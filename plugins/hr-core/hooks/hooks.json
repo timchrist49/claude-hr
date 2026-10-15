@@ -1,0 +1,28 @@
+{
+  "description": "claude-hr secret-leak guard: blocks Bash / PowerShell commands that would print credentials into the transcript. Fails open if claude-hr-hook is not installed.",
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "sh -c 'command -v claude-hr-hook >/dev/null 2>&1 || exit 0; exec claude-hr-hook bash-guard'",
+            "timeout": 10
+          }
+        ]
+      },
+      {
+        "matcher": "PowerShell",
+        "hooks": [
+          {
+            "type": "command",
+            "shell": "powershell",
+            "command": "if (Get-Command claude-hr-hook -ErrorAction SilentlyContinue) { claude-hr-hook bash-guard; exit $LASTEXITCODE } else { exit 0 }",
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  }
+}

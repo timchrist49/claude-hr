@@ -1,0 +1,6 @@
+# Shell scripts and everything Linux/macOS executes must be LF even when edited on Windows.
+* text=auto eol=lf
+*.ps1 text eol=lf
+*.sh text eol=lf
+*.png binary
+*.gif binary

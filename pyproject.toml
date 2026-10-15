@@ -1,0 +1,40 @@
+[build-system]
+requires = ["hatchling>=1.24"]
+build-backend = "hatchling.build"
+
+[project]
+name = "claude-hr"
+version = "0.1.0"
+description = "claude-hr: a managed Claude Code distribution (Headroom, plugins, skills, CLAUDE.md hygiene, resource governor, scheduled upgrades)."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "Proprietary - all rights reserved (timchrist49)" }
+classifiers = ["License :: Other/Proprietary License", "Private :: Do Not Upload"]
+authors = [{ name = "timchrist49" }]
+dependencies = []  # stdlib only on purpose: the launcher must start fast and never break on a dependency
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "ruff>=0.6"]
+
+[project.scripts]
+claude-hr = "claude_hr.launcher:main"
+claude-hr-ctl = "claude_hr.ctl:main"
+claude-hr-hook = "claude_hr.hooks:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/claude_hr"]
+
+[tool.hatch.build.targets.sdist]
+include = ["src", "plugins", ".claude-plugin", "README.md", "pyproject.toml"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B"]
+ignore = ["E501"]

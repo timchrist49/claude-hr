@@ -1,0 +1,27 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "claude-hr",
+  "description": "claude-hr distribution: curated, minimal-footprint plugins for software and security work.",
+  "owner": { "name": "timchrist49" },
+  "plugins": [
+    {
+      "name": "hr-core",
+      "source": "./plugins/hr-core",
+      "description": "Three read-only subagents (explorer, log-triage, security-reviewer), three skills, and a Bash secret-leak guard.",
+      "version": "0.1.0",
+      "category": "productivity",
+      "keywords": ["claude-hr", "security", "tokens"]
+    },
+    {
+      "name": "ponytail",
+      "source": {
+        "source": "url",
+        "url": "https://github.com/DietrichGebert/ponytail.git",
+        "sha": "84740e3d344b69b4a133201fa519eb37a62a2b2a"
+      },
+      "description": "OPTIONAL (profile lean-output). Third-party 'laziest solution that works' behaviour skill, pinned to a reviewed commit. Changes how the model writes code, not just how many tokens it uses.",
+      "category": "productivity",
+      "homepage": "https://github.com/DietrichGebert/ponytail"
+    }
+  ]
+}

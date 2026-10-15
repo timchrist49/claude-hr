@@ -1,0 +1,56 @@
+# Declarative plugin plan. `claude-hr-ctl plugins sync` makes the machine match the chosen profile.
+# Rules: a plugin counts as installed if the SAME NAME is installed from ANY marketplace (no duplicates);
+# plugins not listed here are never removed unless you pass --prune.
+# Third-party plugins come only from Anthropic's SHA-pinned catalog or from this repo's own marketplace.
+
+[marketplaces.claude-hr]
+source = "@repo"                                   # this repository (local checkout) -> `hr-core`
+
+[marketplaces.claude-plugins-official]
+source = "anthropics/claude-plugins-official"      # every external entry in this catalog is pinned to a 40-char SHA
+
+[marketplaces.headroom-marketplace]
+source = "headroomlabs-ai/headroom"
+requires = "headroom.install_plugins"
+
+# ---- profiles -------------------------------------------------------------------------------
+[profiles.minimal]
+description = "Token-lean: only claude-hr's own plugin (3 subagents, 3 skills, 1 guard hook)."
+plugins = ["hr-core@claude-hr"]
+
+[profiles.standard]
+description = "Recommended team default."
+extends = "minimal"
+plugins = [
+  "claude-md-management@claude-plugins-official",   # audit/improve CLAUDE.md (manual use)
+  "feature-dev@claude-plugins-official",            # guided feature workflow + 3 agents
+  "security-guidance@claude-plugins-official",      # edit-time and commit-time security review
+  "code-simplifier@claude-plugins-official",
+  "context7@claude-plugins-official",               # current library docs (MCP, deferred by tool search)
+  "superpowers@claude-plugins-official",            # process skills: TDD, debugging, plans, worktrees
+  "headroom-snip@headroom-marketplace",             # live token-savings band + status line
+]
+
+[profiles.full]
+description = "Standard + maintainer tooling."
+extends = "standard"
+plugins = [
+  "skill-creator@claude-plugins-official",
+]
+
+[profiles.lean-output]
+description = "Standard + Ponytail (Headroom's recommended companion for terser output). It changes how the model writes code - evaluate before rolling out."
+extends = "standard"
+plugins = [
+  "ponytail@claude-hr",   # third-party, pinned to a reviewed commit in this repo's marketplace.json
+]
+
+# Opt-in per project (NOT installed at user scope: large always-on cost outside the matching projects).
+# `claude-hr-ctl plugins suggest` looks at the current directory and tells you when to enable these.
+[project_scoped]
+"vercel@claude-plugins-official" = { markers = ["vercel.json", ".vercel", "next.config.js", "next.config.mjs", "next.config.ts"], why = "35 skills + 200+ MCP tools (~4k tokens always-on, far more without tool search)" }
+"frontend-design@claude-plugins-official" = { markers = ["tailwind.config.js", "tailwind.config.ts", "components.json"], why = "UI design guidance" }
+
+# Known to overlap with something Claude Code already bundles; flagged by `plugins audit`.
+[redundant]
+"code-review@claude-plugins-official" = "Claude Code bundles /code-review; two copies compete for the same prompts."

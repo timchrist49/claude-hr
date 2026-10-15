@@ -1,0 +1,123 @@
+# claude-hr packaged defaults. DO NOT edit on a machine: put overrides in
+#   ~/.claude-hr/config.toml            (per user)
+#   /etc/claude-hr/config.toml          (per machine; Windows: %ProgramData%\claude-hr\config.toml)
+#   CLAUDE_HR_<SECTION>__<KEY>=value           (per process, e.g. CLAUDE_HR_HEADROOM__PORT=9000)
+# `claude-hr-ctl config show` prints the merged result.
+
+[self]
+update_ref = "stable"        # what the self-updater tracks: "stable" = newest vX.Y.Z tag, or a branch name
+
+[claude]
+binary = ""                  # empty = auto-detect the real `claude` (never the claude-hr shim)
+manage_updates = true        # claude-hr stages Claude Code upgrades (smoke-tested, rollback) instead of the built-in updater
+channel = "stable"           # release channel the staged updater follows: "stable" | "latest"
+pin = ""                     # exact version to hold (overrides channel), e.g. "2.1.292"
+privacy = "standard"         # standard: error reporting off | strict: also telemetry + nonessential traffic off
+                             #   (strict removes feature-flagged features such as /skill-doctor and plugin sync)
+statusline = true            # install the claude-hr status line (model | ctx | cost | savings | 5h usage)
+default_flags = []           # extra flags always prepended to interactive/headless launches
+env = {}                     # extra env vars written into settings.json `env`
+
+[plugins]
+profile = "standard"         # minimal | standard | full  (see src/claude_hr/data/plugins.toml)
+
+[headroom]
+enabled = true
+# persistent: ONE shared local proxy (fast starts, also covers `claude agents` workers)
+# wrap:       `headroom wrap claude` per session (per-project code-graph watcher, but ~6s slower and
+#             the proxy dies with the session)
+# off:        never route through Headroom
+mode = "persistent"
+version = ""                 # empty = latest release (subject to updates.cooldown_days); or pin e.g. "0.41.0"
+python = "3.13"              # interpreter of the isolated `uv tool` env
+extras = "all"               # pip extras of headroom-ai; "all" = proxy,code,ml,memory,relevance,image,mcp,...
+footprint = "auto"           # auto: machines with <8 GB RAM get a lite install (proxy,code,mcp)
+port = 8787
+host = "127.0.0.1"
+savings_profile = "coding"   # coding (cache-safe, never lossy-compresses file reads) | balanced | general | agent-90
+proxy_mode = "cache"         # cache = preserve the provider prompt-cache prefix (independent tests: token mode busts the cache)
+memory = true                # cross-session memory, one DB per project under ~/.claude-hr/headroom
+learn = false                # live traffic learning (implies memory). Off: use the scheduled batch `learn` report
+code_graph = true            # only effective in mode = "wrap" (it watches the launch directory)
+code_memory = "serena"       # "serena" | "none"
+code_memory_scope = "user"   # registered once at setup; Serena only starts when a session calls it
+serena_version = ""          # pin e.g. "2.0.0" to stop `uvx` pulling new releases unreviewed
+mcp = true                   # register headroom_compress / headroom_retrieve / headroom_stats
+tool_search = "true"         # ENABLE_TOOL_SEARCH behind the proxy; without it every MCP tool schema is loaded eagerly
+one_m_context = false        # force the [1m] model selector (account must be eligible)
+output_shaper = true         # trim model OUTPUT tokens (verbosity steering + effort routing)
+output_holdout = 0.0         # 0.1 keeps a 10% unshaped control group so savings are *measured*, not estimated
+telemetry = false            # Headroom's anonymous beacon off
+update_check = false         # claude-hr's staged updater replaces Headroom's own daily check
+subscription_tracking = true # proxy polls your plan's usage windows (feeds the status line's 5h figure)
+offline_models = "auto"      # auto: offline once the model is cached (no HuggingFace round-trip at boot, saves ~10s)
+install_plugins = true       # headroom-snip (live savings band) from Headroom's marketplace
+quiet_cli = true             # silence progress bars / banners / version nags in tool output
+start_wait_s = 90            # how long a launch waits for a cold proxy before failing open
+fail_open = true             # proxy unhealthy -> run plain `claude` (loudly) instead of failing
+budget_usd_daily = 0         # >0: proxy rejects requests beyond this daily spend
+extra_proxy_args = []
+
+[agents]
+# Background sessions inherit the environment of whichever client first started the Claude daemon.
+# idle: restart a foreign daemon only when it has no running sessions | always | never
+foreign_daemon = "idle"
+
+[tokens]
+subagent_model = ""          # CLAUDE_CODE_SUBAGENT_MODEL for all subagents; "" = leave Claude's default (quality first)
+
+[resources]
+enabled = true
+max_sessions = "auto"        # int, or "auto" = min((RAM-reserve)/gb_per_session, cores/2, session_cap)
+gb_per_session = 3.0
+reserve_gb = 4.0
+session_cap = 6              # Anthropic's own guidance is 3-5 parallel sessions
+min_free_gb = 2.0            # interactive/agent launches are refused below this much free RAM (headless only warns)
+enforce_sessions = "warn"    # "warn": print a warning when over max_sessions | "block": refuse (interactive/agents only)
+memory_max_gb = "auto"       # hard cap per session tree: auto = clamp(40% of RAM, 6, 16) GB; 0 = off
+memory_high_gb = "auto"      # Linux soft limit (kernel reclaims above it): auto = 80% of memory_max
+cpu_quota_pct = 0            # Linux: needs cpu controller delegation (see docs/OPERATIONS.md); 0 = off
+low_priority = false         # below-normal CPU priority
+kill_on_exit = true          # interactive/headless: kill orphaned child processes (MCP servers, dev servers) on exit
+max_subagents = 0            # CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS; 0 = cores/2 clamped to 2..8
+unattended_retry = true      # headless / background runs wait out 429/529 instead of failing (bounded by retry_max_wait_min)
+retry_max_wait_min = 30
+
+[maintenance]
+transcript_retention_days = 30   # Claude's cleanupPeriodDays (written only if you change it from 30)
+jobs_retention_days = 14         # finished ~/.claude/jobs/<id> scratch dirs (can reach tens of GB)
+log_retention_days = 14          # claude-hr logs
+daemon_log_max_mb = 100
+usage_snapshot = true            # keep a daily token summary even after Claude prunes transcripts
+learn_report = true              # weekly READ-ONLY `headroom learn` suggestions in state/learn-report.txt (never auto-applied)
+
+[monitor]
+interval_minutes = 15
+disk_warn_gb = 10
+mem_warn_pct = 90
+claude_dir_warn_gb = 10
+restart_proxy = true         # self-heal: restart the shared proxy if it died (max once per 10 min)
+alert_command = ""           # shell command run on alert; env CLAUDE_HR_ALERT_TITLE / CLAUDE_HR_ALERT_BODY
+alert_ntfy_url = ""          # e.g. https://ntfy.sh/<topic>   (push to phone; Claude's own push needs Remote Control)
+alert_webhook_url = ""
+alert_cooldown_hours = 6
+
+[updates]
+enabled = true
+at = "03:17"
+cooldown_days = 5            # unattended installs skip releases younger than this (supply-chain / regression buffer)
+auto_apply = true            # false = only report what is available
+smoke_online = false         # true = also run a 1-turn `claude -p` through the proxy before promoting
+
+[claude_md]
+max_global_lines = 80
+max_project_lines = 200
+max_learned_lines = 40
+warn_total_tokens = 4000     # estimated tokens loaded from all CLAUDE.md sources at session start
+
+[credentials]
+block_secret_reads = true    # permissions.deny for .env / ssh / cloud credential files
+op_env_file = ""             # 1Password: launch as `op run --env-file=<file> -- claude ...`
+
+[security]
+profile = "standard"         # strict: also disableBypassPermissionsMode + CLAUDE_CODE_SUBPROCESS_ENV_SCRUB

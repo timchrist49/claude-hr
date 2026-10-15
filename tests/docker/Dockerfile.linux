@@ -1,0 +1,14 @@
+# Linux integration-test image for the claude-hr installer.
+# Mirrors a bare new VM: only curl/git/ca-certificates, a non-root user, no Python, no uv, no Claude Code.
+FROM ubuntu:24.04
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      curl git ca-certificates procps xz-utils sudo cron \
+    && rm -rf /var/lib/apt/lists/*
+RUN useradd -m -s /bin/bash hr
+USER hr
+WORKDIR /home/hr
+ENV HOME=/home/hr PATH=/home/hr/.local/bin:/usr/local/bin:/usr/bin:/bin
+USER root
+RUN apt-get update && apt-get install -y --no-install-recommends systemd && rm -rf /var/lib/apt/lists/*
+USER hr
