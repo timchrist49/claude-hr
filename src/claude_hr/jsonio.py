@@ -50,20 +50,26 @@ def backup_file(path: Path, backup_dir: Path, keep: int = 20) -> Path | None:
     return dest
 
 
-def atomic_write_text(path: Path, text: str, newline: str = "\n") -> None:
+def atomic_write_text(path: Path, text: str, newline: str = "\n", follow_symlinks: bool = True) -> None:
     """Write text atomically (temp file in the same dir + os.replace).
 
-    * A symlinked target (dotfiles repos) is written THROUGH the link, not replaced by a regular file.
+    * A symlinked target (dotfiles repos) is written THROUGH the link, not replaced by a regular file. Pass
+      follow_symlinks=False for files claude-hr owns (state, reports): a symlink at the destination is then replaced,
+      never written through, and the new file is 0600.
     * The existing file's permission bits are kept (mkstemp would otherwise force 0600).
     * On Windows `os.replace` fails with PermissionError while another process holds the file for an instant, so
       it is retried briefly - concurrent launches must not crash on each other's bookkeeping.
     """
-    path = Path(os.path.realpath(path))
+    mode = None
+    if follow_symlinks:
+        path = Path(os.path.realpath(path))
+        try:
+            mode = path.stat().st_mode & 0o777
+        except OSError:
+            mode = None
+    else:
+        path = Path(os.path.abspath(path))
     path.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        mode = path.stat().st_mode & 0o777
-    except OSError:
-        mode = None
     fd, tmp = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent))
     try:
         with os.fdopen(fd, "w", encoding="utf-8", newline=newline) as fh:

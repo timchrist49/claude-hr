@@ -32,7 +32,7 @@ from . import (
 from .checks import FAIL
 from .claude_setup import ClaudeSetup, Step
 from .headroom import Headroom
-from .jsonio import read_json, write_json
+from .jsonio import atomic_write_text, read_json, write_json
 
 
 def _color() -> bool:
@@ -565,7 +565,7 @@ def cmd_job(a, cfg) -> int:
             if cfg.flag("headroom.enabled", True) and cfg.flag("maintenance.learn_report", True) and hr_learn.binary():
                 # read-only (no --apply): auto-written instructions can lower accuracy, so a human decides
                 r = procutil.run([str(hr_learn.binary()), "learn", "--all"], timeout=600, env=hr_learn.server_env())
-                (paths.state_dir() / "learn-report.txt").write_text((r.stdout or "") + (r.stderr or ""), encoding="utf-8")
+                atomic_write_text(paths.state_dir() / "learn-report.txt", (r.stdout or "") + (r.stderr or ""), follow_symlinks=False)
                 msg += " | learn report written"
             hits, scanned = creds.scan_transcripts(7)
             if hits:

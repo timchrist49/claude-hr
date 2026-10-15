@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.1.1 (2026-10-15)
+Security hardening from the post-release commit review:
+- `~/.claude-hr` and its `state/`, `logs/`, `backups/`, `cache/` folders are now owner-only (0700) on Linux/macOS; they hold the
+  proxy log, the transcript-derived `headroom learn` report, usage data and copies of `settings.json`. `install.sh` creates the home
+  folder 0700 from the start, and the proxy log is created 0600.
+- Files claude-hr owns (learn report, Serena pin, proxy state file, proxy log) are never written or opened through a symlink; a symlink
+  planted at such a path is replaced or refused instead of followed. Managed edits to your own `settings.json` still follow a dotfiles symlink.
+- The proxy log handle is closed in the launcher after the proxy is spawned.
+
 ## 0.1.0 (2026-10-15)
 Hardened after an independent review and real-OS testing (Windows 11 incl. PowerShell 5.1 and Task Scheduler, Ubuntu 22.04 with systemd/cgroups):
 - Launcher: `claude --help`-derived subcommand/flag classification, best-effort bookkeeping, nesting guard, gateway detection,

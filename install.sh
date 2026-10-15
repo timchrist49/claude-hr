@@ -72,6 +72,8 @@ log "claude $(claude --version 2>/dev/null | head -1)"
 
 # ---- claude-hr source ---------------------------------------------------------------------------
 mkdir -p "$CLAUDE_HR_HOME"
+# state, logs and settings backups live here: owner-only from the first moment (never the user's real home dir itself)
+if [ "$(cd "$CLAUDE_HR_HOME" && pwd -P)" != "$(cd "$HOME" && pwd -P)" ]; then chmod 700 "$CLAUDE_HR_HOME" 2>/dev/null || true; fi
 SRC="$CLAUDE_HR_HOME/repo"
 if [ -n "$LOCAL" ]; then
   LOCAL="$(cd "$LOCAL" && pwd)"

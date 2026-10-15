@@ -244,31 +244,52 @@ class Headroom:
         if not b:
             return None
         paths.ensure_dirs()
-        log = open(paths.logs_dir() / "headroom-proxy.log", "ab")  # noqa: SIM115
+        try:
+            log = self._open_log()
+        except OSError:  # e.g. a symlink planted at the log path: run without a log rather than not at all
+            log = None
         kwargs: dict = {
             "stdin": subprocess.DEVNULL,
-            "stdout": log,
+            "stdout": log if log is not None else subprocess.DEVNULL,
             "stderr": subprocess.STDOUT,
             "env": self.server_env(),
             "cwd": str(paths.hr_home()),
         }
-        if paths.IS_WINDOWS:
-            flags = (
-                getattr(subprocess, "DETACHED_PROCESS", 0x8)
-                | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x200)
-                | getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
-            )
-            try:
-                proc = subprocess.Popen([str(b), *self.proxy_args()], creationflags=flags | 0x01000000, **kwargs)
-            except OSError:  # CREATE_BREAKAWAY_FROM_JOB not permitted by the parent job
-                proc = subprocess.Popen([str(b), *self.proxy_args()], creationflags=flags, **kwargs)
-        else:
-            proc = subprocess.Popen([str(b), *self.proxy_args()], start_new_session=True, **kwargs)
+        try:
+            if paths.IS_WINDOWS:
+                flags = (
+                    getattr(subprocess, "DETACHED_PROCESS", 0x8)
+                    | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x200)
+                    | getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
+                )
+                try:
+                    proc = subprocess.Popen([str(b), *self.proxy_args()], creationflags=flags | 0x01000000, **kwargs)
+                except OSError:  # CREATE_BREAKAWAY_FROM_JOB not permitted by the parent job
+                    proc = subprocess.Popen([str(b), *self.proxy_args()], creationflags=flags, **kwargs)
+            else:
+                proc = subprocess.Popen([str(b), *self.proxy_args()], start_new_session=True, **kwargs)
+        finally:
+            if log is not None:
+                log.close()  # the child has its own copy of the handle
         atomic_write_text(
             self._state_file(),
             json.dumps({"pid": proc.pid, "port": self.port, "started": time.time()}) + "\n",
+            follow_symlinks=False,
         )
         return proc
+
+    @staticmethod
+    def _open_log():
+        """Proxy stdout/stderr log: owner-only (it can contain project paths and request metadata) and never opened
+        through a symlink. Raises OSError if the path is a symlink."""
+        flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
+        fd = os.open(paths.logs_dir() / "headroom-proxy.log", flags, 0o600)
+        if hasattr(os, "fchmod"):
+            try:
+                os.fchmod(fd, 0o600)  # a log created by an older version was 0644
+            except OSError:
+                pass
+        return os.fdopen(fd, "ab")
 
     def ensure(self, wait_s: float = 0.0, announce=None) -> Health:
         """Make sure a healthy proxy is serving. wait_s=0 starts it in the background and returns."""
@@ -437,7 +458,7 @@ class Headroom:
         if ver:
             try:
                 paths.state_dir().mkdir(parents=True, exist_ok=True)
-                (paths.state_dir() / "serena-pin.txt").write_text(ver + "\n", encoding="utf-8")
+                atomic_write_text(paths.state_dir() / "serena-pin.txt", ver + "\n", follow_symlinks=False)
             except OSError:
                 pass
         return ver

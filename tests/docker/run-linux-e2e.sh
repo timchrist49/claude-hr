@@ -44,6 +44,8 @@ check "wrapper set in settings env" grep -q CLAUDE_CODE_PROCESS_WRAPPER "$HOME/.
 echo "== 4. Headroom proxy =="
 check "proxy starts and is healthy" claude-hr-ctl headroom start --wait 240
 check "compression smoke test"      claude-hr-ctl headroom bench --wait 60
+check "claude-hr home is owner-only"   bash -c "test \"\$(stat -c %a \$HOME/.claude-hr)\" = 700 && test \"\$(stat -c %a \$HOME/.claude-hr/state)\" = 700 && test \"\$(stat -c %a \$HOME/.claude-hr/logs)\" = 700 && test \"\$(stat -c %a \$HOME/.claude-hr/backups)\" = 700"
+check "proxy log is owner-only"        bash -c "test \"\$(stat -c %a \$HOME/.claude-hr/logs/headroom-proxy.log)\" = 600"
 
 echo "== 5. launcher =="
 check "passthrough --version"       bash -c "claude-hr --version | grep -q 'Claude Code'"
