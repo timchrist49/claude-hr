@@ -739,6 +739,7 @@ def _run(argv: list[str]) -> int:
     if args.cmd == "config" and args.action in {"get", "set"} and not args.key:
         out("config get/set need a key")
         return 2
+    paths.tighten_existing()
     return int(args.fn(args, cfg) or 0)
 
 

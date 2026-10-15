@@ -94,6 +94,13 @@ def user_config_file() -> Path:
 def ensure_dirs() -> None:
     for d in (state_dir(), logs_dir(), backups_dir(), cache_dir(), bin_dir()):
         d.mkdir(parents=True, exist_ok=True)
+    tighten_existing()
+
+
+def tighten_existing() -> None:
+    """Make claude-hr's private folders owner-only without creating anything. Called on every entry point so an install
+    upgraded from a release that created them world-readable is fixed by the first command that runs, not the first
+    scheduled job."""
     make_private(hr_home(), state_dir(), logs_dir(), backups_dir(), cache_dir())
 
 

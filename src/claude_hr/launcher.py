@@ -303,6 +303,7 @@ def _remember_launch(pid: int, proxy_url: str | None) -> None:
 
     from .jsonio import atomic_write_text, read_json
 
+    paths.tighten_existing()  # a few chmod calls; fixes installs upgraded from a release that left these world-readable
     try:
         ring = read_json(_ring_path(), []) or []
     except Exception:

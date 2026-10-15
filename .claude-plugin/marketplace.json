@@ -8,7 +8,7 @@
       "name": "hr-core",
       "source": "./plugins/hr-core",
       "description": "Three read-only subagents (explorer, log-triage, security-reviewer), three skills, and a Bash secret-leak guard.",
-      "version": "0.1.1",
+      "version": "0.1.2",
       "category": "productivity",
       "keywords": ["claude-hr", "security", "tokens"]
     },

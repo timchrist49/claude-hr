@@ -1,7 +1,7 @@
 {
   "name": "hr-core",
   "displayName": "claude-hr Core",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Lean team defaults for claude-hr: three read-only subagents, three skills, and a secret-leak guard hook.",
   "author": { "name": "timchrist49" },
   "license": "UNLICENSED",

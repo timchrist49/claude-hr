@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.1.2 (2026-10-15)
+- An install upgraded from 0.1.0 now becomes owner-only on the first `claude-hr` or `claude-hr-ctl` command (found by testing the real
+  v0.1.0 -> v0.1.1 self-update on a fresh user): `paths.tighten_existing()` runs on every entry point and creates nothing.
+
 ## 0.1.1 (2026-10-15)
 Security hardening from the post-release commit review:
 - `~/.claude-hr` and its `state/`, `logs/`, `backups/`, `cache/` folders are now owner-only (0700) on Linux/macOS; they hold the
