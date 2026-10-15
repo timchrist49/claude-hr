@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from claude_hr import config, sysinfo
+from claude_hr import config, paths, sysinfo
 from claude_hr.headroom import Headroom
 
 
@@ -85,6 +85,8 @@ def test_mcp_specs(sandbox, monkeypatch):
     h = hr()
     assert h.mcp_server_spec()["args"] == ["mcp", "serve"]
     assert h.mcp_server_spec()["env"]["HEADROOM_PROXY_URL"] == h.url
+    # same workspace as the proxy, so the MCP tool never keeps a plaintext store in ~/.headroom
+    assert h.mcp_server_spec()["env"]["HEADROOM_WORKSPACE_DIR"] == str(paths.hr_home() / "headroom")
     assert "serena-agent==2.0.0" in h.serena_spec()["args"]
     assert "--project-from-cwd" in h.serena_spec()["args"]
 

@@ -436,7 +436,9 @@ class Headroom:
             "type": "stdio",
             "command": str(b) if b else "headroom",
             "args": ["mcp", "serve"],
-            "env": {"HEADROOM_PROXY_URL": self.url},
+            # same workspace as the proxy: without it the MCP tool keeps its plaintext store in ~/.headroom, outside the
+            # folder that `uninstall --purge` removes and that claude-hr keeps owner-only
+            "env": {"HEADROOM_PROXY_URL": self.url, "HEADROOM_WORKSPACE_DIR": str(paths.hr_home() / "headroom")},
         }
 
     def serena_pin(self) -> str:

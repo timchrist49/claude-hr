@@ -170,6 +170,11 @@ def _systemd_scope_available() -> bool:
     return ok
 
 
+def caps_available() -> bool:
+    """True if per-session memory caps can really be applied on this machine (Linux: a working systemd user scope)."""
+    return _systemd_scope_available()
+
+
 def wrap_command_posix(cfg: Config, cmd: list[str]) -> list[str]:
     """Prefix `cmd` with the strongest available limiter on POSIX. Returns cmd unchanged if none."""
     r = cfg.section("resources")

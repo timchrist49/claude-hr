@@ -10,6 +10,8 @@ Rules that keep it safe to run unattended:
 from __future__ import annotations
 
 import json
+import os
+import pathlib
 import re
 import time
 from dataclasses import dataclass, field
@@ -22,6 +24,21 @@ from .headroom import Headroom
 from .jsonio import read_json, write_json
 
 CLAUDE_RELEASES = "https://downloads.claude.ai/claude-code-releases"
+
+
+def installed_is_behind(repo) -> tuple[str, str] | None:
+    """(checkout version, installed version) if the managed checkout holds a newer claude-hr than the one that is installed
+    (a reinstall failed or was killed), else None."""
+    try:
+        text = (pathlib.Path(repo) / "src" / "claude_hr" / "__init__.py").read_text(encoding="utf-8")
+    except OSError:
+        return None
+    m = re.search(r'__version__\s*=\s*"([^"]+)"', text)
+    if not m:
+        return None
+    from . import __version__
+
+    return (m.group(1), __version__) if vtuple(m.group(1)) > vtuple(__version__) else None
 
 
 def vtuple(v: str | None) -> tuple[int, ...]:
@@ -62,11 +79,134 @@ def _log(entry: dict) -> None:
         pass
 
 
+_PS_QUOTES = "'\u2018\u2019\u201a\u201b"  # PowerShell treats all four typographic single quotes like an ASCII one
+
+
+def _ps_quote(value: str) -> str:
+    """A PowerShell single-quoted string literal. PowerShell also accepts U+2018/2019/201A/201B as quote characters, so every
+    one of them is doubled: a typographic apostrophe in a path or environment value must not end the string early."""
+    return "'" + "".join(c * 2 if c in _PS_QUOTES else c for c in value) + "'"
+
+
+HELPER_TASK_FOLDER = "\\claude-hr\\"
+HELPER_TASK_NAME = "selfupdate"
+_SECRET_NAME = re.compile(r"(?i)(TOKEN|PASSWORD|PASSWD|SECRET|KEY|USERNAME|CREDENTIAL|AUTH)")
+_URL_WITH_USERINFO = re.compile(r"://[^/@\s]*@")
+
+
+def _helper_env(env) -> dict[str, str]:
+    """The environment the reinstall helper needs: PATH and the UV_* settings (tool directory, cache, Python selection ...).
+    A process started by Task Scheduler / the systemd user manager does NOT inherit ours, so without UV_TOOL_DIR and
+    UV_TOOL_BIN_DIR `uv tool install` would use the default tool directory. Anything that looks like a credential is NOT
+    copied (the helper script is a file on disk, and reinstalling a local checkout needs no package-index credentials)."""
+    out: dict[str, str] = {}
+    for k, v in env.items():
+        if not (k.upper().startswith("UV_") or k.upper() == "PATH"):
+            continue
+        if _SECRET_NAME.search(k) or _URL_WITH_USERINFO.search(str(v)):
+            continue
+        out[k] = str(v)
+    return out
+
+
+def _helper_env_lines(env) -> list[str]:
+    return [f"$env:{k} = {_ps_quote(v)}" for k, v in sorted(_helper_env(env).items())]
+
+
+def _windows_reinstall_script(cmd: list[str], pid: int, ppid: int, log, env=None) -> str:
+    """PowerShell source for the helper that reinstalls claude-hr after the updater process (and the claude-hr-ctl.exe
+    trampoline that started it) has exited. Everything it does is appended to logs/self-update.log (UTF-8), and it deletes
+    its own script file and the one-shot scheduled task that started it."""
+    lines = [
+        "$ErrorActionPreference = 'Continue'",
+        *_helper_env_lines(os.environ if env is None else env),
+        f"$log = {_ps_quote(str(log))}",
+        "function Log($m) { Add-Content -LiteralPath $log -Encoding UTF8 -Value ('[' + (Get-Date -Format s) + '] ' + $m) }",
+        f"$ids = @({pid})",
+        f"$parent = Get-Process -Id {ppid} -ErrorAction SilentlyContinue",
+        "if ($parent -and $parent.ProcessName -like 'claude-hr*') { $ids += $parent.Id }",
+        "Log ('waiting for pid(s) ' + ($ids -join ',') + ' to exit before reinstalling')",
+        "Wait-Process -Id $ids -Timeout 120 -ErrorAction SilentlyContinue",
+        "Log ('running: ' + " + _ps_quote(" ".join(cmd)) + ")",
+        "& " + " ".join(_ps_quote(part) for part in cmd) + " 2>&1 | ForEach-Object { "
+        "if ($_ -is [System.Management.Automation.ErrorRecord]) { $_.Exception.Message } else { \"$_\" } } | "
+        "Add-Content -LiteralPath $log -Encoding UTF8",
+        "Log ('reinstall exit code ' + $LASTEXITCODE)",
+        "if ($PSCommandPath) { Remove-Item -LiteralPath $PSCommandPath -Force -ErrorAction SilentlyContinue }",
+        f"Unregister-ScheduledTask -TaskName {_ps_quote(HELPER_TASK_NAME)} -TaskPath {_ps_quote(HELPER_TASK_FOLDER)} "
+        "-Confirm:$false -ErrorAction SilentlyContinue",
+    ]
+    return "\n".join(lines) + "\n"
+
+
+def _start_helper_task(shell: str, script_path) -> bool:
+    """Run the helper script from Windows Task Scheduler instead of as our child. uv's claude-hr-ctl.exe trampoline puts the
+    updater in a Job Object that is killed when the trampoline exits (and refuses breakaway), so any child we spawn dies
+    with us before it can reinstall. A task started by the scheduler lives outside that job. Registering and starting it is
+    synchronous and finishes before we exit. Returns True if the task was started."""
+    args = f'-NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -File "{script_path}"'
+    ps = (
+        "$ErrorActionPreference = 'Stop'; "
+        f"$a = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument {_ps_quote(args)}; "
+        "$s = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -MultipleInstances IgnoreNew "
+        "-ExecutionTimeLimit (New-TimeSpan -Minutes 30); "
+        f"Register-ScheduledTask -TaskName {_ps_quote(HELPER_TASK_NAME)} -TaskPath {_ps_quote(HELPER_TASK_FOLDER)} -Force "
+        "-Action $a -Settings $s -Description 'claude-hr self-update helper (removes itself)' | Out-Null; "
+        f"Start-ScheduledTask -TaskName {_ps_quote(HELPER_TASK_NAME)} -TaskPath {_ps_quote(HELPER_TASK_FOLDER)}"
+    )
+    r = procutil.run([shell, "-NoProfile", "-NonInteractive", "-Command", ps], timeout=60)
+    return r.returncode == 0
+
+
+def _start_systemd_service(cmd: list[str], log) -> bool:
+    """Start `cmd` as a transient unit of the systemd USER manager. The daily update runs as a timer's oneshot service whose
+    default KillMode=control-group kills every process of its cgroup (even a setsid child) the moment the job ends; a
+    reinstall started as the job's last act would be killed half-way. A unit created through the manager lives in its own
+    cgroup and survives. Returns True if the unit was started."""
+    if not (paths.IS_LINUX and resources.caps_available()):
+        return False
+    argv = ["systemd-run", "--user", "--quiet", "--collect", f"--unit=claude-hr-selfupdate-{int(time.time())}",
+            "-p", f"StandardOutput=append:{log}", "-p", f"StandardError=append:{log}"]
+    argv += [f"--setenv={k}={v}" for k, v in sorted(_helper_env(os.environ).items())]
+    argv += ["--", *cmd]
+    return procutil.run(argv, timeout=30).returncode == 0
+
+
+def _spawn_detached(cmd: list[str], log_path=None) -> None:
+    """Start `cmd` detached from this process (own session / no console); output goes to `log_path` if given.
+
+    On Windows the child also tries to break away from any Job Object (this is only a best-effort fallback: uv's trampoline
+    job usually refuses breakaway, which is why _start_helper_task exists)."""
+    import subprocess
+
+    out = subprocess.DEVNULL
+    if log_path is not None:
+        try:
+            out = open(log_path, "ab")  # noqa: SIM115
+        except OSError:
+            out = subprocess.DEVNULL
+    kwargs: dict = {"stdout": out, "stderr": subprocess.STDOUT if out is not subprocess.DEVNULL else subprocess.DEVNULL,
+                    "stdin": subprocess.DEVNULL}
+    try:
+        if paths.IS_WINDOWS:
+            flags = 0x08000000 | 0x00000008 | 0x00000200  # CREATE_NO_WINDOW | DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
+            try:
+                subprocess.Popen(cmd, creationflags=flags | 0x01000000, **kwargs)  # | CREATE_BREAKAWAY_FROM_JOB
+            except OSError:  # the parent job does not allow breakaway
+                subprocess.Popen(cmd, creationflags=flags, **kwargs)
+        else:
+            subprocess.Popen(cmd, start_new_session=True, **kwargs)
+    finally:
+        if out is not subprocess.DEVNULL:
+            out.close()
+
+
 class Updater:
     def __init__(self, cfg: Config, dry: bool = False, force: bool = False, allow_downgrade: bool = False):
         self.cfg, self.dry, self.force, self.allow_downgrade = cfg, dry, force, allow_downgrade
         self.hr = Headroom(cfg)
         self.claude = procutil.find_claude(str(cfg.get("claude.binary", "") or ""))
+        self._pending_reinstall: list[str] | None = None  # set by update_self, started by run() once everything else is done
 
     # ---- guards ---------------------------------------------------------------------------
     def _busy(self) -> str:
@@ -284,39 +424,88 @@ class Updater:
             return res
         head = procutil.run([g, "-C", str(repo), "rev-parse", "HEAD"], timeout=30).stdout.strip()
         want = procutil.run([g, "-C", str(repo), "rev-parse", tgt + "^{commit}"], timeout=30).stdout.strip()
-        if not want or head == want:
+        if not want:
             res.target = res.current
             return res
+        retry = False
+        if head == want:
+            # Already checked out. If the installed tool is still OLDER than this checkout, an earlier reinstall failed or
+            # was killed (the checkout is moved before the reinstall runs): try again, but not while one was started
+            # moments ago.
+            if not installed_is_behind(repo):
+                res.target = res.current
+                return res
+            started = (read_json(paths.state_dir() / "self-update.json", {}) or {}).get("ts", 0)
+            if time.time() - float(started) < 900:
+                res.target = res.current
+                res.detail = "a reinstall was started in the last 15 minutes; waiting for it"
+                return res
+            retry = True
         # only ever move forward: a checkout of `main` that is ahead of the newest tag must not be rewound to it
-        if procutil.run([g, "-C", str(repo), "merge-base", "--is-ancestor", head, want], timeout=30).returncode != 0:
+        elif procutil.run([g, "-C", str(repo), "merge-base", "--is-ancestor", head, want], timeout=30).returncode != 0:
             res.target = res.current
             res.detail = f"installed commit is not behind {tgt}; not moving"
             return res
         if self.dry:
             res.action = "available"
+            res.detail = "reinstall of the checked-out release is pending" if retry else ""
             return res
         busy = self._busy()
         if busy:  # replacing the tool env under a running launcher fails on Windows and can leave a broken install
             res.action, res.detail = "deferred", busy
             return res
-        co = procutil.run([g, "-C", str(repo), "checkout", "--detach", "--quiet", tgt], timeout=60)
-        if co.returncode != 0:
-            res.action, res.detail = "failed", "git checkout failed: " + (co.stderr or co.stdout).strip()[-160:]
-            return res
-        uv = procutil.which_all("uv")
+        uv = procutil.which_all("uv")  # resolved BEFORE the checkout moves, so "uv missing" never leaves it ahead of the tool
         if not uv:
             res.action, res.detail = "failed", "uv missing"
             return res
-        import subprocess
-
-        # Re-installing replaces the files this process runs from, so hand it to a detached helper.
-        cmd = [str(uv[0]), "tool", "install", "--python", "3.13", "--force", "--reinstall", str(repo)]
-        flags = 0x08000000 | 0x00000008 if paths.IS_WINDOWS else 0
-        subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL,
-                         creationflags=flags, start_new_session=not paths.IS_WINDOWS)
+        if not retry:
+            co = procutil.run([g, "-C", str(repo), "checkout", "--detach", "--quiet", tgt], timeout=60)
+            if co.returncode != 0:
+                res.action, res.detail = "failed", "git checkout failed: " + (co.stderr or co.stdout).strip()[-160:]
+                return res
+        # Re-installing replaces the files this process runs from, so it is handed to a detached helper that starts
+        # only at the very END of run() (see _launch_reinstall): the helper must never overlap with later components.
+        self._pending_reinstall = [str(uv[0]), "tool", "install", "--python", "3.13", "--force", "--reinstall", str(repo)]
         write_json(paths.state_dir() / "self-update.json", {"from": head, "to": want, "ts": time.time()})
-        res.action, res.detail = "updated", "reinstalling in the background; run `claude-hr-ctl setup` afterwards if config changed"
+        res.action = "updated"
+        res.detail = ("retrying the reinstall of the checked-out release (the last one did not finish); " if retry else "") + \
+            "reinstalling in the background (log: logs/self-update.log); run `claude-hr-ctl setup` afterwards if config changed"
         return res
+
+    def _launch_reinstall(self) -> None:
+        """Start the detached `uv tool install --reinstall` for a self-update. Called once, after every component has run.
+
+        On Windows the reinstall must not run while this process (or the claude-hr-ctl.exe trampoline that started it)
+        still holds the tool environment: doing so alongside `plugins update` left the environment without site-packages
+        (every later claude-hr call failed with ModuleNotFoundError). The trampoline also kills every child we spawn the
+        moment it exits, so a detached child never gets to reinstall. So on Windows a one-shot scheduled task runs a
+        PowerShell helper that waits for those processes to exit and then runs uv (see _start_helper_task)."""
+        cmd = self._pending_reinstall
+        if not cmd:
+            return
+        self._pending_reinstall = None
+        log = paths.logs_dir() / "self-update.log"
+        try:
+            paths.ensure_dirs()  # the helper script lives in state/, its log in logs/
+            if paths.IS_WINDOWS:
+                shell = procutil.which_all("powershell") or procutil.which_all("pwsh")
+                if shell:
+                    import base64
+
+                    script = _windows_reinstall_script(cmd, os.getpid(), os.getppid(), log)
+                    ps1 = paths.state_dir() / "self-update.ps1"
+                    ps1.write_bytes(b"\xef\xbb\xbf" + script.encode("utf-8"))  # BOM: PowerShell 5.1 reads ANSI otherwise
+                    if _start_helper_task(str(shell[0]), ps1):
+                        return
+                    _log({"component": "self", "action": "note", "detail": "scheduler refused the helper task; starting the helper directly"})
+                    ps1.unlink(missing_ok=True)  # the fallback carries the script itself; do not leave a copy on disk
+                    encoded = base64.b64encode(script.encode("utf-16-le")).decode("ascii")
+                    cmd = [str(shell[0]), "-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-EncodedCommand", encoded]
+            if not paths.IS_WINDOWS and _start_systemd_service(cmd, log):
+                return
+            _spawn_detached(cmd, log)
+        except OSError as exc:
+            _log({"component": "self", "action": "failed", "detail": f"could not start the reinstall: {exc}"})
 
     # ---- orchestration --------------------------------------------------------------------
     def run(self, components: list[str] | None = None) -> Report:
@@ -339,4 +528,5 @@ class Updater:
         st["last_run"] = time.time()
         st["last_ok"] = report.ok
         write_json(paths.state_dir() / "update-state.json", st)
+        self._launch_reinstall()  # strictly last: nothing may run in this process while the tool environment is replaced
         return report

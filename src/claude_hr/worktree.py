@@ -83,7 +83,14 @@ def remove(name: str, force: bool = False, delete_branch: bool = False, cwd: Pat
     r = _git("worktree", "remove", *(["--force"] if force else []), str(path), cwd=root)
     if r.returncode != 0:
         return 1, (r.stderr or r.stdout).strip()
+    notes = []
     if delete_branch:
         for branch in (f"hr/{slug}", slug):
-            _git("branch", "-d", branch, cwd=root)
-    return 0, f"removed {path}"
+            if _git("show-ref", "--verify", "--quiet", f"refs/heads/{branch}", cwd=root).returncode != 0:
+                continue
+            res = _git("branch", "-d", branch, cwd=root)  # -d: only a branch that is fully merged; unmerged work is never lost
+            if res.returncode == 0:
+                notes.append(f"deleted branch {branch}")
+            else:
+                notes.append(f"kept branch {branch} (not fully merged; delete it with: git branch -D {branch})")
+    return 0, "; ".join([f"removed {path}", *notes])

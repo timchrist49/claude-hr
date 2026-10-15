@@ -274,3 +274,164 @@ def test_windows_shim_passes_arguments_through_exactly(sandbox, tmp_path, monkey
     assert r.returncode == 0, r.stderr
     assert json.loads(r.stdout.strip().splitlines()[-1]) == tricky
     assert not (tmp_path / "b.txt").exists()
+
+
+def test_doctor_says_so_when_linux_memory_caps_are_inactive(sandbox, monkeypatch):
+    """The caps silently do nothing without a systemd user bus (minimal VMs, stock WSL); doctor must not hide that."""
+    from pathlib import Path
+
+    from claude_hr import doctor, resources
+
+    monkeypatch.setattr(doctor.paths, "IS_LINUX", True)
+    monkeypatch.setattr(resources, "caps_available", lambda: False)
+    caps = [c for c in doctor.run(config.load(), Path.cwd()) if c.name == "resource caps"]
+    assert caps and caps[0].status == "warn" and "dbus-user-session" in caps[0].fix
+    monkeypatch.setattr(resources, "caps_available", lambda: True)
+    caps = [c for c in doctor.run(config.load(), Path.cwd()) if c.name == "resource caps"]
+    assert caps and caps[0].status == "ok"
+
+
+def test_setup_profile_is_saved_so_doctor_and_later_setups_keep_it(sandbox):
+    """Regression: `install --profile minimal` applied to one run only; doctor then reported the standard plugins as missing."""
+    import tomllib
+
+    from claude_hr import ctl
+
+    assert config.load().get("plugins.profile") == "standard"
+    assert ctl._run(["setup", "--only", "claude-md", "--profile", "minimal", "--dry-run"]) == 0
+    assert not paths.user_config_file().exists()  # a dry run changes nothing
+    assert ctl._run(["setup", "--only", "claude-md", "--profile", "minimal"]) == 0
+    assert tomllib.loads(paths.user_config_file().read_text(encoding="utf-8"))["plugins"]["profile"] == "minimal"
+    assert config.load().get("plugins.profile") == "minimal"
+    assert ctl._run(["config", "set", "plugins.profile", "full"]) == 0  # `config set` still works through the same helper
+    assert config.load().get("plugins.profile") == "full"
+
+
+# ---- config persistence (found by the 0.1.3 review) --------------------------------------------------------------------
+def test_setup_profile_keeps_comments_and_non_bmp_text_in_an_existing_config(sandbox):
+    """`setup --profile` used to rewrite config.toml with ensure_ascii escapes (surrogate pairs are invalid TOML), which broke
+    every later claude-hr-ctl command, and it dropped the user's comments even when the profile did not change."""
+    import tomllib
+
+    from claude_hr import ctl
+
+    cfg_file = paths.user_config_file()
+    cfg_file.parent.mkdir(parents=True, exist_ok=True)
+    original = '# my notes\n[monitor]\nalert_command = "notify-send \U0001F6A8"\n[plugins]\nprofile = "minimal"\n'
+    cfg_file.write_text(original, encoding="utf-8")
+    assert ctl._run(["setup", "--only", "claude-md", "--profile", "minimal"]) == 0
+    assert cfg_file.read_text(encoding="utf-8") == original  # unchanged value -> file untouched, comment kept
+    assert ctl._run(["setup", "--only", "claude-md", "--profile", "full"]) == 0
+    data = tomllib.loads(cfg_file.read_text(encoding="utf-8"))  # still valid TOML
+    assert data["monitor"]["alert_command"] == "notify-send \U0001F6A8" and data["plugins"]["profile"] == "full"
+    assert config.load().get("monitor.alert_command") == "notify-send \U0001F6A8"
+
+
+def test_toml_writer_round_trips_awkward_values():
+    import datetime
+    import tomllib
+
+    from claude_hr import ctl
+
+    data = {"a": {"weird key": 'q"uote\back\x7f', "when": datetime.datetime(2026, 1, 2, 3, 4, 5), "day": datetime.date(2026, 1, 2),
+                  "t": {"x y": [1, 2.5, "z"]}}, "plain-key_1": True}
+    assert tomllib.loads(ctl._dump_toml(data)) == data
+
+
+def test_a_config_file_with_a_bom_loads_and_can_be_edited(sandbox):
+    from claude_hr import ctl
+
+    f = paths.user_config_file()
+    f.parent.mkdir(parents=True, exist_ok=True)
+    f.write_bytes(b"\xef\xbb\xbf[resources]\nmax_sessions = 3\n")  # what Windows PowerShell 5.1 `Set-Content -Encoding UTF8` writes
+    assert config.load().get("resources.max_sessions") == 3
+    assert ctl._run(["config", "set", "plugins.profile", "full"]) == 0
+    assert not f.read_bytes().startswith(b"\xef\xbb\xbf") and config.load().get("resources.max_sessions") == 3
+
+
+def test_persist_failures_are_reported_not_raised(sandbox, monkeypatch):
+    from claude_hr import ctl
+
+    f = paths.user_config_file()
+    f.parent.mkdir(parents=True, exist_ok=True)
+
+    def deny(self, *a, **k):
+        raise PermissionError("read-only")
+
+    with monkeypatch.context() as scoped:  # NOT monkeypatch.undo(): that would also undo the sandbox environment
+        scoped.setattr(type(f), "write_text", deny)
+        ok, msg = ctl._persist_config("plugins.profile", "minimal")
+    assert ok is False and "read-only" in msg
+    assert str(paths.hr_home()).startswith(str(sandbox))  # still inside the sandbox
+    f.write_text('plugins = "not a table"\n', encoding="utf-8")
+    ok, msg = ctl._persist_config("plugins.profile", "minimal")
+    assert ok is False and "not a table" in msg
+
+
+def test_config_set_without_a_value_is_rejected(sandbox):
+    from claude_hr import ctl
+
+    assert ctl._run(["config", "set", "plugins.profile"]) == 2
+    assert not paths.user_config_file().exists()
+
+
+def test_install_time_lite_footprint_is_saved(sandbox, monkeypatch):
+    """`CLAUDE_HR_HEADROOM__FOOTPRINT=lite` before the installer only lives for that process; later reinstalls would go full."""
+    import tomllib
+
+    from claude_hr import ctl
+
+    monkeypatch.setenv("CLAUDE_HR_HEADROOM__FOOTPRINT", "lite")
+    assert ctl._run(["setup", "--only", "claude-md"]) == 0
+    assert tomllib.loads(paths.user_config_file().read_text(encoding="utf-8"))["headroom"]["footprint"] == "lite"
+    monkeypatch.delenv("CLAUDE_HR_HEADROOM__FOOTPRINT")
+    assert config.load().get("headroom.footprint") == "lite"
+
+
+def test_scheduler_failures_are_reported_as_errors(sandbox, capsys):
+    from claude_hr import ctl
+
+    line, bad = ctl._schedule_line("systemd timer update: FAILED boom")
+    assert bad and line.startswith("[ERR] schedule:")
+    line, bad = ctl._schedule_line("cron: could not read the current crontab (x); not touching it")
+    assert bad
+    line, bad = ctl._schedule_line("Task Scheduler: nothing to remove")
+    assert not bad and line.startswith("[ok ] schedule:")
+
+
+def test_wt_rm_delete_branch_says_what_it_did(repo):
+    """`--delete-branch` used `git branch -d`, ignored the result and printed only 'removed': an unmerged branch silently stayed."""
+    # a branch with unmerged work is kept, and the message says so
+    rc, path = worktree.new("feat", cwd=repo)
+    assert rc == 0
+    wt = repo / ".claude" / "worktrees" / "feat"
+    (wt / "new.txt").write_text("x")
+    git(wt, "add", "new.txt")
+    git(wt, "commit", "-q", "-m", "unmerged work")
+    rc, msg_ = worktree.remove("feat", delete_branch=True, cwd=repo)
+    assert rc == 0 and "kept branch hr/feat" in msg_ and "git branch -D hr/feat" in msg_
+    assert "hr/feat" in git(repo, "branch", "--list", "hr/*").stdout
+    # a branch with nothing to lose is deleted, and the message says so
+    rc, path = worktree.new("clean", cwd=repo)
+    rc, msg_ = worktree.remove("clean", delete_branch=True, cwd=repo)
+    assert rc == 0 and "deleted branch hr/clean" in msg_
+    assert "hr/clean" not in git(repo, "branch", "--list", "hr/*").stdout
+    # without the flag nothing is said about branches
+    worktree.new("plain", cwd=repo)
+    rc, msg_ = worktree.remove("plain", cwd=repo)
+    assert rc == 0 and msg_.startswith("removed ") and "deleted branch" not in msg_ and "kept branch" not in msg_
+    assert "hr/plain" in git(repo, "branch", "--list", "hr/*").stdout  # the default keeps the branch
+
+
+def test_doctor_flags_a_self_update_that_did_not_finish(sandbox, monkeypatch):
+    from pathlib import Path
+
+    from claude_hr import doctor
+
+    d = paths.hr_home() / "repo" / "src" / "claude_hr"
+    d.mkdir(parents=True)
+    (d / "__init__.py").write_text('__version__ = "99.0.0"\n', encoding="utf-8")
+    hit = [c for c in doctor.run(config.load(), Path.cwd()) if c.name == "claude-hr version"]
+    assert hit and hit[0].status == "warn" and "99.0.0" in hit[0].detail and "update --only self" in hit[0].fix
+    (d / "__init__.py").write_text('__version__ = "0.0.1"\n', encoding="utf-8")
+    assert not [c for c in doctor.run(config.load(), Path.cwd()) if c.name == "claude-hr version"]

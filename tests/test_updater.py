@@ -1,5 +1,8 @@
+import json
 import subprocess
 from pathlib import Path
+
+import pytest
 
 from claude_hr import config, resources, updater
 
@@ -319,3 +322,277 @@ def test_self_update_defers_while_sessions_run(managed_repo, monkeypatch):
     assert res.action == "deferred"
     assert res.target == "v0.2.0"
     assert _git(managed, "describe", "--tags", "--always") == "v0.1.0"  # nothing was checked out
+
+
+def _release_v020(work):
+    (work / "f").write_text("2")
+    _git(work, "commit", "-q", "-am", "c2")
+    _git(work, "tag", "v0.2.0")
+    _git(work, "push", "-q", "origin", "main", "--tags")
+
+
+def test_update_self_only_queues_the_reinstall(managed_repo, monkeypatch):
+    """The reinstall replaces the running tool environment: update_self must not start it, run() starts it last."""
+    origin, work, managed = managed_repo
+    _release_v020(work)
+    spawned = []
+    monkeypatch.setattr(updater, "_spawn_detached", lambda cmd, log=None: spawned.append(cmd))
+    u = updater.Updater(config.load())
+    res = u.update_self()
+    assert res.action == "updated" and res.target == "v0.2.0"
+    assert spawned == [], "update_self started the reinstall itself"
+    assert u._pending_reinstall and u._pending_reinstall[1:3] == ["tool", "install"]
+    assert _git(managed, "describe", "--tags", "--always") == "v0.2.0"  # the checkout (and so the plugin source) is already new
+
+
+def test_run_starts_the_reinstall_after_plugins_were_updated(sandbox, monkeypatch):
+    """Windows regression: `self` then `plugins` in one process used to leave the tool environment empty."""
+    events = []
+    u = updater.Updater(config.load())
+
+    def fake_self():
+        u._pending_reinstall = ["uv", "tool", "install", "--force", "--reinstall", "/repo"]
+        events.append("self")
+        return updater.Result("self", action="updated")
+
+    monkeypatch.setattr(u, "update_self", fake_self)
+    monkeypatch.setattr(u, "update_plugins", lambda: events.append("plugins") or updater.Result("plugins"))
+    monkeypatch.setattr(updater.paths, "IS_WINDOWS", False)  # this test is about ordering, not the Windows helper
+    monkeypatch.setattr(updater, "_start_systemd_service", lambda cmd, log: False)  # fall through to the plain spawn
+    monkeypatch.setattr(updater, "_spawn_detached", lambda cmd, log=None: events.append("reinstall"))
+    u.run(["self", "plugins"])
+    assert events == ["self", "plugins", "reinstall"]
+    assert u._pending_reinstall is None
+    events.clear()
+    u.run(["plugins"])  # nothing queued -> nothing started
+    assert events == ["plugins"]
+
+
+def _windows_updater(monkeypatch):
+    monkeypatch.setattr(updater.paths, "IS_WINDOWS", True)
+    monkeypatch.setattr(updater.procutil, "which_all", lambda name: [r"C:\Windows\powershell.exe"])
+    u = updater.Updater(config.load())
+    u._pending_reinstall = [r"C:\Users\O'Neil\bin\uv.exe", "tool", "install", "--force", "--reinstall", r"C:\Users\O'Neil\.claude-hr\repo"]
+    __import__("shutil").rmtree(updater.paths.hr_home(), ignore_errors=True)  # the updater must create state/ and logs/ itself
+    return u
+
+
+def test_windows_reinstall_runs_from_a_scheduled_task_not_as_our_child(sandbox, monkeypatch):
+    """uv's claude-hr-ctl.exe trampoline kills everything in its job when it exits, so a child of ours never reinstalls."""
+    started, spawned = [], []
+    monkeypatch.setattr(updater, "_start_helper_task", lambda shell, script: started.append((shell, script)) or True)
+    monkeypatch.setattr(updater, "_spawn_detached", lambda cmd, log=None: spawned.append(cmd))
+    u = _windows_updater(monkeypatch)
+    u._launch_reinstall()
+    assert spawned == []
+    shell, script_path = started[0]
+    assert shell.endswith("powershell.exe") and script_path.name == "self-update.ps1"
+    raw = script_path.read_bytes()
+    assert raw.startswith(b"\xef\xbb\xbf")  # BOM, or PowerShell 5.1 reads the file as ANSI
+    text = raw.decode("utf-8-sig")
+    assert text.index("Wait-Process") < text.index("'tool'")  # waits for this process first, then reinstalls
+    assert "claude-hr*" in text  # also waits for the claude-hr-ctl.exe trampoline that started this process
+
+
+def test_windows_reinstall_falls_back_to_a_direct_helper_if_the_scheduler_refuses(sandbox, monkeypatch):
+    import base64
+
+    spawned = []
+    monkeypatch.setattr(updater, "_start_helper_task", lambda shell, script: False)
+    monkeypatch.setattr(updater, "_spawn_detached", lambda cmd, log=None: spawned.append(cmd))
+    _windows_updater(monkeypatch)._launch_reinstall()
+    cmd = spawned[0]
+    assert cmd[0].endswith("powershell.exe") and "-EncodedCommand" in cmd
+    assert "Wait-Process" in base64.b64decode(cmd[-1]).decode("utf-16-le")
+
+
+@pytest.mark.real_helpers
+def test_helper_task_is_registered_and_started_synchronously(sandbox, monkeypatch, tmp_path):
+    seen = {}
+
+    def fake_run(cmd, **k):
+        seen["cmd"], seen["kw"] = cmd, k
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+
+    monkeypatch.setattr(updater.procutil, "run", fake_run)
+    assert updater._start_helper_task("powershell.exe", tmp_path / "self-update.ps1") is True
+    ps = seen["cmd"][-1]
+    assert "Register-ScheduledTask -TaskName 'selfupdate' -TaskPath '\\claude-hr\\'" in ps
+    assert ps.index("Register-ScheduledTask") < ps.index("Start-ScheduledTask")
+    assert "-File" in ps and "self-update.ps1" in ps and "-ExecutionPolicy Bypass" in ps
+    monkeypatch.setattr(updater.procutil, "run", lambda cmd, **k: subprocess.CompletedProcess(cmd, 1, "", "denied"))
+    assert updater._start_helper_task("powershell.exe", tmp_path / "x.ps1") is False
+
+
+@pytest.mark.real_helpers
+def test_detached_helper_breaks_away_from_the_trampoline_job_and_logs(sandbox, monkeypatch, tmp_path):
+    """uv's claude-hr-ctl.exe trampoline kills its job on exit; the reinstall helper must survive it and say what it did."""
+    calls = []
+
+    def fake_popen(cmd, **kwargs):
+        calls.append((cmd, kwargs))
+        if len(calls) == 1:
+            raise OSError("breakaway not permitted")  # the parent job forbids it: fall back to a plain detached start
+
+    monkeypatch.setattr(updater.paths, "IS_WINDOWS", True)
+    monkeypatch.setattr(subprocess, "Popen", fake_popen)
+    log = tmp_path / "self-update.log"
+    updater._spawn_detached(["powershell", "-File", "x"], log)
+    assert calls[0][1]["creationflags"] & 0x01000000  # CREATE_BREAKAWAY_FROM_JOB first
+    assert calls[0][1]["creationflags"] & 0x00000008  # DETACHED_PROCESS
+    assert not calls[1][1]["creationflags"] & 0x01000000  # fallback without it
+    assert log.exists() and calls[1][1]["stdout"] is not subprocess.DEVNULL  # output goes to the log, not nowhere
+
+
+def test_reinstall_script_recreates_the_uv_environment(sandbox):
+    """Regression: a task started by Task Scheduler does not inherit UV_TOOL_DIR, so the helper installed claude-hr into the
+    default tool directory instead of the one the updater was running from."""
+    env = {"UV_TOOL_DIR": r"D:\x'y\tools", "UV_TOOL_BIN_DIR": r"D:\bin", "Path": r"C:\a;C:\b", "UNRELATED": "no", "CLAUDE_CONFIG_DIR": "no"}
+    lines = updater._windows_reinstall_script(["uv", "tool", "install"], 1, 2, "log.txt", env=env).splitlines()
+    assert r"$env:UV_TOOL_DIR = 'D:\x''y\tools'" in lines
+    assert r"$env:UV_TOOL_BIN_DIR = 'D:\bin'" in lines
+    assert r"$env:Path = 'C:\a;C:\b'" in lines
+    assert not any("UNRELATED" in ln or "CLAUDE_CONFIG_DIR" in ln for ln in lines)
+    last_env = max(i for i, ln in enumerate(lines) if ln.startswith("$env:"))
+    assert last_env < next(i for i, ln in enumerate(lines) if ln.startswith("& "))  # set before uv runs
+
+
+def test_reinstall_script_logs_each_step_and_quotes_awkward_paths():
+    script = updater._windows_reinstall_script(
+        [r"C:\Users\O'Neil\uv.exe", "tool", "install", r"D:\a b\repo"], 111, 222, r"C:\Users\O'Neil\logs\self-update.log", env={})
+    lines = script.splitlines()
+    assert "$ids = @(111)" in lines and any("Get-Process -Id 222" in ln for ln in lines)
+    assert any(ln.startswith("Wait-Process -Id $ids") for ln in lines)
+    uv_line = next(ln for ln in lines if ln.startswith("& "))
+    assert uv_line.startswith(r"& 'C:\Users\O''Neil\uv.exe' 'tool' 'install' 'D:\a b\repo' 2>&1 | ForEach-Object")
+    assert "Add-Content -LiteralPath $log -Encoding UTF8" in uv_line  # ONE encoding in the log (5.1: `*>>` wrote UTF-16)
+    assert "-Encoding UTF8" in next(ln for ln in lines if ln.startswith("function Log"))
+    assert "$log = 'C:\\Users\\O''Neil\\logs\\self-update.log'" in lines
+    assert any("reinstall exit code" in ln for ln in lines)
+    # it removes its own script (it may hold the user's PATH) and then the one-shot task that started it
+    assert any("Remove-Item -LiteralPath $PSCommandPath" in ln for ln in lines)
+    assert lines[-1].startswith("Unregister-ScheduledTask -TaskName 'selfupdate' -TaskPath '\\claude-hr\\'")
+
+
+def test_helper_environment_never_carries_credentials():
+    """The helper script is a file on disk: no tokens, passwords or URLs with embedded credentials may be written into it."""
+    env = {
+        "UV_TOOL_DIR": r"D:\tools", "UV_CACHE_DIR": r"D:\cache", "Path": r"C:\a;C:\b",
+        "UV_INDEX_URL": "https://user:pw@mirror.example/simple", "UV_INDEX_CORP_PASSWORD": "pw", "UV_PUBLISH_TOKEN": "t",
+        "UV_GITHUB_TOKEN": "t", "UV_INDEX_CORP_USERNAME": "u", "UV_KEYRING_PROVIDER": "subprocess", "UV_INDEX": "https://ok.example/simple",
+        "GITHUB_TOKEN": "t", "HOME": "x",
+    }
+    kept = updater._helper_env(env)
+    assert kept == {"UV_TOOL_DIR": r"D:\tools", "UV_CACHE_DIR": r"D:\cache", "Path": r"C:\a;C:\b", "UV_INDEX": "https://ok.example/simple"}
+    script = updater._windows_reinstall_script(["uv"], 1, 2, "log.txt", env=env)
+    for secret in ("user:pw", "PASSWORD", "UV_PUBLISH_TOKEN", "GITHUB_TOKEN", "USERNAME", "KEYRING"):
+        assert secret not in script
+
+
+def test_powershell_quoting_doubles_every_kind_of_single_quote():
+    """PowerShell also closes a string at U+2018/2019/201A/201B: one in a path would end the literal early (and could inject)."""
+    for q in ("'", "\u2018", "\u2019", "\u201a", "\u201b"):
+        quoted = updater._ps_quote(f"C:\\Users\\Tim{q}s\\bin")
+        assert quoted == f"'C:\\Users\\Tim{q}{q}s\\bin'"
+    assert updater._ps_quote("plain") == "'plain'"
+
+
+@pytest.mark.skipif(__import__("shutil").which("powershell") is None and __import__("shutil").which("pwsh") is None, reason="needs PowerShell")
+def test_generated_helper_script_parses_with_hostile_values(tmp_path):
+    """Render the script with awkward values and let the real PowerShell parser judge it (parse only, nothing is run)."""
+    shell = __import__("shutil").which("powershell") or __import__("shutil").which("pwsh")
+    env = {"UV_TOOL_DIR": "C:\\Users\\Tim\u2019s\\t'ools", "Path": "C:\\a b;C:\\\u201bq;$(calc);`n", "UV_X": "line1\nline2"}
+    script = updater._windows_reinstall_script(
+        ["C:\\Users\\Tim\u2019s\\uv.exe", "tool", "install", "D:\\a $(calc) b\\repo"], 1, 2, "C:\\l\u2018og\\x.log", env=env)
+    ps1 = tmp_path / "helper.ps1"
+    ps1.write_bytes(b"\xef\xbb\xbf" + script.encode("utf-8"))
+    check = (
+        "$e = $null; $t = $null; [void][System.Management.Automation.Language.Parser]::ParseFile("
+        f"'{ps1}', [ref]$t, [ref]$e); if ($e.Count -eq 0) {{ 'PARSE_OK' }} else {{ $e | ForEach-Object {{ $_.Message }} }}"
+    )
+    out = subprocess.run([shell, "-NoProfile", "-NonInteractive", "-Command", check], capture_output=True, text=True, timeout=60).stdout
+    assert "PARSE_OK" in out, out
+
+
+@pytest.mark.real_helpers
+def test_systemd_service_survives_the_timer_job_and_gets_the_uv_environment(sandbox, monkeypatch):
+    from claude_hr import resources
+
+    seen = {}
+    monkeypatch.setattr(updater.paths, "IS_LINUX", True)
+    monkeypatch.setattr(resources, "caps_available", lambda: True)
+    monkeypatch.setattr(updater.procutil, "run", lambda cmd, **k: seen.update(cmd=cmd) or subprocess.CompletedProcess(cmd, 0, "", ""))
+    monkeypatch.setenv("UV_TOOL_DIR", "/srv/tools")
+    monkeypatch.setenv("UV_PUBLISH_TOKEN", "secret")
+    assert updater._start_systemd_service(["uv", "tool", "install"], "/tmp/self-update.log") is True
+    cmd = seen["cmd"]
+    assert cmd[:3] == ["systemd-run", "--user", "--quiet"]
+    assert any(a.startswith("--unit=claude-hr-selfupdate-") for a in cmd)
+    assert "StandardOutput=append:/tmp/self-update.log" in cmd and "--setenv=UV_TOOL_DIR=/srv/tools" in cmd
+    assert not any("secret" in a or "PUBLISH_TOKEN" in a for a in cmd)
+    assert cmd[-4:] == ["--", "uv", "tool", "install"] or cmd[cmd.index("--") + 1:] == ["uv", "tool", "install"]
+    monkeypatch.setattr(resources, "caps_available", lambda: False)
+    assert updater._start_systemd_service(["uv"], "/tmp/x.log") is False  # no user manager: caller falls back to a plain spawn
+
+
+def test_posix_reinstall_prefers_a_systemd_unit_and_falls_back_to_a_plain_spawn(sandbox, monkeypatch):
+    events = []
+    monkeypatch.setattr(updater.paths, "IS_WINDOWS", False)
+    u = updater.Updater(config.load())
+    monkeypatch.setattr(updater, "_start_systemd_service", lambda cmd, log: events.append("unit") or True)
+    monkeypatch.setattr(updater, "_spawn_detached", lambda cmd, log=None: events.append("spawn"))
+    u._pending_reinstall = ["uv", "tool", "install"]
+    u._launch_reinstall()
+    assert events == ["unit"]
+    monkeypatch.setattr(updater, "_start_systemd_service", lambda cmd, log: events.append("unit") or False)
+    u._pending_reinstall = ["uv", "tool", "install"]
+    u._launch_reinstall()
+    assert events == ["unit", "unit", "spawn"]
+
+
+def _stub_uv(monkeypatch, found=True):
+    real = updater.procutil.which_all
+    monkeypatch.setattr(updater.procutil, "which_all", lambda name: ([r"/usr/bin/uv"] if found else []) if name == "uv" else real(name))
+
+
+def test_uv_missing_does_not_move_the_checkout(managed_repo, monkeypatch):
+    """The checkout used to move first; with uv missing the tool then stayed old and `head == want` hid the problem forever."""
+    origin, work, managed = managed_repo
+    _release_v020(work)
+    _stub_uv(monkeypatch, found=False)
+    res = updater.Updater(config.load()).update_self()
+    assert res.action == "failed" and "uv missing" in res.detail
+    assert _git(managed, "describe", "--tags", "--always") == "v0.1.0"
+
+
+def _fake_checkout_version(managed, version):
+    d = managed / "src" / "claude_hr"
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "__init__.py").write_text(f'__version__ = "{version}"\n', encoding="utf-8")
+
+
+def test_a_reinstall_that_never_finished_is_retried(managed_repo, monkeypatch, sandbox):
+    """Checkout at the newest tag but the installed tool is older: the earlier reinstall failed/was killed -> try again."""
+    origin, work, managed = managed_repo
+    _release_v020(work)
+    _git(managed, "fetch", "-q", "--tags")
+    _git(managed, "checkout", "-q", "--detach", "v0.2.0")
+    _stub_uv(monkeypatch)
+    monkeypatch.setattr(updater, "__version__", "0.1.0", raising=False)
+    monkeypatch.setattr("claude_hr.__version__", "0.1.0")
+    _fake_checkout_version(managed, "0.2.0")
+    u = updater.Updater(config.load())
+    paths_state = updater.paths.state_dir()
+    paths_state.mkdir(parents=True, exist_ok=True)
+    (paths_state / "self-update.json").write_text('{"ts": 1}', encoding="utf-8")  # long ago
+    res = u.update_self()
+    assert res.action == "updated" and "retrying" in res.detail
+    assert u._pending_reinstall and u._pending_reinstall[1:3] == ["tool", "install"]
+    # ... but not while a reinstall started a moment ago may still be running
+    u2 = updater.Updater(config.load())
+    (paths_state / "self-update.json").write_text(json.dumps({"ts": __import__("time").time()}), encoding="utf-8")
+    res2 = u2.update_self()
+    assert res2.action == "none" and "waiting" in res2.detail and u2._pending_reinstall is None
+    # an up-to-date tool is left alone
+    monkeypatch.setattr("claude_hr.__version__", "0.2.0")
+    assert updater.Updater(config.load()).update_self().detail == ""

@@ -28,10 +28,14 @@ def _deep_merge(base: dict, over: dict) -> dict:
 
 def _load_toml(path: Path) -> dict:
     try:
-        with path.open("rb") as fh:
-            return tomllib.load(fh)
+        # utf-8-sig: Windows PowerShell 5.1 (`Set-Content -Encoding UTF8`) and some editors write a BOM, which tomllib rejects
+        text = path.read_text(encoding="utf-8-sig")
     except FileNotFoundError:
         return {}
+    except UnicodeDecodeError as exc:
+        raise ValueError(f"{path} is not valid UTF-8: {exc}") from exc
+    try:
+        return tomllib.loads(text)
     except tomllib.TOMLDecodeError as exc:
         raise ValueError(f"invalid TOML in {path}: {exc}") from exc
 

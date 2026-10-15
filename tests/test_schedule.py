@@ -107,3 +107,55 @@ def test_cron_install_never_overwrites_an_unreadable_crontab(sandbox, monkeypatc
     msgs = schedule.install(config.load())
     assert "not touching it" in msgs[0]
     assert ["crontab", "-"] not in calls
+
+
+def _windows_remove(monkeypatch, returncode, stdout="", stderr=""):
+    from claude_hr import procutil
+
+    seen = {}
+
+    def fake_run(cmd, **k):
+        seen["cmd"] = cmd
+        return subprocess.CompletedProcess(cmd, returncode, stdout, stderr)
+
+    monkeypatch.setattr(procutil, "run", fake_run)
+    monkeypatch.setattr(schedule.paths, "IS_WINDOWS", True)
+    return schedule.remove(), seen["cmd"]
+
+
+def test_windows_remove_with_no_tasks_is_not_a_failure(sandbox, monkeypatch):
+    """Regression: uninstall printed '[ok ] schedule: FAILED' when nothing had ever been registered (-SkipSchedule)."""
+    msgs, cmd = _windows_remove(monkeypatch, 0, stdout="0\n")
+    assert msgs == ["Task Scheduler: nothing to remove"]
+    assert "Count -gt 0" in cmd[-1] and "exit 1" in cmd[-1]
+
+
+def test_windows_remove_only_touches_this_installs_tasks(sandbox, monkeypatch):
+    """Regression: uninstall in a sandbox (or a second profile) removed EVERY task under \\claude-hr\\ on the machine."""
+    msgs, cmd = _windows_remove(monkeypatch, 0, stdout="0\n")
+    script = cmd[-1]
+    mine = str(schedule.Path(schedule.job_argv()[0]).parent)
+    assert f"$mine = '{mine}'" in script
+    assert "StartsWith($mine" in script  # only tasks whose action runs from this install's environment
+    assert "'selfupdate'" in script and "Test-Path -LiteralPath $_.Execute" in script  # + the one-shot helper and orphans
+    # the real PowerShell parser must accept it (parse only; nothing is run)
+    shell = __import__("shutil").which("powershell") or __import__("shutil").which("pwsh")
+    if shell:
+        check = ("$e = $null; $t = $null; [void][System.Management.Automation.Language.Parser]::ParseInput($args[0], [ref]$t, [ref]$e); "
+                 "if ($e.Count -eq 0) { 'PARSE_OK' } else { $e | ForEach-Object { $_.Message } }")
+        out = subprocess.run([shell, "-NoProfile", "-NonInteractive", "-Command", check, script], capture_output=True, text=True, timeout=60).stdout
+        assert "PARSE_OK" in out, out
+
+
+def test_windows_remove_reports_how_many_tasks_went_and_real_failures(sandbox, monkeypatch):
+    assert _windows_remove(monkeypatch, 0, stdout="4\n")[0] == ["Task Scheduler: removed 4 task(s)"]
+    msgs = _windows_remove(monkeypatch, 1, stderr="Access is denied")[0]
+    assert msgs and msgs[0].startswith("FAILED") and "Access is denied" in msgs[0]
+
+
+def test_update_job_is_allowed_to_leave_its_reinstall_running(sandbox):
+    """The update job ends by starting the reinstall as a child; systemd (control-group) and launchd would kill it with the job."""
+    service, _ = schedule.render_systemd(schedule.Spec("update", "daily", at="03:17"), ARGV, "/bin")
+    assert "KillMode=process" in service
+    plist = plistlib.loads(schedule.render_launchd(schedule.Spec("update", "daily", at="03:17"), ARGV, "/bin"))
+    assert plist["AbandonProcessGroup"] is True

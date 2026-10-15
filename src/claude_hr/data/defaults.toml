@@ -19,7 +19,7 @@ default_flags = []           # extra flags always prepended to interactive/headl
 env = {}                     # extra env vars written into settings.json `env`
 
 [plugins]
-profile = "standard"         # minimal | standard | full  (see src/claude_hr/data/plugins.toml)
+profile = "standard"         # minimal | standard | full | lean-output  (see src/claude_hr/data/plugins.toml); `setup --profile X` saves X here
 
 [headroom]
 enabled = true
@@ -97,7 +97,7 @@ disk_warn_gb = 10
 mem_warn_pct = 90
 claude_dir_warn_gb = 10
 restart_proxy = true         # self-heal: restart the shared proxy if it died (max once per 10 min)
-alert_command = ""           # shell command run on alert; env CLAUDE_HR_ALERT_TITLE / CLAUDE_HR_ALERT_BODY
+alert_command = ""           # command line, split into arguments and run WITHOUT a shell (no pipes or expansion); the text arrives in CLAUDE_HR_ALERT_TITLE / CLAUDE_HR_ALERT_BODY
 alert_ntfy_url = ""          # e.g. https://ntfy.sh/<topic>   (push to phone; Claude's own push needs Remote Control)
 alert_webhook_url = ""
 alert_cooldown_hours = 6
@@ -107,7 +107,6 @@ enabled = true
 at = "03:17"
 cooldown_days = 5            # unattended installs skip releases younger than this (supply-chain / regression buffer)
 auto_apply = true            # false = only report what is available
-smoke_online = false         # true = also run a 1-turn `claude -p` through the proxy before promoting
 
 [claude_md]
 max_global_lines = 80

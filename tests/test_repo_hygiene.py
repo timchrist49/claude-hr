@@ -65,6 +65,19 @@ def test_skill_and_agent_names_match_their_location():
         assert name == md.stem, f"{md}: name {name!r} != file {md.stem!r}"
 
 
+def test_agents_do_not_list_bash_command_filters_in_tools():
+    """Claude Code ignores `Bash(git diff *)` in a subagent's tools list and grants the whole Bash tool; keep agents read-only."""
+    for md in (ROOT / "plugins").glob("*/agents/*.md"):
+        tools = re.search(r"(?m)^tools:\s*(.+)$", md.read_text(encoding="utf-8").split("---", 2)[1])
+        assert tools and "Bash" not in tools.group(1), f"{md.name}: grants the Bash tool"
+
+
+def test_side_effecting_skills_are_manual_only():
+    for name in ("hr-status", "hr-parallel-worktrees"):
+        fm = (ROOT / "plugins" / "hr-core" / "skills" / name / "SKILL.md").read_text(encoding="utf-8").split("---", 2)[1]
+        assert re.search(r"(?m)^disable-model-invocation:\s*true", fm), name
+
+
 def test_no_stray_control_characters_in_text_files():
     """A scripted edit once turned a backslash-v in a path into a vertical tab; also catches crash dumps and binaries."""
     bad = re.compile(rb"[\x00-\x08\x0b\x0c\x0e-\x1f]")
@@ -95,5 +108,8 @@ def test_hook_commands_fail_open_when_hr_is_missing():
 
 def test_license_is_present_and_consistent():
     text = (ROOT / "LICENSE").read_text(encoding="utf-8")
-    assert "All rights reserved" in text and "timchrist49" in text
-    assert "Proprietary" in (ROOT / "pyproject.toml").read_text(encoding="utf-8")
+    assert text.startswith("MIT License\n") and "Copyright (c) 2026 timchrist49" in text
+    assert "Permission is hereby granted, free of charge" in text  # untouched standard text, so GitHub detects it
+    assert 'license = { text = "MIT" }' in (ROOT / "pyproject.toml").read_text(encoding="utf-8")
+    plugin = json.loads((ROOT / "plugins" / "hr-core" / ".claude-plugin" / "plugin.json").read_text(encoding="utf-8"))
+    assert plugin["license"] == "MIT"

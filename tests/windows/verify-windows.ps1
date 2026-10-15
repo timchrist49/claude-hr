@@ -2,13 +2,14 @@
 #   powershell -NoProfile -ExecutionPolicy Bypass -File tests\windows\verify-windows.ps1
 # Installs into %TEMP%\esb3 (own uv tool dir, Claude config dir and claude-hr home), runs ~30 checks incl. the real Headroom
 # install and ONE tiny `claude -p` call with your real login, then uninstalls and deletes the sandbox. It never writes
-# to your real ~/.claude or ~/.claude-hr, and it verifies that afterwards. Takes ~3-5 minutes (2 GB download).
+# to your real ~/.claude or ~/.claude-hr, and it verifies that afterwards. Takes ~3-5 minutes (about 0.5 GB download, 2 GB on disk).
 $ErrorActionPreference = 'Continue'
 $repo = (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path
 $sb = Join-Path $env:TEMP 'esb3'
 if (Test-Path $sb) { Remove-Item -Recurse -Force $sb }
 New-Item -ItemType Directory -Force -Path "$sb\h\.claude", "$sb\tooldir", "$sb\toolbin", "$sb\proj" | Out-Null
 $realConfig = "$env:USERPROFILE\.claude"
+$tasksBefore = (@(Get-ScheduledTask -TaskPath '\claude-hr\' -ErrorAction SilentlyContinue | ForEach-Object TaskName) | Sort-Object) -join ','
 $pass = 0; $fail = 0
 function Check($name, [bool]$ok, $detail = '') { if ($ok) { $script:pass++; "  PASS $name" } else { $script:fail++; "  FAIL $name  $detail" } }
 
@@ -94,12 +95,12 @@ Check "CLAUDE.md block removed" ((-not (Test-Path "$sb\h\.claude\CLAUDE.md")) -o
 "== real profile untouched? =="
 Check "no ~/.claude-hr" (-not (Test-Path "$env:USERPROFILE\.claude-hr"))
 Check "no claude-hr keys in real settings.json" ((Get-Content "$realConfig\settings.json" -Raw) -notmatch 'CLAUDE_HR_MANAGED')
-Check "no claude-hr scheduler tasks" (@(Get-ScheduledTask -TaskPath '\claude-hr\' -ErrorAction SilentlyContinue).Count -eq 0)
+$tasksAfter = (@(Get-ScheduledTask -TaskPath '\claude-hr\' -ErrorAction SilentlyContinue | ForEach-Object TaskName) | Sort-Object) -join ','
+Check "scheduler tasks unchanged (none created, none of yours removed)" ($tasksAfter -eq $tasksBefore) "before: $tasksBefore after: $tasksAfter"
 "WIN_RESULT: $pass passed, $fail failed"
 
-# teardown: proxy, daemon, sandbox
+# teardown: proxy, sandbox (nothing here starts a Claude daemon, so none is stopped: it could be the user's own)
 Get-NetTCPConnection -LocalPort 18788 -State Listen -ErrorAction SilentlyContinue | ForEach-Object { taskkill /PID $_.OwningProcess /T /F | Out-Null }
-claude daemon stop --any 2>&1 | Out-Null
 Set-Location 'C:\'
 Remove-Item -Recurse -Force $sb -ErrorAction SilentlyContinue
 "sandbox removed: $(-not (Test-Path $sb))"

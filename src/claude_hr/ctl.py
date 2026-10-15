@@ -65,6 +65,12 @@ def _print_step(step: Step) -> None:
 # ---------------------------------------------------------------------------------------------
 # setup / uninstall
 # ---------------------------------------------------------------------------------------------
+def _schedule_line(msg: str) -> tuple[str, bool]:
+    """Format one scheduler message; failures are reported as errors instead of '[ok ] ... FAILED'."""
+    bad = "FAILED" in msg or "could not" in msg
+    return f"[{'ERR' if bad else 'ok '}] schedule: {msg}", bad
+
+
 def cmd_setup(a, cfg) -> int:
     paths.ensure_dirs()
     steps = [s for s in ALL_STEPS if (not a.only or s in a.only) and s not in (a.skip or [])]
@@ -74,6 +80,17 @@ def cmd_setup(a, cfg) -> int:
     failed = 0
     if a.profile:
         cfg.data.setdefault("plugins", {})["profile"] = a.profile
+        if not a.dry_run:
+            # a profile chosen at install time must stick: doctor, `plugins sync` and every later `setup` read the config
+            ok, msg = _persist_config("plugins.profile", a.profile)
+            out(f"[{'ok ' if ok else 'ERR'}] plugin profile: {msg if not ok else f'{a.profile} saved to {paths.user_config_file()}'}")
+            failed += 0 if ok else 1
+    if not a.dry_run and str(cfg.get("headroom.footprint", "auto")) == "lite":
+        # the lite choice (often made with an environment variable for the installer) decides which Headroom extras later
+        # reinstalls and upgrades use, so it must outlive this process
+        ok, msg = _persist_config("headroom.footprint", "lite")
+        out(f"[{'ok ' if ok else 'ERR'}] headroom footprint: {msg if not ok else 'lite saved to ' + str(paths.user_config_file())}")
+        failed += 0 if ok else 1
     if "headroom" in steps and cfg.flag("headroom.enabled", True):
         st = Step("headroom")
         cur = hr.version()
@@ -114,7 +131,9 @@ def cmd_setup(a, cfg) -> int:
             failed += 0 if st.ok else 1
     if "schedule" in steps and not a.dry_run:
         for m in schedule.install(cfg):
-            out(f"[ok ] schedule: {m}")
+            line, bad = _schedule_line(m)
+            out(line)
+            failed += 1 if bad else 0
     st_file = paths.state_dir() / "install.json"
     if not a.dry_run:
         write_json(st_file, {"version": __version__, "ts": time.time(), "profile": cfg.get("plugins.profile")})
@@ -141,8 +160,11 @@ def cmd_uninstall(a, cfg) -> int:
     claude = procutil.find_claude(str(cfg.get("claude.binary", "") or ""))
     hr = Headroom(cfg)
     setup = ClaudeSetup(cfg, hr, claude, dry=a.dry_run)
+    sched_failed = False
     for m in schedule.remove() if not a.dry_run else []:
-        out(f"[ok ] schedule: {m}")
+        line, bad = _schedule_line(m)
+        out(line)
+        sched_failed = sched_failed or bad
     _print_step(setup.revert_settings())
     _print_step(setup.remove_claude_md())
     _print_step(setup.unregister_mcp())
@@ -162,6 +184,9 @@ def cmd_uninstall(a, cfg) -> int:
             else:
                 out("[ok ] purged ~/.claude-hr and uninstalled Headroom")
     out("Uninstalled managed configuration. Your own settings, plugins and CLAUDE.md content were left untouched.")
+    if sched_failed:
+        out("[warn] the scheduled jobs could not be removed (see above); remove them with `claude-hr-ctl schedule remove` or in Task Scheduler / systemd")
+        return 1
     return 0
 
 
@@ -211,46 +236,77 @@ def cmd_config(a, cfg) -> int:
     elif a.action == "get":
         out(json.dumps(cfg.get(a.key)))
     elif a.action == "set":
-        f = paths.user_config_file()
-        try:
-            data = tomllib.loads(f.read_text(encoding="utf-8")) if f.exists() else {}
-        except tomllib.TOMLDecodeError as exc:
-            out(f"cannot edit {f}: {exc}")
-            return 1
-        cur = data
-        parts = a.key.split(".")
-        for p in parts[:-1]:
-            cur = cur.setdefault(p, {})
-        cur[parts[-1]] = config_mod._parse_scalar(a.value)
-        f.parent.mkdir(parents=True, exist_ok=True)
-        f.write_text(_dump_toml(data), encoding="utf-8")
-        out(f"{a.key} = {cur[parts[-1]]!r}  ({f})")
+        ok, msg = _persist_config(a.key, a.value)
+        out(msg)
+        return 0 if ok else 1
     return 0
 
 
+def _persist_config(key: str, raw_value: str) -> tuple[bool, str]:
+    """Write one key into the per-user config file (~/.claude-hr/config.toml). Returns (ok, message). Never raises, and does
+    not touch the file at all when the value is already what was asked for (so the installer cannot strip your comments)."""
+    f = paths.user_config_file()
+    try:
+        data = tomllib.loads(f.read_text(encoding="utf-8-sig")) if f.exists() else {}
+        cur = data
+        parts = key.split(".")
+        for p in parts[:-1]:
+            nxt = cur.setdefault(p, {})
+            if not isinstance(nxt, dict):
+                return False, f"cannot set {key}: '{p}' is not a table in {f}"
+            cur = nxt
+        value = config_mod._parse_scalar(raw_value)
+        if parts[-1] in cur and cur[parts[-1]] == value and type(cur[parts[-1]]) is type(value):
+            return True, f"{key} = {value!r}  ({f}, unchanged)"
+        cur[parts[-1]] = value
+        f.parent.mkdir(parents=True, exist_ok=True)
+        f.write_text(_dump_toml(data), encoding="utf-8")
+        return True, f"{key} = {value!r}  ({f})"
+    except (OSError, ValueError) as exc:  # ValueError covers tomllib.TOMLDecodeError and UnicodeDecodeError
+        return False, f"cannot edit {f}: {exc}"
+
+
+_BARE_KEY = __import__("re").compile(r"[A-Za-z0-9_-]+")
+
+
+def _toml_key(k) -> str:
+    k = str(k)
+    return k if _BARE_KEY.fullmatch(k) else _toml_string(k)
+
+
+def _toml_string(s: str) -> str:
+    # JSON string syntax is valid TOML except that DEL must be escaped; ensure_ascii=False keeps non-BMP characters as
+    # themselves (ensure_ascii=True would write surrogate pairs, which TOML forbids)
+    return json.dumps(s, ensure_ascii=False).replace("\x7f", "\\u007f")
+
+
 def _toml_val(v) -> str:
+    import datetime as _dt
+
     if isinstance(v, bool):
         return "true" if v else "false"
     if isinstance(v, (int, float)):
         return repr(v)
+    if isinstance(v, (_dt.datetime, _dt.date, _dt.time)):
+        return v.isoformat()
     if isinstance(v, list):
         return "[" + ", ".join(_toml_val(x) for x in v) + "]"
     if isinstance(v, dict):
-        return "{ " + ", ".join(f"{json.dumps(k)} = {_toml_val(x)}" for k, x in v.items()) + " }"
-    return json.dumps(str(v))
+        return "{ " + ", ".join(f"{_toml_key(k)} = {_toml_val(x)}" for k, x in v.items()) + " }"
+    return _toml_string(str(v))
 
 
-def _dump_toml(data: dict, prefix: str = "") -> str:
+def _dump_toml(data: dict, prefix: tuple = ()) -> str:
     lines = ["# edited by `claude-hr-ctl config set` (comments are not preserved)"] if not prefix else []
     for k, v in data.items():
         if not isinstance(v, dict):
-            lines.append(f"{k} = {_toml_val(v)}")
+            lines.append(f"{_toml_key(k)} = {_toml_val(v)}")
     for k, v in data.items():
         if isinstance(v, dict):
-            name = f"{prefix}.{k}" if prefix else k
+            path = (*prefix, k)
             lines.append("")
-            lines.append(f"[{name}]")
-            lines.append(_dump_toml(v, name))
+            lines.append("[" + ".".join(_toml_key(part) for part in path) + "]")
+            lines.append(_dump_toml(v, path))
     return "\n".join(lines).strip("\n") + "\n"
 
 
@@ -393,7 +449,7 @@ def cmd_schedule(a, cfg) -> int:
     msgs = {"install": lambda: schedule.install(cfg), "remove": schedule.remove, "status": schedule.status}[a.action]()
     for m in msgs:
         out(m)
-    return 0
+    return 1 if a.action != "status" and any(_schedule_line(m)[1] for m in msgs) else 0
 
 
 def cmd_monitor(a, cfg) -> int:
@@ -738,6 +794,9 @@ def _run(argv: list[str]) -> int:
         return 2
     if args.cmd == "config" and args.action in {"get", "set"} and not args.key:
         out("config get/set need a key")
+        return 2
+    if args.cmd == "config" and args.action == "set" and args.value is None:
+        out("config set needs a key and a value")
         return 2
     paths.tighten_existing()
     return int(args.fn(args, cfg) or 0)

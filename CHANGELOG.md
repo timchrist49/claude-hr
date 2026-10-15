@@ -1,5 +1,41 @@
 # Changelog
 
+## 0.1.3 (2026-10-16)
+- License is now MIT.
+- **Windows self-update fixed.** `update` running `self` and then `plugins` in one process left the tool environment without
+  site-packages (every `claude-hr-ctl` call failed with `ModuleNotFoundError`), and the detached reinstall helper was killed with
+  uv's `claude-hr-ctl.exe` trampoline job. The reinstall now starts last, from a one-shot Task Scheduler task (outside that job) that
+  waits for the updater to exit, recreates the `UV_*` environment, logs to `logs/self-update.log` and removes itself.
+  Regression test: `tests/windows/verify-windows-selfupdate.ps1`.
+- `setup --profile` (and the installers' `--profile` / `-Profile`) is now saved to `~/.claude-hr/config.toml`; before, the next
+  `doctor`, `plugins sync` or `setup` silently went back to `standard`.
+- `uninstall` no longer prints `schedule: FAILED` on Windows when no scheduled jobs exist.
+- `doctor` warns when Linux per-session memory caps are inactive (no systemd user session bus / `dbus-user-session`).
+- `install.sh` now adds `~/.local/bin` to your shell startup files when it is missing from PATH (as uv's own installer does; opt out
+  with `--no-modify-path`), and says to log in on first run.
+- The `headroom` MCP tool uses the same workspace as the proxy (`~/.claude-hr/headroom`) instead of `~/.headroom`.
+- `security-reviewer` is limited to Read/Grep/Glob (Claude Code ignores `Bash(git diff *)` filters in a subagent `tools` list, so
+  it had full Bash); `hr-parallel-worktrees` is manual-only (`disable-model-invocation`). New tests check that skill and agent
+  names match their files and that agents do not grant Bash.
+- README rewritten after executing it on Windows and Linux: first-run login, PATH, `--shim`, `--dry-run`, `--no-headroom-install`,
+  install sizes (about 4 GB on Linux x86_64), uninstall, profiles, fork-based team extension, corrected command table.
+- Tests can no longer register a scheduled task or start a reinstall on the machine running them.
+- Found by an independent review of this release, all fixed:
+  - a self-update whose reinstall failed or was killed was never retried (the checkout had already moved); it now is, `uv` is
+    resolved before the checkout moves, and `doctor` warns about it;
+  - on Linux the scheduled update job killed its own reinstall (systemd `KillMode=control-group`): the reinstall is now a
+    transient systemd user unit, the units use `KillMode=process`, and launchd jobs set `AbandonProcessGroup`;
+  - the Windows helper script no longer copies credentials from `UV_*` variables to disk (only `PATH` and non-secret `UV_*`), deletes
+    itself, logs in one encoding and quotes typographic apostrophes safely;
+  - re-running the installer kept a stale local `main` instead of `origin/main`, ignored an explicit `--repo`, and failed after a
+    `--local` install; `install.ps1` no longer closes your PowerShell window on error or shadows `$PROFILE`;
+  - `claude-hr-ctl uninstall` removed every claude-hr scheduled task on the machine; it now removes only this install's tasks,
+    the self-update helper and orphans, and scheduler failures are reported as errors;
+  - `config.toml` writes are valid TOML for any value (emoji), keep comments when nothing changes, tolerate a UTF-8 BOM, and
+    report errors; `config set` without a value is rejected; an install-time `FOOTPRINT=lite` is saved;
+  - `wt rm --delete-branch` says whether the branch was deleted or kept (unmerged);
+  - README corrections: install sizes (download vs disk), `--dry-run`, macOS first login, the Updates row, savings wording.
+
 ## 0.1.2 (2026-10-15)
 - An install upgraded from 0.1.0 now becomes owner-only on the first `claude-hr` or `claude-hr-ctl` command (found by testing the real
   v0.1.0 -> v0.1.1 self-update on a fresh user): `paths.tighten_existing()` runs on every entry point and creates nothing.

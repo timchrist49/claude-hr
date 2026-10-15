@@ -16,7 +16,7 @@ param(
   [string]$Repo = $(if ($env:CLAUDE_HR_REPO_URL) { $env:CLAUDE_HR_REPO_URL } else { 'https://github.com/timchrist49/claude-hr.git' }),
   [string]$Ref = $(if ($env:CLAUDE_HR_REF) { $env:CLAUDE_HR_REF } else { 'main' }),
   [string]$Local = '',
-  [ValidateSet('', 'minimal', 'standard', 'full', 'lean-output')][string]$Profile = '',
+  [ValidateSet('', 'minimal', 'standard', 'full', 'lean-output')][Alias('Profile')][string]$PluginProfile = '',
   [switch]$NoHeadroomInstall,
   [switch]$SkipSchedule,
   [switch]$Shim,
@@ -24,7 +24,7 @@ param(
 )
 $ErrorActionPreference = 'Stop'
 function Log($m) { Write-Host "[claude-hr-install] $m" -ForegroundColor Cyan }
-function Die($m) { Write-Host "[claude-hr-install] ERROR: $m" -ForegroundColor Red; exit 1 }
+function Die($m) { Write-Host "[claude-hr-install] ERROR: $m" -ForegroundColor Red; throw "claude-hr-install failed: $m" }
 # Windows PowerShell 5.1 turns ANY native-command stderr line (uv's "Resolved 1 package", git progress) into a terminating
 # error under $ErrorActionPreference='Stop'. Run native tools with 'Continue' and decide from $LASTEXITCODE instead.
 function N([scriptblock]$Block) {
@@ -75,9 +75,19 @@ if ($Local) {
     $b64 = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes("x-access-token:$($env:CLAUDE_HR_GIT_TOKEN)"))
     $env:GIT_CONFIG_COUNT = '1'; $env:GIT_CONFIG_KEY_0 = 'http.extraheader'; $env:GIT_CONFIG_VALUE_0 = "Authorization: Basic $b64"
   }
+  # A copy left by an earlier -Local install has no .git: replace it, `git clone` refuses a non-empty directory.
+  if ((Test-Path $src) -and -not (Test-Path (Join-Path $src '.git'))) {
+    Log "replacing the non-git copy at $src (left by a -Local install)"
+    Remove-Item -Recurse -Force $src
+  }
+  $repoExplicit = $PSBoundParameters.ContainsKey('Repo') -or [bool]$env:CLAUDE_HR_REPO_URL
   try {
     if (Test-Path (Join-Path $src '.git')) {
       Log "updating $src"
+      if ($repoExplicit) {
+        $curUrl = (N { git -C $src remote get-url origin } | Select-Object -First 1)
+        if ("$curUrl".Trim() -ne $Repo) { Log "switching origin to $Repo"; N { git -C $src remote set-url origin $Repo } | Out-Null }
+      }
       N { git -C $src fetch --quiet --tags --prune origin } | Out-Null
     } else {
       Log "cloning $Repo ($Ref)"
@@ -89,8 +99,9 @@ if ($Local) {
   }
   # Native-command stderr becomes a terminating error under $ErrorActionPreference='Stop' in Windows PowerShell 5.1,
   # so probe the ref with Continue and decide from the exit code.
-  N { git -C $src checkout --quiet --detach $Ref } | Out-Null
-  if ($LASTEXITCODE -ne 0) { N { git -C $src checkout --quiet --detach "origin/$Ref" } | Out-Null }
+  # Prefer the remote-tracking ref: a LOCAL branch `main` is only as new as the original clone. Tags and SHAs fall through.
+  N { git -C $src checkout --quiet --detach "origin/$Ref" } | Out-Null
+  if ($LASTEXITCODE -ne 0) { N { git -C $src checkout --quiet --detach $Ref } | Out-Null }
   if ($LASTEXITCODE -ne 0) { Die "could not check out '$Ref'" }
 }
 
@@ -109,7 +120,7 @@ if ($toolBin -and ($env:PATH -notlike "*$toolBin*")) { $env:PATH = "$toolBin;$en
 if (-not (Get-Command claude-hr-ctl -ErrorAction SilentlyContinue)) { Die 'claude-hr-ctl not on PATH after install (try: uv tool update-shell)' }
 
 $setupArgs = @('setup')
-if ($Profile) { $setupArgs += @('--profile', $Profile) }
+if ($PluginProfile) { $setupArgs += @('--profile', $PluginProfile) }
 if ($NoHeadroomInstall) { $setupArgs += '--no-headroom-install' }
 if ($SkipSchedule) { $setupArgs += @('--skip', 'schedule') }
 if ($DryRun) { $setupArgs += '--dry-run' }
@@ -127,4 +138,5 @@ claude-hr is installed.
                                claude-hr agents --dangerously-skip-permissions
   Health:                      claude-hr-ctl doctor
   If 'claude-hr' is not found: run  uv tool update-shell  and restart the terminal.
+  First run on a new machine: log in to Claude Code (/login); until then claude-hr starts it without Headroom on purpose.
 "@

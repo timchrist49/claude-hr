@@ -107,6 +107,13 @@ def run(cfg: Config, cwd: Path, deep: bool = False) -> list[Check]:
     adm = resources.admit(cfg)
     out.append(Check("memory", OK if avail >= float(cfg.get("resources.min_free_gb", 2)) else WARN, f"{avail:.1f} GB free of {total:.1f} GB"))
     out.append(Check("sessions", OK, f"{adm.running} running / limit {adm.limit}"))
+    if paths.IS_LINUX:
+        cap, _ = resources.memory_limits_gb(cfg)
+        if cap > 0 and resources.caps_available():
+            out.append(Check("resource caps", OK, f"each session runs in a systemd scope, MemoryMax {cap:.0f} GB"))
+        elif cap > 0:
+            out.append(Check("resource caps", WARN, "per-session memory caps are NOT active (no systemd user session bus)",
+                             "install dbus-user-session (apt install dbus-user-session), log in again; on WSL also enable systemd"))
     free = sysinfo.disk_free_gb(paths.home())
     out.append(Check("disk", OK if free >= float(cfg.get("monitor.disk_warn_gb", 10)) else WARN, f"{free:.0f} GB free"))
     if deep:
@@ -114,6 +121,14 @@ def run(cfg: Config, cwd: Path, deep: bool = False) -> list[Check]:
         big = cd >= float(cfg.get("monitor.claude_dir_warn_gb", 10))
         out.append(Check("~/.claude size", WARN if big else OK, f"{'at least ' if not complete else ''}{cd:.1f} GB",
                          "claude-hr-ctl cleanup" if big else ""))
+
+    # ---- self-update that did not finish -----------------------------------------------------
+    from . import updater
+
+    behind = updater.installed_is_behind(paths.hr_home() / "repo")
+    if behind:
+        out.append(Check("claude-hr version", WARN, f"installed {behind[1]} but the checkout holds {behind[0]}: the last self-update did not finish",
+                         "claude-hr-ctl update --only self   (see ~/.claude-hr/logs/self-update.log)"))
 
     # ---- schedule + credentials -----------------------------------------------------------
     jobs = schedule.status()

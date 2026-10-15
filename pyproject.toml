@@ -4,12 +4,12 @@ build-backend = "hatchling.build"
 
 [project]
 name = "claude-hr"
-version = "0.1.2"
+version = "0.1.3"
 description = "claude-hr: a managed Claude Code distribution (Headroom, plugins, skills, CLAUDE.md hygiene, resource governor, scheduled upgrades)."
 readme = "README.md"
 requires-python = ">=3.11"
-license = { text = "Proprietary - all rights reserved (timchrist49)" }
-classifiers = ["License :: Other/Proprietary License", "Private :: Do Not Upload"]
+license = { text = "MIT" }
+classifiers = ["License :: OSI Approved :: MIT License", "Private :: Do Not Upload"]
 authors = [{ name = "timchrist49" }]
 dependencies = []  # stdlib only on purpose: the launcher must start fast and never break on a dependency
 
@@ -30,6 +30,7 @@ include = ["src", "plugins", ".claude-plugin", "README.md", "pyproject.toml"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q"
+markers = ["real_helpers: calls the real self-update helper functions (they must stub subprocess/procutil themselves)"]
 
 [tool.ruff]
 line-length = 100

@@ -60,7 +60,9 @@ def render_systemd(spec: Spec, argv: list[str], path_env: str) -> tuple[str, str
     service = (
         f"[Unit]\nDescription=claude-hr {spec.name}\n\n"
         # quoted: systemd splits an unquoted Environment= value on whitespace ("Program Files" in a WSL PATH would be cut)
-        f"[Service]\nType=oneshot\nNice=10\nEnvironment=\"PATH={path_env.replace(chr(34), '')}\"\nExecStart={cmd}\n"
+        # KillMode=process: the daily update ends by starting its own reinstall as a child; the default (control-group) would
+        # kill that child together with the job the moment the job exits
+        f"[Service]\nType=oneshot\nKillMode=process\nNice=10\nEnvironment=\"PATH={path_env.replace(chr(34), '')}\"\nExecStart={cmd}\n"
     )
     if spec.kind == "logon":
         when = "OnBootSec=45s\nOnStartupSec=45s"
@@ -101,6 +103,7 @@ def render_launchd(spec: Spec, argv: list[str], path_env: str) -> bytes:
         "ProgramArguments": [*argv, spec.name],
         "EnvironmentVariables": {"PATH": path_env},
         "ProcessType": "Background",
+        "AbandonProcessGroup": True,  # launchd would otherwise kill the reinstall the update job starts as its last act
         "Nice": 10,
         "StandardOutPath": str(paths.logs_dir() / f"{spec.name}.out.log"),
         "StandardErrorPath": str(paths.logs_dir() / f"{spec.name}.err.log"),
@@ -201,10 +204,27 @@ def install(cfg: Config) -> list[str]:
 def remove() -> list[str]:
     msgs: list[str] = []
     if paths.IS_WINDOWS:
-        r = procutil.run(["powershell", "-NoProfile", "-NonInteractive", "-Command",
-                          "Get-ScheduledTask -TaskPath '\\claude-hr\\' -ErrorAction SilentlyContinue | "
-                          "Unregister-ScheduledTask -Confirm:$false"], timeout=60)
-        msgs.append("Task Scheduler: removed" if r.returncode == 0 else f"FAILED {r.stderr.strip()[:200]}")
+        # Get-ScheduledTask finds nothing when no job was ever registered (e.g. installed with -SkipSchedule): that is a
+        # successful removal, not an error. The script prints how many tasks existed.
+        # Only tasks that belong to THIS install: they run pythonw.exe from this environment. The one-shot self-update helper
+        # and orphans whose executable no longer exists go too; another install's jobs (a sandbox, a second profile) stay.
+        mine = str(Path(job_argv()[0]).parent).replace("'", "''")
+        script = (
+            "$ErrorActionPreference = 'Stop'; "
+            f"try {{ $mine = '{mine}'; "
+            "$t = @(Get-ScheduledTask -TaskPath '\\claude-hr\\' -ErrorAction SilentlyContinue | Where-Object { "
+            "$_.TaskName -eq 'selfupdate' -or @($_.Actions | Where-Object { $_.Execute -and "
+            "($_.Execute.StartsWith($mine, [StringComparison]::OrdinalIgnoreCase) -or -not (Test-Path -LiteralPath $_.Execute)) }).Count -gt 0 }); "
+            "if ($t.Count -gt 0) { $t | Unregister-ScheduledTask -Confirm:$false }; Write-Output $t.Count } "
+            "catch { [Console]::Error.WriteLine($_.Exception.Message); exit 1 }"
+        )
+        r = procutil.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", script], timeout=60)
+        if r.returncode != 0:
+            msgs.append(f"FAILED {(r.stderr or r.stdout).strip()[:200]}")
+        elif (r.stdout or "").strip() in ("", "0"):
+            msgs.append("Task Scheduler: nothing to remove")
+        else:
+            msgs.append(f"Task Scheduler: removed {(r.stdout or '').strip()} task(s)")
     elif paths.IS_MAC:
         uid = os.getuid()
         for s in JOBS:

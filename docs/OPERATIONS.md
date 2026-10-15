@@ -13,7 +13,7 @@ claude-hr-ctl doctor --deep     # also measures ~/.claude size (time-boxed)
 | One session without Headroom | `claude-hr --hr-direct …` (or `CLAUDE_HR_DIRECT=1`) |
 | Everything without Headroom | `claude-hr-ctl config set headroom.enabled false` |
 | Reinstall while sessions are open (Windows) | blocked on purpose: replacing the tool env under a running launcher breaks it. Close sessions, or `$env:CLAUDE_HR_FORCE_INSTALL=1` |
-| Run exactly like stock `claude` | use `claude` (claude-hr never edits its binary; only the optional `shim` shadows it: `claude-hr-ctl shim remove`) |
+| Run without Headroom routing | use `claude` (claude-hr never edits its binary; only the optional `shim` shadows it: `claude-hr-ctl shim remove`). Plain `claude` still reads the managed `settings.json`, the CLAUDE.md block, the plugins and the MCP servers: only the Headroom routing is skipped. To remove those too, run `claude-hr-ctl uninstall`. |
 | Stop scheduled jobs | `claude-hr-ctl schedule remove` |
 | Undo all managed config | `claude-hr-ctl uninstall` (your own settings/plugins/CLAUDE.md content stay) |
 | Also delete Headroom and `~/.claude-hr` | `claude-hr-ctl uninstall --purge` |
@@ -31,6 +31,12 @@ claude-hr itself updates to the newest `vX.Y.Z` tag (`self.update_ref`); cut a r
 
 **Rollback by hand:** `claude install <version> --force`; `uv tool install --python 3.13 "headroom-ai[all]==<ver>"`;
 `git -C ~/.claude-hr/repo checkout <tag> && uv tool install --force --reinstall ~/.claude-hr/repo`.
+
+**A self-update that did not finish:** claude-hr's own reinstall runs in the background after `update` exits and logs to
+`~/.claude-hr/logs/self-update.log` (Windows: a one-shot Task Scheduler task `selfupdate` in the `claude-hr` folder that deletes
+itself and its script; Linux: a transient `claude-hr-selfupdate-*` systemd user unit). If `doctor` warns that the installed
+version is behind the checkout, run `claude-hr-ctl update --only self` to retry (the next daily update retries too), or re-run
+the installer.
 
 ## Monitoring and alerts
 `monitor tick` (every 15 min) writes `state/health.json`, appends `logs/monitor.jsonl`, restarts a dead proxy, and alerts

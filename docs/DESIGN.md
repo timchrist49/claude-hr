@@ -57,7 +57,9 @@ The launcher sets it (Headroom's wrapper does the same, issue #746).
 Third-party measurements (500-session replay; 25-task benchmark) found `token` mode reduced prompt tokens but raised the
 uncached share ~4× (123 vs 14 cache busts) with no cost benefit. `coding` also never lossy-compresses file reads,
 which protects answer quality. Expect modest end-to-end savings on interactive coding (measured here: 2.5% on a
-trivial prompt; the large effects are tool-schema deferral and big repetitive tool output). Judge by
+trivial prompt; the larger effects come from big repetitive tool output, and tool-schema deferral is a regression avoided
+rather than a saving: behind a non-first-party base URL Claude Code turns tool search off, 174k vs 36k input tokens for a bare
+prompt with a 200-tool plugin, and claude-hr keeps it on). Judge by
 `claude-hr-ctl usage` (cache hit %) and measured spend, not "tokens saved". `headroom.output_holdout = 0.1` makes the
 output-savings figure measured instead of estimated.
 
@@ -107,9 +109,16 @@ difference is the reason they exist), one skill per genuinely repeated workflow,
 
 ### 12. Updates
 `DISABLE_AUTOUPDATER=1` (not `DISABLE_UPDATES`, which also blocks `claude install` that the staged updater needs) plus a
-daily job. Rules: never downgrade, defer while sessions run, 5-day cooldown on Headroom releases (it ships ~weekly with
-breaking changes), smoke-test (`/v1/compress` must save tokens on a synthetic payload; Claude must report the new
-version and list plugins), roll back on failure. Claude release channels are read from
+daily job. Rules: never downgrade; Claude Code, Headroom and claude-hr itself defer while sessions run (plugin updates do
+not); 5-day cooldown on Headroom releases (it ships ~weekly with breaking changes); smoke-test (`/v1/compress` must save
+tokens on a synthetic payload; Claude must report the new version and list plugins) and roll back on failure, for Claude
+Code and Headroom only. claude-hr itself follows the newest `vX.Y.Z` tag with no cooldown, smoke test or rollback (manual
+rollback: docs/OPERATIONS.md). Its reinstall replaces the tool environment the updater runs from, so `update` only queues
+it and starts it as the very last act: on Windows from a one-shot Task Scheduler task (uv's `claude-hr-ctl.exe` trampoline
+kills any child process we spawn when it exits), on Linux as a transient systemd user unit (the timer's oneshot service
+would kill leftovers, hence also `KillMode=process`), on macOS with `AbandonProcessGroup`. The checkout moves before the
+reinstall runs, so a failed or killed reinstall is detected by comparing the installed version with the checkout's and
+retried by the next update; `doctor` warns about it. Claude release channels are read from
 `downloads.claude.ai/claude-code-releases/{stable,latest}`.
 
 ## Failure modes
@@ -128,7 +137,7 @@ version and list plugins), roll back on failure. Claude release channels are rea
 | claude-hr itself uninstalled | Plain `claude` unaffected (no global base URL); hook commands exit 0 if `claude-hr-hook` is missing |
 
 ## Decisions confirmed with the owner (2026-10-15)
-Proprietary, all-rights-reserved license (kept as chosen before the repo went public; see LICENSE); default plugin profile `standard` including Superpowers; `claude.privacy = standard` (error reporting off, telemetry left on so flag-gated features work); one saved Workflow, `hr-review-changes`, installed per project on request and never run automatically (validated by a stubbed harness, `tests/workflow_harness.js`, not by spawning agents).
+MIT license (switched from all-rights-reserved when the repo went public); default plugin profile `standard` including Superpowers; `claude.privacy = standard` (error reporting off, telemetry left on so flag-gated features work); one saved Workflow, `hr-review-changes`, installed per project on request and never run automatically (validated by a stubbed harness, `tests/workflow_harness.js`, not by spawning agents).
 
 ## Not verified
 macOS end to end (launchd plists and BSD tools are unit-tested only); Windows `statusLine` shell behaviour in an

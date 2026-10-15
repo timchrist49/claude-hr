@@ -27,6 +27,22 @@ def sandbox(tmp_path, monkeypatch):
     return home
 
 
+@pytest.fixture(autouse=True)
+def _never_start_real_update_helpers(request, monkeypatch):
+    """No test may register a scheduled task or spawn a reinstall on the machine running the suite (on Windows the real
+    code path does exactly that). Tests that exercise the real functions are marked `real_helpers` and stub what they call."""
+    if request.node.get_closest_marker("real_helpers"):
+        return
+    from claude_hr import updater
+
+    def refuse(*args, **kwargs):
+        raise AssertionError("test tried to start a real self-update helper: monkeypatch it or mark the test real_helpers")
+
+    monkeypatch.setattr(updater, "_start_helper_task", refuse)
+    monkeypatch.setattr(updater, "_spawn_detached", refuse)
+    monkeypatch.setattr(updater, "_start_systemd_service", refuse)
+
+
 # ---- guard: the suite must never touch the machine's real Claude / claude-hr profile ---------------------------------
 _REAL_HOME = Path(os.environ.get("USERPROFILE") or os.environ.get("HOME") or Path.home())
 _WATCHED = [_REAL_HOME / ".claude-hr", _REAL_HOME / ".claude" / "settings.json", _REAL_HOME / ".claude" / "CLAUDE.md",
