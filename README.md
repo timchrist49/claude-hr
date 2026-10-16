@@ -137,7 +137,7 @@ PR template, CODEOWNERS, Dependabot, `docs/plans` and `docs/decisions`, `REVIEW.
 
 Switches: `CLAUDE_HR_GATES=off` in the environment (or `gates.enabled = false`) disables the hook, `format.enabled`,
 `verify.gate`, `gates.trail` switch single steps, `security.profile = "strict"` makes the git confirmations refusals. Everything fails
-open: a missing tool, an error or running out of the overall time budget exits quietly and never blocks `claude`. A trusted check that fails, or exceeds its own `timeout_s`, is a failed check and does block (at most `verify.gate_max_blocks` times for the same tree).
+open: a missing tool, an error or running out of the overall time budget exits quietly and never blocks `claude`. A trusted check that fails, or exceeds its own `timeout_s`, is a failed check and does block (at most `verify.gate_max_blocks` times for the same tree); a check's `timeout_s` is capped by `verify.gate_timeout_s` and by what is left of the hook's 150 s budget, and a check cut short by that shared budget is inconclusive: it never blocks and you get a one-line notice.
 
 ## Commands
 
@@ -163,7 +163,7 @@ They change routing and limits only, not the managed settings or plugins. `claud
 | `fmt [paths] [--changed] [--check]` | no arguments: which formatter this repo configures. With paths or `--changed`: format them (`--check` only reports and exits 1 if something needs formatting) |
 | `verify init [--write] [--force]\|status\|trust\|untrust\|run [--tier fast\|full]` | the repo's verify recipe `.claude/hr-verify.toml`: propose it from what the repo declares, trust its exact bytes (a person in a terminal only), run it |
 | `audit [path] [--json] [--strict] [--tools]` | read-only, zero-token audit of a repository (agent-config attack surface, hidden Unicode, workflow lint, masked secrets); exit 0 when it ran, 1 with `--strict` on any high or medium finding (an incomplete scan or an unreadable agent file counts), 2 when it could not run |
-| `init-repo [path] [--apply] [--only github,docs,editor,dependabot,codeowners,review,ci]` | scaffold the files an agent workflow relies on; a dry run unless `--apply`, creates only files that do not exist, never touches git or the network |
+| `init-repo [path] [--apply] [--only github,docs,editor,dependabot,codeowners,review,ci]` | scaffold the files an agent workflow relies on, at the top level of a git work tree (a plain folder, a bare repository or a subdirectory gets a warning and exit 2 / only the groups that make sense there); a dry run unless `--apply`, creates only files that do not exist, skips the CI skeleton when another workflow already runs tests, never touches git or the network |
 | `footprint [--probe] [--strict]` | estimated always-on tokens per enabled plugin and the hidden costs; `--probe` measures one real turn (spends tokens) |
 | `trail [--tail N] [--prune]` | the metadata-only audit trail of the end-of-turn gate |
 | `daemon status\|restart` | status: is the Claude background service routed through Headroom? restart: stops the service (without checking for running background sessions); the next `claude-hr agents` / `--bg` starts a new one routed through Headroom |

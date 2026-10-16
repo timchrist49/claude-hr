@@ -57,6 +57,21 @@ no model, effort or thinking setting; Headroom's own output shaper stays a separ
     existing issue templates win; `dryRun` is fail-safe; a crashed integrator is reported as needing inspection; wildcard file lists make groups conflict.
   - **Wiring:** after a self-update the next update job re-applies the managed settings and plugins (and `doctor` says when they are stale); the state-directory deny rule
     follows `CLAUDE_HR_HOME` and `config.toml` asks; `uninstall`, `doctor` and `footprint` no longer crash or mislead on corrupt files; the audit trail append is locked on Windows.
+  - **Second review round** (49 more findings in the fixes themselves and the gaps they left; fixed unless noted):
+    - the unattended post-upgrade re-apply is scoped down to the settings baseline and the CLAUDE.md block (no plugin installs, no `-y`), keyed per step in `state/applied-version.json`
+      and bound to the Claude config directory setup applied it to; `uninstall` removes the markers so an uninstalled baseline is not resurrected;
+    - `verify init --write` no longer follows a symlink committed in the repository; recipe and manifests are read only if they are regular files; the checks' environment keeps
+      `PWD`, `AWS_REGION`, `GOPRIVATE` and non-secret npm settings (`verify.env_allow` for the rest); a hang that equals its own `timeout_s` is a failure, and a run cut short by
+      the shared budget tells the user instead of passing silently; a second session no longer runs the suite concurrently; a missing tool no longer disables the checks behind it;
+    - the audit: a symlink to an ancestor (`.claude -> .`) cannot hide the agent surface, the hidden-Unicode scan has no 20,000-character budget a decoy can exhaust, hooks are judged by
+      their arguments, unlistable directories and incomplete scans are findings, `.gitignore` matching is linear, and ordinary repositories no longer fail `--strict` on documented sample
+      credentials, stock workflow expressions or ordinary CLAUDE.md rules;
+    - the launcher resolves `claude`, `op`, the limiter prefix and `headroom wrap` through absolute PATH entries only (a planted `op.exe` ran on Windows); an untrusted repository
+      falls back to the formatter on PATH instead of being shadowed by a refused in-repo copy; Windows atomic replace retries when a file is briefly in use;
+    - init-repo works on a git top level only, skips the CI skeleton when another workflow already runs tests, installs corepack for pnpm/yarn, and runs pytest only when tests exist;
+      the workflows validate their arguments, label unverified findings, and report a crashed integrator as needing inspection;
+    - the Windows schedule script escapes apostrophes in paths, the statusline never fails on odd payloads, the audit-trail lock costs nothing where the OS cannot grant one, and
+      `tests/test_schedule.py` no longer executes the scripts it only meant to parse (it could register or remove real Task Scheduler tasks on a Windows machine).
   - Accepted and documented: the formatter formats every file git reports as changed (your own uncommitted work included); an edit made by someone else while the checks run
     is verified on the next change; `config set` and the `CLAUDE_HR_*` switches are protected by Claude Code's permission prompts only (the audit flags them in project settings).
 - Rejected after research, with reasons in `docs/ADDONS.md`: Headroom Desktop (mutually exclusive with claude-hr), `bun fmt` as a
