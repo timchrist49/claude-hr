@@ -1856,7 +1856,10 @@ def test_a_fifo_manifest_cannot_hang_the_launcher(repo, person, keys, cfg):
     t.start()
     t.join(20)
     assert done, "the launcher hung on a FIFO named package.json"
-    assert not gate_offer.offer_path().exists()
+    state = json.loads(gate_offer.offer_path().read_text(encoding="utf-8"))
+    assert all(e["decision"] == "nothing" for e in state.values()), (
+        "at most the 'nothing to propose here' memo, never an answer"
+    )
 
 
 @pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="no FIFOs on this platform")

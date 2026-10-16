@@ -347,10 +347,11 @@ def test_discover_python_mypy_files_pyright_and_tests_dir(tmp_path):
     )
     put(tmp_path, "tests/test_a.py", "def test_a():\n    assert True\n")
     r = verify.discover(tmp_path)
+    py = verify._default_python()  # `python` on Windows, `python3` on a machine that has only that
     assert [c.argv for c in r.fast] == [
-        ["python", "-m", "mypy"],
+        [py, "-m", "mypy"],
         ["pyright"],
-        ["python", "-m", "pytest", "-q"],
+        [py, "-m", "pytest", "-q"],
     ]
 
 
