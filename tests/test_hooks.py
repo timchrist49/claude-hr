@@ -384,6 +384,7 @@ TRUST_BLOCK = [
     # the launcher's one-time offer and its record: enabling is approving, and the record is the user's answer
     "claude-hr-ctl verify enable",
     "claude-hr ctl verify enable",
+    "CLAUDE-HR-CTL VERIFY ENABLE",  # the keyword pre-filter is as case-blind as the patterns
     "cd repo && claude-hr-ctl.exe verify enable --yes",
     "claude-hr-ctl verify disable",
     "echo '{}' > ~/.claude-hr/state/verify-offer.json",
@@ -426,13 +427,18 @@ TRUST_BURIED = [
     'python -c "from claude_hr import verify; verify.trust(root, state)"',
     'python -c "from claude_hr import gate_offer; gate_offer.enable(root, proposal, cfg, print)"',
 ]
-# Padding that makes an open-ended gap between the words cost the most: the keywords the patterns look for, repeated
+# Padding that makes the gaps between the words cost the most: the keywords the patterns look for, repeated, and the
+# program name run into its own prefix and suffix characters (the runs of word characters that follow it)
 PADDINGS = [
     "claude_hr verify ",
     "claude_hr gate_offer ",
     "claude-hr-ctl verify ",
     "claude_hr ",
     "curl ",
+    ".claude-hr",
+    "claude-hr-",
+    "claude_hr",
+    "claude-hr.verify.",
 ]
 
 
@@ -443,19 +449,39 @@ def padded(pad: str, size: int) -> str:
 @pytest.mark.parametrize("pad", PADDINGS)
 def test_a_one_megabyte_command_is_scanned_in_bounded_time(monkeypatch, capsys, pad):
     """A comment line of padded keywords made the patterns cost the cube of its length: the hook ran past its 10 s timeout,
-    and a hook that is killed lets the command through."""
+    and a hook that is killed lets the command through. Then `.claude-hr` x 1 MB still took 3 s (4 s as a process) and a
+    machine three times slower lost the race: the whole check is now a few hundredths of a second."""
     command = padded(pad, 1_000_000) + "\nclaude-hr-ctl verify enable"
     started = time.perf_counter()
     assert run_guard(monkeypatch, command) == 2
-    assert (
-        time.perf_counter() - started < 2.0
-    )  # a few tenths of a second on a slow machine; unbounded was minutes
+    assert time.perf_counter() - started < 0.5
     assert "only the user does it" in capsys.readouterr().err
     started = time.perf_counter()
     assert (
         hooks.trust_attempt(padded(pad, 1_000_000)) is False
     )  # the padding alone asks for nothing
-    assert time.perf_counter() - started < 2.0
+    assert time.perf_counter() - started < 0.5
+
+
+@pytest.mark.parametrize("pad", PADDINGS)
+def test_padding_that_names_verify_is_scanned_in_bounded_time_too(pad):
+    """The keyword pre-filter lets padding without `verify` or `gate_offer` skip the patterns; this padding names one (once
+    in the window, and as part of every unit), so the patterns themselves run."""
+    for window in (padded(pad, 16_384) + " verify", padded(pad + "verify ", 1_000_000)):
+        started = time.perf_counter()
+        assert hooks.trust_attempt(window) is False
+        assert time.perf_counter() - started < 0.5
+
+
+def test_the_scan_windows_are_sixteen_kib_from_each_end():
+    attempt = "\nclaude-hr-ctl verify enable\n"
+    assert hooks._SCAN == 16_384
+    assert hooks.trust_attempt(attempt + "x" * 100_000)  # the first window
+    assert hooks.trust_attempt("x" * 100_000 + attempt)  # the last window
+    # a command of up to two windows is scanned whole, its middle included
+    assert hooks.trust_attempt("x" * 16_000 + attempt + "x" * 16_000)
+    # the documented limit: in the middle of a longer command a trust attempt is not seen
+    assert not hooks.trust_attempt("x" * 20_000 + attempt + "x" * 20_000)
 
 
 @pytest.mark.parametrize("cmd", TRUST_BURIED)

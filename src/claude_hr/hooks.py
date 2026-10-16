@@ -107,13 +107,15 @@ GIT_RISKS: list[tuple[re.Pattern, str]] = [
 #
 # The gaps between the words are BOUNDED and trust_attempt() scans a bounded amount of text: with an open-ended gap the
 # match time grows with the cube of the line, so one comment line of padded keywords ran the hook past its timeout, and a
-# hook that is killed lets the command through. The bounds are far longer than any typed command.
+# hook that is killed lets the command through. The bounds are far longer than any typed command. Every alternative
+# needs the word `verify` or `gate_offer`: text without either is not looked at by a pattern at all.
 _GAP = 256  # `claude-hr ... verify trust`: other words between the program name and the verb
 _GAP_PY = 128  # `claude_hr ... verify` / `claude_hr ... gate_offer` inside python -c
 _GAP_CALL = 64  # `verify ... trust(`
-_SCAN = 65_536  # characters scanned from the start and from the end of an over-long command
+_SCAN = 16_384  # characters scanned from the start and from the end of an over-long command
+_KEYWORDS = ("verify", "gate_offer")
 _VERIFY_TRUST = re.compile(
-    rf"(?ism)claude[-_]hr[\w.-]{{0,32}}\b[^\n;&|]{{0,{_GAP}}}?\bverify\s+(?:(?:un)?trust|enable|disable)\b"
+    rf"(?ism)claude[-_]hr[^\n;&|]{{0,{_GAP}}}?\bverify\s+(?:(?:un)?trust|enable|disable)\b"
     r"|\bverify-(?:trust|offer)\.json\b"
     rf"|\bclaude_hr\b[^\n]{{0,{_GAP_PY}}}\bverify\b[^\n]{{0,{_GAP_CALL}}}\b(?:un)?trust\s*\("
     rf"|\bclaude_hr\b[^\n]{{0,{_GAP_PY}}}\bgate_offer\b[^\n]{{0,{_GAP_CALL}}}"
@@ -121,14 +123,21 @@ _VERIFY_TRUST = re.compile(
 )
 
 
+def _scan(text: str) -> bool:
+    lowered = text.lower()
+    if not any(word in lowered for word in _KEYWORDS):
+        return False
+    return bool(_VERIFY_TRUST.search(text))
+
+
 def trust_attempt(command: str) -> bool:
     """Does `command` try to trust, enable or disable a verify recipe, or touch the trust or the offer record?
 
     A command longer than 2 * _SCAN is looked at from its first and its last _SCAN characters only, so the time this takes
-    has a ceiling however the command is padded."""
+    has a ceiling however the command is padded (a trust attempt only in the middle of such a command is not seen)."""
     if len(command) > 2 * _SCAN:
-        return bool(_VERIFY_TRUST.search(command[:_SCAN]) or _VERIFY_TRUST.search(command[-_SCAN:]))
-    return bool(_VERIFY_TRUST.search(command))
+        return _scan(command[:_SCAN]) or _scan(command[-_SCAN:])
+    return _scan(command)
 
 
 def git_risk(command: str) -> str | None:
@@ -186,8 +195,8 @@ def bash_guard() -> int:
 
 
 def _judge(command: str) -> int:
-    # The trust check goes first: it is the one with a ceiling on its time (see _VERIFY_TRUST), so padding aimed at the
-    # slower patterns below cannot keep it from running before the hook is killed.
+    # The trust check goes first: it is the one with a ceiling on its time (see _VERIFY_TRUST, a few hundredths of a second
+    # for any command), so padding aimed at the slower patterns below cannot keep it from running before the hook is killed.
     if trust_attempt(command):
         sys.stderr.write(
             "Blocked by the claude-hr guard: trusting or enabling (or editing the trust record of) a verify recipe lets "
