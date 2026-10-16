@@ -16,7 +16,9 @@ from . import (
     claudemd,
     creds,
     doctor,
+    gate_offer,
     hooks,
+    human,
     maintenance,
     monitor,
     paths,
@@ -802,57 +804,19 @@ def _repo_root() -> Path:
 
 
 def _not_a_person() -> str | None:
-    """Why nobody can be assumed to be at the keyboard (None = a person plausibly is).
+    """Why nobody can be assumed to be at the keyboard (None = a person plausibly is): see human.not_a_person.
 
-    Used for the two decisions that let a repository's own commands run: `verify trust` and `verify run` of an
-    untrusted recipe. An agent that was talked into running them must not be able to approve itself: there is no
-    --yes flag, and a shell that belongs to a Claude Code session or has no terminal is refused. This is a speed bump
-    (a determined agent can allocate a pty); the permission prompts and the bash guard are the other layers.
-    """
-    if os.environ.get("CLAUDECODE") or os.environ.get("CLAUDE_CODE_ENTRYPOINT"):
-        return "this shell belongs to a Claude Code session"
-    if not (sys.stdin and sys.stdin.isatty() and sys.stdout and sys.stdout.isatty()):
-        return "there is no interactive terminal"
-    return None
+    Used for the decisions that let a repository's own commands run: `verify trust`, `verify enable` and `verify run` of
+    an untrusted recipe. A thin wrapper so that a test (or a caller) can replace it in this module."""
+    return human.not_a_person()
 
 
 def _show_recipe(
     root: Path, recipe, gate_timeout_s: float | None = None, gate_tier: str = "fast"
 ) -> None:
-    """Every check of both tiers, in full, exactly as the gate would run it.
-
-    This is what a person reads before approving the file, so nothing is left out and nothing is printed raw: name,
-    argv items and cwd go through verify.safe_text (an escape sequence or bidi override in the repository's text is
-    shown as \\x1b / \\u202e, it cannot erase or reorder the line). A [[full]] check is only labelled a repeat when
-    it is IDENTICAL to a [[fast]] check (name, argv, timeout and cwd); one that merely shares a name with a fast
-    check is shown like any other, so a difference cannot hide behind a familiar name.
-
-    `gate_timeout_s` (verify.gate_timeout_s) is what ALL the checks of one end-of-turn run get together. A check of the
-    tier the gate runs whose own timeout_s is above it is shown with the limit that really applies there, and what
-    happens at that limit: the gate stops it, tells the user and does not block (`verify run` honours timeout_s).
-    """
-    from . import verify
-
-    fast = list(recipe.fast)
-    gate_tier = "full" if gate_tier == "full" and recipe.full else "fast"
-    for tier in ("fast", "full"):
-        for n, c in enumerate(getattr(recipe, tier), 1):
-            same = (
-                next((i for i, f in enumerate(fast, 1) if f == c), None) if tier == "full" else None
-            )
-            repeat = f"   (identical to [fast {same}])" if same else ""
-            limit = f"timeout {c.timeout_s}s"
-            if gate_timeout_s is not None and tier == gate_tier and c.timeout_s > gate_timeout_s:
-                limit = (
-                    f"timeout {c.timeout_s}s, but the end-of-turn gate stops it after {gate_timeout_s:g}s "
-                    "(its time budget, verify.gate_timeout_s, shared by all checks) and then does not block"
-                )
-            out(
-                f"  [{tier} {n}] {verify.safe_text(c.name)}: {verify.command_line(c)}"
-                f"   ({limit}, cwd {verify.safe_text(c.cwd)}){repeat}"
-            )
-    for note in getattr(recipe, "notes", None) or []:
-        out(f"  note: {verify.safe_text(str(note)[:300])}")
+    """Every check of both tiers, in full, exactly as the gate would run it (see gate_offer.recipe_lines)."""
+    for line in gate_offer.recipe_lines(recipe, gate_timeout_s, gate_tier):
+        out(line)
 
 
 def _confirm(question: str) -> bool:
@@ -925,17 +889,12 @@ def cmd_fmt(a, cfg) -> int:
 
 def cmd_verify(a, cfg) -> int:
     """The repo's verify recipe (.claude/hr-verify.toml): propose it, trust it, run it."""
-    from . import stop_gate, verify
+    from . import verify
 
     root = _repo_root()
     cp = verify.config_path(root)
-    try:
-        gate_budget = float(cfg.get("verify.gate_timeout_s", verify.DEFAULT_GATE_TIMEOUT_S))
-    except (TypeError, ValueError):
-        gate_budget = float(verify.DEFAULT_GATE_TIMEOUT_S)
     # what the checks of one end-of-turn run can really get: the setting, and never more than the hook has left
-    gate_budget = min(gate_budget, stop_gate.HOOK_BUDGET_S - verify.POST_RUN_RESERVE_S)
-    gate_tier = str(cfg.get("verify.tier", "fast"))
+    gate_budget, gate_tier = gate_offer.gate_limits(cfg)
     if a.action == "init":
         recipe = verify.discover(root)
         text = verify.render_toml(recipe)
@@ -969,7 +928,48 @@ def cmd_verify(a, cfg) -> int:
             if removed
             else "this repository was not trusted"
         )
+        out(
+            "(the launcher may offer this folder's checks again when you next start Claude here; `claude-hr-ctl verify disable` stops that too)"
+        )
         return 0
+    if a.action == "disable":
+        # same as untrust, and remember "no" so the launcher never asks again for this folder; the file is kept
+        removed = gate_offer.disable(root)
+        out(
+            "turned off: the end-of-turn gate will not run this folder's checks"
+            if removed
+            else "this folder's checks were not on"
+        )
+        out(
+            f"{cp} was kept (if there is one). claude-hr will not ask again here. "
+            "Turn it on again: claude-hr-ctl verify enable"
+        )
+        return 0
+    if a.action == "enable":
+        why = _not_a_person()
+        if why:
+            out(
+                f"refusing to turn the checks on: {why}.\n"
+                "They run commands from this folder unattended after every turn, so a person has to say yes: open a "
+                f"normal terminal (not a Claude Code session), cd to {root} and run `claude-hr-ctl verify enable`."
+            )
+            return 1
+        if worktree.repo_root(Path.cwd()) is None:
+            out(
+                "this folder is not inside a git repository, and the end-of-turn gate only runs in git repositories "
+                "(`git init` first, or cd into one)"
+            )
+            return 1
+        if not (cfg.flag("gates.enabled", True) and cfg.flag("verify.gate", True)):
+            out(
+                "note: gates.enabled or verify.gate is off in your config, so the end-of-turn gate will not run until you turn it on"
+            )
+        if str(cfg.get("plugins.profile", "standard")).strip().lower() == "minimal":
+            out(
+                "note: the minimal plugin profile does not install hr-gates (the end-of-turn hook): claude-hr-ctl setup --profile standard"
+            )
+        outcome = gate_offer.offer_now(root, cfg, out, explicit=True)
+        return {"enabled": 0, "already-on": 0, "unavailable": 2}.get(outcome, 1)
     # ONE read of the file: the recipe shown, the trust verdict and (for `trust`) the digest that is approved all come
     # from these bytes, so what a person sees is what gets trusted or run
     try:
@@ -980,16 +980,21 @@ def cmd_verify(a, cfg) -> int:
     recipe = loaded.recipe
     state = verify.trust_state_of(root, paths.state_dir(), loaded.data)
     if a.action == "status":
+        hint = gate_offer.status_hint(root, state, cfg)
         if recipe is None:
-            out(f"no recipe at {cp}  ->  `claude-hr-ctl verify init --write`")
+            out(f"no recipe at {cp}  ->  `claude-hr-ctl verify enable` (or `verify init --write`)")
+            if hint:
+                out(hint)
             return 0
         meaning = {
             "trusted": "TRUSTED: the end-of-turn gate runs these checks",
-            "untrusted": "NOT trusted: the gate does nothing until a person runs `claude-hr-ctl verify trust`",
-            "modified": "CHANGED since it was trusted: the gate does nothing until it is reviewed and trusted again",
+            "untrusted": "NOT trusted: the gate does nothing until a person approves it (`claude-hr-ctl verify enable`)",
+            "modified": "CHANGED since it was trusted: the gate does nothing until it is reviewed and trusted again (`claude-hr-ctl verify enable`)",
         }.get(state, state)
         out(f"{cp}: {meaning}")
         _show_recipe(root, recipe, gate_budget, gate_tier)
+        if hint:
+            out(hint)
         return 0
     if a.action == "trust":
         if recipe is None:
@@ -1024,6 +1029,9 @@ def cmd_verify(a, cfg) -> int:
         except ValueError as exc:
             out(verify.safe_text(str(exc)))
             return 1
+        gate_offer.record(
+            root, "enabled", recipe_sha=digest
+        )  # so the launcher never asks about this folder
         out(f"trusted ({digest[:12]}...): the end-of-turn gate may now run these commands")
         return 0
     # ---- run -------------------------------------------------------------------------------------------------
@@ -1353,9 +1361,17 @@ def build_parser() -> argparse.ArgumentParser:
 
     s = sub.add_parser(
         "verify",
-        help="the repo's test/lint recipe (.claude/hr-verify.toml): init, trust, run, status",
+        help="the repo's test/lint recipe (.claude/hr-verify.toml): enable, disable, status, init, trust, untrust, run",
+        description=(
+            "The end-of-turn test gate. 'enable' turns it on for this folder (runs the checks once, keeps the ones "
+            "that pass, asks you first; a person at a terminal only); 'disable' turns it off and stops the launcher "
+            "from asking again; 'status' shows where this folder stands. 'init' / 'trust' / 'untrust' are the manual "
+            "way (write the file, approve it, revoke the approval); 'run' runs the checks once now."
+        ),
     )
-    s.add_argument("action", choices=["init", "run", "trust", "untrust", "status"])
+    s.add_argument(
+        "action", choices=["enable", "disable", "status", "init", "trust", "untrust", "run"]
+    )
     s.add_argument(
         "--write", action="store_true", help="init: save the proposal to .claude/hr-verify.toml"
     )

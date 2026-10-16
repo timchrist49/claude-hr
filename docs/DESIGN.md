@@ -143,6 +143,31 @@ Plan: `docs/plans/2026-10-16-dev-workflow.md`; evidence and rejected options: `d
 - *Parallel work.* Independent plan steps run in worktrees (`hr-plan-execute`, up to 8 at once, merged one by one with the
   checks run before each merge commit); steps that touch the same files are forced sequential.
 
+### 14. The one-time offer of the test gate (0.2.1)
+Problem: the gate was safe but nobody had it. Turning it on meant `verify init --write`, reading a TOML file and `verify trust` in
+a separate terminal, in every repository; the people it helps most never got that far. Decision: make it effectively default-on
+without changing what protects the user, by moving the *question* (not the approval) to the one moment a person is
+provably there: starting an interactive session in a normal terminal.
+- *The model of trust is untouched.* The recipe is still repository text; running it is still approval of its exact bytes by hash;
+  an agent still cannot approve it. The launcher asks only when `human.not_a_person()` says a person is at a terminal (the same
+  refusal as `verify trust`: not in a Claude Code shell, not without a terminal on both ends), never in `-p`, `agents`, a
+  subcommand, a nested launch or `--hr-dry-run`, and no flag or variable answers for the person.
+- *What the person approves is what runs.* The offer shows the discovered commands in plain words; `yes` runs each once while they
+  watch, keeps only those that pass today (a gate that blocks Claude on a failure that predates it wastes tokens and trust),
+  writes exactly those through the no-symlink writer, hashes the bytes it wrote and trusts that hash. A recipe that ships with
+  the repository gets the old full screen (both tiers, escaped, audit preflight, SHA-256) and the default answer No.
+- *Default answer follows risk.* Enter is Yes only when the audit preflight (read-only, bounded) finds nothing high or medium,
+  or No with the findings printed. EOF and Ctrl-C are "not now" and record nothing; an explicit `n` is remembered per folder in
+  `state/verify-offer.json` (a record of an answer, never an approval) and `verify enable|disable` move it either way.
+- *Costs nothing when nothing is due.* The launcher imports `gate_offer` only for a plain interactive session; "trusted", "declined" and
+  "nothing in this folder to propose from" are decided with a handful of `stat`s and one SHA-256, without importing `verify` or
+  `audit` and without a subprocess (about 3 ms, measured), by mirroring three constants of `verify.py` that a test keeps in step.
+  Only a folder that has project files but nothing discovery can propose pays for `verify.discover` on each start.
+- *Rejected:* an environment variable or flag that auto-answers (it would be the agent's lever too); asking from the Stop hook
+  (no terminal there, and the person cannot answer a hook); a modal at first-ever `claude-hr` run (the answer is per folder);
+  committing the generated file (it is the user's local choice, so it is kept out of `git status` through `.git/info/exclude`
+  instead of the repository's `.gitignore`).
+
 ## Failure modes
 
 | Failure | Behaviour |
@@ -157,6 +182,7 @@ Plan: `docs/plans/2026-10-16-dev-workflow.md`; evidence and rejected options: `d
 | Daemon started without the route | Restarted if idle, loud warning otherwise |
 | Update smoke test fails | Previous version reinstalled, logged to `logs/update.jsonl` |
 | claude-hr itself uninstalled | Plain `claude` unaffected (no global base URL); `hr-core` hook commands exit 0 if `claude-hr-hook` is missing; the `hr-gates` Stop hook (exec form, no shell) shows a non-blocking notice each turn until `claude-hr-ctl uninstall` removes the plugin |
+| The launcher's gate offer fails, hangs on a hostile repository, is interrupted (Ctrl-C) or hits EOF | Claude starts as before, nothing is recorded or approved; every file it reads from the repository is a size-bounded regular file, the preflight and the checks have time limits, and nothing is written outside `.claude/hr-verify.toml` and `.git/info/exclude` |
 | Formatter missing, slow or failing; check times out or cannot start; state file unwritable; any bug in the gate | The turn ends normally; the reason is in `trail` / `logs/crash.log`. Running out of the overall time budget, or a check that cannot start, never blocks; a check that exceeds its own `timeout_s` is a failed check and does block (capped by `verify.gate_max_blocks`) |
 
 ## Decisions confirmed with the owner (2026-10-15)

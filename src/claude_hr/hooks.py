@@ -105,9 +105,10 @@ GIT_RISKS: list[tuple[re.Pattern, str]] = [
 # user does it (in their own terminal). The CLI refuses a Claude Code shell; this refuses the agent that tries anyway,
 # in every permission mode, as long as hooks run. Like every pattern here it is not a boundary (`sh -c "$(echo ...)"`).
 _VERIFY_TRUST = re.compile(
-    r"(?ism)claude[-_]hr[\w.-]*\b[^\n;&|]*?\bverify\s+(?:un)?trust\b"
-    r"|\bverify-trust\.json\b"
+    r"(?ism)claude[-_]hr[\w.-]*\b[^\n;&|]*?\bverify\s+(?:(?:un)?trust|enable|disable)\b"
+    r"|\bverify-(?:trust|offer)\.json\b"
     r"|\bclaude_hr\b[^\n]*\bverify\b[^\n]*\b(?:un)?trust\s*\("
+    r"|\bclaude_hr\b[^\n]*\bgate_offer\b[^\n]*\b(?:enable|disable|record|forget|offer_now)\s*\("
 )
 
 
@@ -174,9 +175,9 @@ def bash_guard() -> int:
             return 2
     if _VERIFY_TRUST.search(command):
         sys.stderr.write(
-            "Blocked by the claude-hr guard: trusting (or editing the trust record of) a verify recipe lets commands "
-            "run unattended after every turn, so only the user does it. Show the user .claude/hr-verify.toml and ask "
-            "them to run `claude-hr-ctl verify trust` in their own terminal.\n"
+            "Blocked by the claude-hr guard: trusting or enabling (or editing the trust record of) a verify recipe lets "
+            "commands run unattended after every turn, so only the user does it. Show the user .claude/hr-verify.toml "
+            "and ask them to run `claude-hr-ctl verify enable` (or `verify trust`) in their own terminal.\n"
         )
         return 2
     mode = os.environ.get("CLAUDE_HR_GIT_GUARD", "ask").strip().lower()

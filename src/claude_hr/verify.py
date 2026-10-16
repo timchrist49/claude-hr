@@ -2,9 +2,9 @@
 
 Why this exists: "done" from a model proves nothing, the repo's own tests and linters do. The commands live in
 `<repo>/.claude/hr-verify.toml` as argv lists. They execute code that arrives with the repository (a clone, a PR
-branch), so they only run after the user approved that exact file by hash (`claude-hr-ctl verify trust`), with no
-shell, a scrubbed environment, a timeout that kills the whole process tree, and a cap on how often one failure may
-block the model.
+branch), so they only run after the user approved that exact file by hash (`claude-hr-ctl verify trust`, or a yes to the
+one-time offer the launcher makes in a terminal, see gate_offer.py: both end in trust()), with no shell, a scrubbed
+environment, a timeout that kills the whole process tree, and a cap on how often one failure may block the model.
 
 Everything a hook calls (`gate`, `fingerprint`, `test_weakening`, `is_trusted`) fails open: no exception escapes, the
 worst case is that nothing is checked. Heavy imports (subprocess, tomllib, hashlib) are lazy, a hook that skips
@@ -399,9 +399,17 @@ _HEADER = """\
 """
 
 
-def render_toml(r: Recipe) -> str:
-    """The exact text `verify init --write` puts in `.claude/hr-verify.toml`."""
-    out = [_HEADER.rstrip("\n"), "#", f"# Proposed from: {_comment(r.source) or 'nothing'}"]
+def render_toml(r: Recipe, header: str | None = None) -> str:
+    """The exact text `verify init --write` puts in `.claude/hr-verify.toml`.
+
+    `header` replaces the standard comment block (the launcher's one-time offer writes its own, which says the file was
+    generated after a yes and how to edit or turn it off). It must consist of comment lines only."""
+    if header is not None and any(
+        ln.strip() and not ln.lstrip().startswith("#") for ln in header.splitlines()
+    ):
+        raise ValueError("a recipe header may contain comment lines only")
+    head = _HEADER if header is None else header
+    out = [head.rstrip("\n"), "#", f"# Proposed from: {_comment(r.source) or 'nothing'}"]
     if r.notes:
         out += [
             "#",
@@ -2439,6 +2447,9 @@ def discover(root: Path) -> Recipe:
 
     fast = lint, typecheck, unit tests (should take about a minute); full = those plus the build and the slow
     suites. CI `run:` lines and tox/nox/pre-commit are only reported as notes. Never raises.
+
+    Adding an ecosystem that looks at a new file name? Add the name to gate_offer._DISCOVER_MARKERS too: the launcher uses
+    that list to skip a folder with nothing to propose without calling this function.
     """
     root = Path(root)
     b = _Builder()

@@ -92,7 +92,7 @@ claude-hr-ctl doctor                                          # lists what is st
 claude-hr-ctl setup --only settings claude-md plugins         # adds hr-gates, the lean profile and the new permission rules; it only adds
 ```
 
-The 0.2.0 `standard` profile no longer includes Superpowers, feature-dev or code-simplifier; a machine that already has them keeps them. Uninstall them by name (`claude plugin uninstall superpowers`) to save their tokens, or keep them with `--profile process`. (`plugins sync --prune` removes *every* user-scope plugin outside the profile, including ones you added yourself.) Then, in each repository where you want the end-of-turn test gate, run `claude-hr-ctl verify init --write`, read `.claude/hr-verify.toml`, and `claude-hr-ctl verify trust` in a normal terminal.
+The 0.2.0 `standard` profile no longer includes Superpowers, feature-dev or code-simplifier; a machine that already has them keeps them. Uninstall them by name (`claude plugin uninstall superpowers`) to save their tokens, or keep them with `--profile process`. (`plugins sync --prune` removes *every* user-scope plugin outside the profile, including ones you added yourself.) The end-of-turn test gate needs no per-repository setup any more: the first time you start `claude-hr` in a git repository in a normal terminal it offers to turn the gate on (see [Automatic checks](#automatic-checks-the-test-gate)).
 
 ## What it does about each concern
 
@@ -124,8 +124,47 @@ it costs **no model tokens** unless something fails or you ask for a review. cla
 | **Plan, build, prove** | `/hr-core:hr-plan` (a plan file with a verify command per step, your approval, one step at a time), `/hr-core:hr-done` (evidence instead of "it works"), `/hr-core:hr-gh` (issue and PR recipes with the `gh` CLI, no MCP server). For independent steps the opt-in `hr-plan-execute` workflow runs them in parallel git worktrees and merges the passing ones one by one. | manual-only skills: nothing until you call them |
 | **Review ladder** | `/hr-core:hr-audit`: the free `claude-hr-ctl audit` first, then the bundled `/code-review`, `/security-review` only for changes at a trust boundary, and the opt-in `hr-review-changes` workflow for a risky release. LLM reviews are advisory; the repo's checks and CI are the gate. | on request |
 
-**Trusting a repository's checks.** `.claude/hr-verify.toml` is text from that repository (a clone, a PR, a dependency), so
-it never runs until you have trusted its exact bytes:
+### Automatic checks (the test gate)
+
+**What it is.** After each turn, claude-hr can run the project's own checks (its linter and its tests) and, if one of them
+fails, hand the failure back to Claude to fix before the turn can end. It only uses checks the project already has (for
+example `ruff check .` and `pytest -q`) and it costs no tokens unless something fails.
+
+**What you see the first time.** The first time you start `claude-hr` in a folder that is a git repository, in a normal
+terminal, it asks once:
+
+```
+claude-hr can double-check Claude's work in this folder (optional; asked once per folder).
+After each turn it would run this project's own checks and send any failure back to Claude to fix:
+    1. ruff check .
+    2. pytest -q
+Nothing runs unless you say yes now. If you do, they run once, here, to see which pass today.
+These checks run code from this folder, so say no if you do not trust it.
+Turn it on? [Y/n]
+```
+
+Enter means yes. claude-hr then runs each check once, while you watch, and keeps only the ones that pass today (a check that
+already fails would only block Claude on a problem it did not cause; those are listed so you can fix them or add them
+yourself). The list is saved as `.claude/hr-verify.toml` and kept out of `git status` through `.git/info/exclude` (local to
+your clone, never committed by accident). If the folder's agent settings look risky (the same scan as `claude-hr-ctl audit`),
+the findings are shown first and the default answer is No.
+
+**How to say no.** Type `n`: you are not asked again for that folder. Ctrl-C or closing the terminal means "not now" and it
+asks again next time. To stop the question everywhere: `claude-hr-ctl config set verify.offer off`.
+
+**How to undo it.** `claude-hr-ctl verify disable` turns the gate off for this folder and keeps the file;
+`claude-hr-ctl verify enable` turns it on again; `claude-hr-ctl verify status` shows where the folder stands (on, off, or never
+offered). To remove it completely, delete `.claude/hr-verify.toml` (and its line in `.git/info/exclude`).
+
+**What it never does.** It never asks in `claude -p`, `claude agents`, `claude mcp ...` or any other subcommand, inside a
+Claude Code session, with piped input, a redirected stderr or without a terminal, and no flag or environment variable answers for you. A repository
+that brings its own `.claude/hr-verify.toml` (a clone, a pull request) is shown in full, every command of both tiers, with No as
+the default; editing the file later asks again. The gate runs the commands you saw and nothing else.
+
+### The manual way
+
+`.claude/hr-verify.toml` is text from that repository (a clone, a PR, a dependency), so it never runs until you have trusted its
+exact bytes. The offer above does this for you; to do it by hand:
 
 ```bash
 claude-hr-ctl verify init --write   # propose checks from what the repo already declares (package.json scripts, pyproject, Cargo, go.mod, Makefile, CI); nothing runs
@@ -134,7 +173,7 @@ claude-hr-ctl verify trust          # in a normal terminal, after reading the fi
 claude-hr-ctl verify run [--tier full]
 ```
 
-Editing the file afterwards revokes the trust. There is no `--yes`: `verify trust` refuses to run inside a Claude Code session
+Editing the file afterwards revokes the trust. There is no `--yes`: `verify trust` and `verify enable` refuse to run inside a Claude Code session
 or without a terminal, the bash guard denies an agent that tries it anyway, and `verify run` will not run an untrusted recipe
 for an agent. Checks run without a shell, with a scrubbed environment (credential-looking names, cloud/CI/agent prefixes such as `ANTHROPIC_` and `AWS_`, `SSH_AUTH_SOCK` are dropped), a time limit, and the whole process tree is ended on a timeout and when a check exits leaving children running.
 `verify trust` shows every check of both tiers in full with terminal and bidi characters escaped, prints the file's SHA-256 and trusts exactly the bytes it showed. A repo without a recipe is simply not gated; formatting still happens.
@@ -147,7 +186,7 @@ PR template, CODEOWNERS, Dependabot, `docs/plans` and `docs/decisions`, `REVIEW.
 `claude-hr-ctl fmt`.
 
 Switches: `CLAUDE_HR_GATES=off` in the environment (or `gates.enabled = false`) disables the hook, `format.enabled`,
-`verify.gate`, `gates.trail` switch single steps, `security.profile = "strict"` makes the git confirmations refusals. Everything fails
+`verify.gate`, `gates.trail` switch single steps, `verify.offer = "off"` stops the one-time question at launch, `security.profile = "strict"` makes the git confirmations refusals. Everything fails
 open: a missing tool, an error or running out of the overall time budget exits quietly and never blocks `claude`. A trusted check that fails, or exceeds its own `timeout_s`, is a failed check and does block (at most `verify.gate_max_blocks` times for the same tree); a check's `timeout_s` is capped by `verify.gate_timeout_s` and by what is left of the hook's 150 s budget, and a check cut short by that shared budget is inconclusive: it never blocks and you get a one-line notice.
 
 ## Commands
@@ -172,7 +211,8 @@ They change routing and limits only, not the managed settings or plugins. `claud
 | `wt new <name> [--base ref]\|list\|rm <name> [--force] [--delete-branch]` | git worktrees for parallel agents (`.claude/worktrees/<name>` on branch `hr/<name>`; `rm` keeps the branch; `--delete-branch` deletes it only if it is fully merged, otherwise it is kept and the command says so) |
 | `workflows list\|install` | copies the opt-in Workflows `hr-review-changes` (parallel review + adversarial verification, typically 10-40 agents and up to about 85 with the defaults; `votes` and `maxPerDimension` raise it) and `hr-plan-execute` (independent plan steps in parallel worktrees, up to ~25 agents, `dryRun` first) into a project's `.claude/workflows/`; they only run when you ask Claude to |
 | `fmt [paths] [--changed] [--check]` | no arguments: which formatter this repo configures. With paths or `--changed`: format them (`--check` only reports and exits 1 if something needs formatting) |
-| `verify init [--write] [--force]\|status\|trust\|untrust\|run [--tier fast\|full]` | the repo's verify recipe `.claude/hr-verify.toml`: propose it from what the repo declares, trust its exact bytes (a person in a terminal only), run it |
+| `verify enable\|disable\|status` | the end-of-turn test gate for this folder: `enable` runs the discovered checks once, keeps the ones that pass, asks you, writes `.claude/hr-verify.toml` and trusts it (the same thing the launcher offers once per folder; a person in a terminal only, no `--yes`); `disable` turns it off and stops the offer; `status` shows where the folder stands |
+| `verify init [--write] [--force]\|trust\|untrust\|run [--tier fast\|full]` | the manual way: propose the recipe `.claude/hr-verify.toml` from what the repo declares, trust its exact bytes (a person in a terminal only), revoke, run it |
 | `audit [path] [--json] [--strict] [--tools]` | read-only, zero-token audit of a repository (agent-config attack surface, hidden Unicode, workflow lint, masked secrets); exit 0 when it ran, 1 with `--strict` on any high or medium finding (an incomplete scan or an unreadable agent file counts), 2 when it could not run |
 | `init-repo [path] [--apply] [--only github,docs,editor,dependabot,codeowners,review,ci]` | scaffold the files an agent workflow relies on, at the top level of a git work tree (a plain folder, a bare repository or a subdirectory gets a warning and exit 2 / only the groups that make sense there); a dry run unless `--apply`, creates only files that do not exist, skips the CI skeleton when another workflow already runs tests, never touches git or the network |
 | `footprint [--probe] [--strict]` | estimated always-on tokens per enabled plugin and the hidden costs; `--probe` measures one real turn (spends tokens) |

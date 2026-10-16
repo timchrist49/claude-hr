@@ -52,6 +52,8 @@ TAMPER_ASK = [
     # trusting a verify recipe is what lets commands run unattended: only the user does that
     "Bash(claude-hr-ctl verify trust*)",
     "Bash(claude-hr ctl verify trust*)",
+    "Bash(claude-hr-ctl verify enable*)",
+    "Bash(claude-hr ctl verify enable*)",
 ]
 
 # claude-hr's own files: state/ holds the verify trust record and the gate counters (Claude never needs to edit it: denied)

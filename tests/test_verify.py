@@ -473,6 +473,15 @@ def test_render_toml_header_explains_the_trust_model():
     assert tomllib.loads(text) == {}
 
 
+def test_render_toml_accepts_a_custom_header_of_comments_only():
+    text = verify.render_toml(Recipe([], [], "x"), header="# generated\n# by claude-hr")
+    assert text.startswith("# generated\n# by claude-hr\n#\n# Proposed from: x\n")
+    assert "claude-hr-ctl verify trust" not in text and tomllib.loads(text) == {}
+    for bad in ("# fine\n[[fast]]", 'x = "1"', "# ok\n\nname = 1"):
+        with pytest.raises(ValueError):
+            verify.render_toml(Recipe([], [], "x"), header=bad)
+
+
 def test_render_toml_format_of_one_table():
     text = verify.render_toml(Recipe([Check("unit", ["npm", "run", "test"], 90, "web")], [], "x"))
     assert (

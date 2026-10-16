@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.2.1
+The end-of-turn test gate is now offered, once per folder, instead of waiting for you to find three commands. The model of trust
+is unchanged: the checks still run only after a person approved the exact file, and an agent still cannot approve it.
+- **One-time offer at launch.** The first time you start an interactive `claude-hr` session in a git repository in a normal
+  terminal, it asks `Turn it on? [Y/n]` in plain words and lists the commands it found. Yes runs each check once while you watch,
+  keeps only the ones that pass today, writes `.claude/hr-verify.toml`, hides it from `git status` (`.git/info/exclude`, local) and
+  trusts the exact bytes it wrote. No is remembered for that folder; Ctrl-C is "not now". The default answer is No, with the findings
+  printed first, when the audit preflight finds anything high or medium. A recipe that ships with a repository is shown in full
+  (both tiers, escaped, SHA-256) and asked about with No as the default. Never asked in `-p`, `agents`, subcommands, a Claude Code
+  shell, with piped input, in a home directory or a bare repository; nothing answers for you (no flag, no variable). New config key
+  `verify.offer` (`"ask"`, or `"off"`).
+- **New commands:** `claude-hr-ctl verify enable` (the same thing on request, a person at a terminal only, no `--yes`) and
+  `verify disable` (untrust, remember the no, keep the file). `verify status` says when a folder was declined or never offered;
+  `verify trust` by hand also stops the offer for that folder. The bash guard and the settings baseline treat `verify enable` /
+  `disable` like `verify trust`.
+- **Cost:** about 3 ms on an interactive start in a folder that is already decided, and nothing on any other launch (`-p`, agents,
+  subcommands, dry runs do not even import the module). The launcher stays fail-open: any error in the offer starts Claude.
+- The manual way (`verify init --write`, `verify trust`) still works and is documented as such.
+
 ## 0.2.0 (2026-10-16)
 A verified development loop with no always-on token cost, for sessions run at Ultracode effort on `opusplan` (claude-hr still sets
 no model, effort or thinking setting; Headroom's own output shaper stays a separate switch). Plan: `docs/plans/2026-10-16-dev-workflow.md`; reasons: `docs/DESIGN.md` section 13.

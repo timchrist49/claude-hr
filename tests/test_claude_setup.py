@@ -189,6 +189,9 @@ def test_baseline_lean_defaults_for_the_dev_workflow(sandbox):
     assert (
         "Bash(claude-hr-ctl verify trust*)" in ask
     )  # only the user decides which commands run unattended
+    assert (
+        "Bash(claude-hr-ctl verify enable*)" in ask and "Bash(claude-hr ctl verify enable*)" in ask
+    )
     deny = doc["permissions"]["deny"]  # the trust record and gate counters are not Claude's to edit
     assert "Edit(~/.claude-hr/state/**)" in deny and "Write(~/.claude-hr/state/**)" in deny
     assert "Read(~/.ssh/**)" in deny  # next to, not instead of, the secret-read rules

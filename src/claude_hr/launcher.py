@@ -13,7 +13,9 @@ claude-hr-only switches (stripped before Claude sees the args):
     --hr-wait N      seconds to wait for a cold proxy
 Management lives in `claude-hr ctl ...` (same as the `claude-hr-ctl` command).
 
-All claude-hr chatter goes to stderr so `-p --output-format json` pipelines stay clean.
+All claude-hr chatter goes to stderr so `-p --output-format json` pipelines stay clean. The one thing that ever asks a
+question is the one-time offer of the end-of-turn test gate (gate_offer.py): only for a plain interactive session with a
+terminal, once per git folder, never in -p / agents / subcommands / --hr-dry-run; Ctrl-C or any error just starts Claude.
 
 Design rule: nothing in here may stop `claude` from starting. Bookkeeping (session registry, launch ring, caches) is
 best-effort and every failure degrades to "launch anyway".
@@ -604,6 +606,17 @@ def main(argv: list[str] | None = None) -> int:
         if opts.get("dry-run"):
             _say("command: " + " ".join(cmd))
             return 0
+
+    if kind == "session":
+        # The one-time offer of the end-of-turn test gate: only a plain interactive session, only in a normal terminal,
+        # once per folder. Imported here (it pulls in nothing heavy unless a question is really due) and wrapped:
+        # whatever happens in there, Claude starts.
+        try:
+            from . import gate_offer
+
+            gate_offer.maybe_offer(args, cfg)
+        except Exception:
+            pass
 
     # ---- launch ---------------------------------------------------------------------------
     cwd = os.getcwd()

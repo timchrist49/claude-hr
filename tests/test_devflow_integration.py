@@ -738,3 +738,185 @@ def test_verify_init_write_does_not_write_into_a_linked_claude_directory(repo, c
     link(repo / ".claude", elsewhere, directory=True)
     rc, text = run(capsys, "verify", "init", "--write")
     assert rc == 1 and "cannot write" in text and list(elsewhere.iterdir()) == []
+
+
+# ---- `verify enable` / `verify disable`, and the launcher offer's record shown by `verify status` -----------------
+from claude_hr import gate_offer, human  # noqa: E402
+
+OFFER_CHECKS = [
+    verify.Check(
+        "needs-ok-file",
+        [sys.executable, "-c", "import os,sys; sys.exit(0 if os.path.exists('ok.txt') else 1)"],
+        30,
+    ),
+    verify.Check("always-fails", [sys.executable, "-c", "raise SystemExit(5)"], 30),
+]
+
+
+@pytest.fixture
+def offer_discovery(repo, monkeypatch):
+    """Discovery proposes OFFER_CHECKS; ok.txt makes the first pass today, the second never passes."""
+    (repo / "ok.txt").write_text("x", encoding="utf-8")
+    (repo / "pyproject.toml").write_text("[project]\nname='x'\nversion='0'\n", encoding="utf-8")
+    recipe = verify.Recipe(list(OFFER_CHECKS), list(OFFER_CHECKS), "discovered from test", [])
+    monkeypatch.setattr(verify, "discover", lambda root: recipe)
+    return recipe
+
+
+@pytest.fixture
+def typed(monkeypatch):
+    """A person at a normal terminal who types the queued answers; an unscripted question fails the test."""
+    monkeypatch.setattr(ctl, "_not_a_person", lambda: None)
+    monkeypatch.setattr(human, "not_a_person", lambda: None)
+    answers: list = []
+    asked: list[str] = []
+
+    def fake_input(prompt=""):
+        asked.append(prompt)
+        if not answers:
+            raise AssertionError(f"nobody was supposed to be asked: {prompt!r}")
+        return answers.pop(0)
+
+    monkeypatch.setattr("builtins.input", fake_input)
+    return type("Typed", (), {"answers": answers, "asked": asked})
+
+
+def test_verify_enable_refuses_a_claude_code_shell(repo, capsys, agent_shell, offer_discovery):
+    rc, text = run(capsys, "verify", "enable")
+    assert rc == 1 and "refusing to turn the checks on" in text and "Claude Code session" in text
+    assert (
+        verify.trust_state(repo, paths.state_dir()) == "no-config"
+        and not (repo / ".claude").exists()
+    )
+
+
+def test_verify_enable_refuses_without_a_terminal(repo, capsys, monkeypatch, offer_discovery):
+    monkeypatch.delenv("CLAUDECODE", raising=False)
+    monkeypatch.delenv("CLAUDE_CODE_ENTRYPOINT", raising=False)
+    rc, text = run(capsys, "verify", "enable")  # pytest's stdin is not a tty
+    assert rc == 1 and "no interactive terminal" in text and not (repo / ".claude").exists()
+
+
+def test_there_is_no_flag_that_answers_for_verify_enable(repo, capsys):
+    for flag in ("--yes", "-y", "--assume-yes", "--no-confirm"):
+        with pytest.raises(SystemExit) as exc:
+            ctl.main(["verify", "enable", flag])
+        assert exc.value.code == 2
+    assert verify.trust_state(repo, paths.state_dir()) == "no-config"
+
+
+def test_the_one_flag_verify_has_for_init_does_not_answer_enable(
+    repo, capsys, typed, offer_discovery
+):
+    typed.answers.append("n")
+    rc, _text = run(capsys, "verify", "enable", "--force")  # --force belongs to `init --write`
+    assert rc == 1 and len(typed.asked) == 1 and not (repo / ".claude").exists()
+
+
+def test_enable_keeps_only_what_passes_today_and_disable_undoes_it(
+    repo, capsys, typed, offer_discovery
+):
+    typed.answers.append("")  # Enter = yes
+    rc, text = run(capsys, "verify", "enable")
+    assert rc == 0 and "[ok]   needs-ok-file" in text and "[FAIL] always-fails" in text
+    assert "Failing today, not turned on" in text and "Turned on" in text
+    state = verify.trust_state(repo, paths.state_dir())
+    assert state == "trusted"
+    assert [c.name for c in verify.load_checked(repo).recipe.fast] == ["needs-ok-file"]
+    assert gate_offer.decision_for(repo)["decision"] == "enabled"
+    status = run(capsys, "verify", "status")[1]
+    assert "TRUSTED" in status and "needs-ok-file" in status and "always-fails" not in status
+
+    rc, text = run(capsys, "verify", "enable")  # already on: nothing to ask
+    assert rc == 0 and "already on" in text and len(typed.asked) == 1
+
+    rc, text = run(capsys, "verify", "disable")
+    assert rc == 0 and "turned off" in text and verify.config_path(repo).exists()
+    assert verify.trust_state(repo, paths.state_dir()) == "untrusted"
+    status = run(capsys, "verify", "status")[1]
+    assert "declined on " in status and "claude-hr-ctl verify enable" in status
+
+    typed.answers.append("y")  # `verify enable` after a no is an explicit request: it asks again
+    rc, text = run(capsys, "verify", "enable")
+    assert rc == 0 and verify.trust_state(repo, paths.state_dir()) == "trusted"
+    assert gate_offer.decision_for(repo)["decision"] == "enabled"
+
+
+def test_the_stop_gate_then_checks_the_enabled_recipe(repo, capsys, typed, offer_discovery):
+    typed.answers.append("y")
+    assert run(capsys, "verify", "enable")[0] == 0
+    assert stop(repo) is None  # ok.txt exists: green
+    (repo / "ok.txt").unlink()
+    blocked = stop(repo)
+    assert blocked and blocked["decision"] == "block" and "needs-ok-file" in blocked["reason"]
+
+
+def test_enable_with_no_changes_nothing(repo, capsys, typed, offer_discovery):
+    typed.answers.append("n")
+    rc, text = run(capsys, "verify", "enable")
+    assert rc == 1 and "not turning it on" in text and not (repo / ".claude").exists()
+    assert gate_offer.decision_for(repo)["decision"] == "declined"
+    assert "declined on " in run(capsys, "verify", "status")[1]
+
+
+def test_enable_in_a_folder_with_nothing_to_check_says_so(repo, capsys, typed):
+    rc, text = run(capsys, "verify", "enable")  # the real discovery: app.py only
+    assert rc == 1 and "nothing to turn on" in text and typed.asked == []
+
+
+def test_enable_on_a_recipe_that_ships_with_the_repo_is_the_trust_path(repo, capsys, typed):
+    write_recipe(repo, trusted=False)
+    shown = verify.load_checked(repo).sha256
+    typed.answers.append("")  # Enter is No for a recipe nobody here approved
+    rc, text = run(capsys, "verify", "enable")
+    assert rc == 1 and "needs-ok-file" in text and f"file sha256: {shown}" in text
+    assert verify.trust_state(repo, paths.state_dir()) == "untrusted"
+    typed.answers.append("y")
+    rc, text = run(capsys, "verify", "enable")
+    assert rc == 0 and verify.trust_state(repo, paths.state_dir()) == "trusted"
+
+
+def test_enable_reports_an_invalid_recipe_instead_of_asking(repo, capsys, typed):
+    p = verify.config_path(repo)
+    p.parent.mkdir(parents=True)
+    p.write_text('[[fast]]\nname = "x"\nargv = ["a && b"]\n', encoding="utf-8")
+    rc, text = run(capsys, "verify", "enable")
+    assert rc == 2 and "shell characters" in text and typed.asked == []
+
+
+def test_status_says_when_the_folder_was_never_offered(repo, capsys):
+    rc, text = run(capsys, "verify", "status")
+    assert rc == 0 and "no recipe" in text and "never offered here" in text
+
+
+def test_verify_trust_by_hand_is_recorded_so_the_launcher_stays_quiet(
+    repo, capsys, at_the_keyboard
+):
+    write_recipe(repo, trusted=False)
+    assert run(capsys, "verify", "trust")[0] == 0
+    entry = gate_offer.decision_for(repo)
+    assert (
+        entry["decision"] == "enabled" and entry["recipe_sha"] == verify.load_checked(repo).sha256
+    )
+
+
+def test_untrust_points_at_disable(repo, capsys):
+    write_recipe(repo)
+    rc, text = run(capsys, "verify", "untrust")
+    assert rc == 0 and "verify disable" in text
+
+
+def test_disable_works_without_a_recipe_and_without_a_person(repo, capsys, agent_shell):
+    rc, text = run(capsys, "verify", "disable")
+    assert rc == 0 and "were not on" in text
+    assert gate_offer.decision_for(repo)["decision"] == "declined"
+
+
+def test_enable_outside_a_git_repository_is_refused(tmp_path, capsys, typed, monkeypatch):
+    plain = tmp_path / "not-a-repo"
+    plain.mkdir()
+    (plain / "pyproject.toml").write_text("[project]\nname='x'\n", encoding="utf-8")
+    monkeypatch.chdir(plain)
+    rc, text = run(capsys, "verify", "enable")
+    assert rc == 1 and "not inside a git repository" in text and typed.asked == []
+    assert not (plain / ".claude").exists()

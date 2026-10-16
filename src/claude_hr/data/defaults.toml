@@ -153,8 +153,12 @@ repo_tools = "trusted"       # trusted: a formatter that lives inside the repo (
                              #   are used only for a repo whose verify recipe you trusted; always: use them in every repo (the gate then runs code the repo or Claude wrote)
 
 [verify]
-# The end-of-turn test gate runs ONLY the commands in a repo's .claude/hr-verify.toml that you trusted (claude-hr-ctl verify trust).
+# The end-of-turn test gate runs ONLY the commands in a repo's .claude/hr-verify.toml that you trusted (claude-hr-ctl verify enable / trust).
 gate = true                  # false: never run the gate (the commands stay available through `claude-hr-ctl verify run`)
+offer = "ask"                # ask: when you start an interactive `claude-hr` session in a git repository in a normal terminal, offer to turn the gate on, ONCE per folder
+                             #   (one keystroke; Enter = yes unless the folder's agent settings look risky; a "no" is remembered; nothing is asked in -p, agents, subcommands,
+                             #   a Claude Code shell or without a terminal). off: never ask (`claude-hr-ctl verify enable` still works). Needs gates.enabled and gate = true;
+                             #   the minimal plugin profile has no gate, so it is not offered there. There is no setting that answers the question for you.
 gate_max_blocks = 2          # at most this many times per unchanged working tree (Claude Code's own cap is 8)
 gate_timeout_s = 120         # per turn, for all checks together (a recipe check's own timeout_s is cut to what is left, and a check cut short by this budget is reported to you and never blocks); see the 150 s hook budget under [gates]
 tier = "fast"                # which tier of the recipe the gate runs: fast | full

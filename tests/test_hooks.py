@@ -380,6 +380,13 @@ TRUST_BLOCK = [
     'python -c "from claude_hr import verify; verify.trust(root, state)"',
     "cat ~/.claude-hr/state/verify-trust.json",
     "echo '{}' > ~/.claude-hr/state/verify-trust.json",
+    # the launcher's one-time offer and its record: enabling is approving, and the record is the user's answer
+    "claude-hr-ctl verify enable",
+    "claude-hr ctl verify enable",
+    "cd repo && claude-hr-ctl.exe verify enable --yes",
+    "claude-hr-ctl verify disable",
+    "echo '{}' > ~/.claude-hr/state/verify-offer.json",
+    'python -c "from claude_hr import gate_offer; gate_offer.enable(root, proposal, cfg, print)"',
 ]
 TRUST_ALLOW = [
     "claude-hr-ctl verify status",

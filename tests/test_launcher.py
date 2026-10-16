@@ -400,3 +400,270 @@ def test_resolved_command_is_the_single_choke_point(hostile_cwd):
         absolute,
         "y",
     ]  # an explicit path is the caller's choice
+
+
+# ---- the one-time offer of the test gate ----------------------------------------------------------------------------
+class _OfferWorld:
+    def __init__(self, repo, launched, prompts, answers):
+        self.repo = repo
+        self.launched = launched
+        self.prompts = prompts
+        self.answers = answers
+
+
+@pytest.fixture
+def offer_world(tmp_path, monkeypatch):
+    """A real git repository as the current directory, a person at a terminal (scripted), a fake claude whose start is
+    only recorded, and a discovery that proposes two real checks (`python -c pass`)."""
+    import os
+    import subprocess
+    import sys
+
+    from claude_hr import gate_offer, human, verify
+
+    repo = tmp_path / "work" / "proj"
+    repo.mkdir(parents=True)
+    env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+    env["GIT_CONFIG_GLOBAL"] = os.devnull
+    try:
+        subprocess.run(["git", "init", "-q"], cwd=repo, env=env, check=True, capture_output=True)
+    except (OSError, subprocess.CalledProcessError):
+        pytest.skip("git is needed for a real repository")
+    (repo / "pyproject.toml").write_text("[project]\nname='x'\nversion='0'\n", encoding="utf-8")
+    monkeypatch.chdir(repo)
+    for var in ("CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT", "CLAUDE_HR_GATES"):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv("CLAUDE_HR_HEADROOM__ENABLED", "false")
+
+    claude = _exe(tmp_path / "claude-home", "claude")
+    monkeypatch.setattr(launcher.procutil, "find_claude", lambda *_a, **_k: claude)
+    monkeypatch.setattr(launcher, "_cli_shape", lambda _real: None)
+
+    launched: list[list[str]] = []
+
+    def fake_execve(path, argv, env=None):
+        launched.append(list(argv))
+        raise OSError("recorded, not started")
+
+    def fake_run_windows(cfg, cmd, env, cwd, kind, routed_url, limits, pids):
+        launched.append(list(cmd))
+        return 0
+
+    monkeypatch.setattr(launcher.os, "execve", fake_execve)
+    monkeypatch.setattr(launcher, "_run_windows", fake_run_windows)
+
+    prompts: list[str] = []
+    answers: list[str] = []
+
+    def fake_input(prompt=""):
+        prompts.append(prompt)
+        if not answers:
+            raise AssertionError(f"nobody was supposed to be asked: {prompt!r}")
+        return answers.pop(0)
+
+    monkeypatch.setattr("builtins.input", fake_input)
+    monkeypatch.setattr(human, "not_a_person", lambda: None)
+    monkeypatch.setattr(gate_offer, "_can_see_the_question", lambda: True)
+    py = sys.executable
+    prop = verify.Recipe(
+        [
+            verify.Check("lint", [py, "-c", "pass"], 30),
+            verify.Check("tests", [py, "-c", "pass"], 30),
+        ],
+        [
+            verify.Check("lint", [py, "-c", "pass"], 30),
+            verify.Check("tests", [py, "-c", "pass"], 30),
+        ],
+        "discovered from test",
+        [],
+    )
+    monkeypatch.setattr(verify, "discover", lambda root: prop)
+    return _OfferWorld(repo, launched, prompts, answers)
+
+
+def test_an_interactive_session_is_offered_the_gate_once(offer_world, capsys):
+    from claude_hr import paths, verify
+
+    offer_world.answers.append("")  # Enter
+    launcher.main(["--hr-no-limits", "fix the bug"])
+    err = capsys.readouterr().err
+    assert "claude-hr can double-check Claude's work in this folder" in err
+    assert "Turned on" in err
+    assert len(offer_world.launched) == 1 and offer_world.launched[0][-1] == "fix the bug"
+    assert verify.trust_state(offer_world.repo, paths.state_dir()) == "trusted"
+    # the second launch is silent and still starts Claude
+    launcher.main(["--hr-no-limits", "fix the bug"])
+    err = capsys.readouterr().err
+    assert "double-check" not in err and len(offer_world.prompts) == 1
+    assert len(offer_world.launched) == 2
+
+
+def test_no_to_the_offer_is_final_and_claude_still_starts(offer_world, capsys):
+    from claude_hr import gate_offer, paths, verify
+
+    offer_world.answers.append("n")
+    launcher.main(["--hr-no-limits"])
+    launcher.main(["--hr-no-limits"])
+    assert len(offer_world.prompts) == 1 and len(offer_world.launched) == 2
+    assert verify.trust_state(offer_world.repo, paths.state_dir()) == "no-config"
+    assert gate_offer.decision_for(offer_world.repo)["decision"] == "declined"
+
+
+def test_ctrl_c_at_the_offer_launches_claude_and_asks_again_next_time(offer_world, monkeypatch):
+    def interrupted(prompt=""):
+        offer_world.prompts.append(prompt)
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr("builtins.input", interrupted)
+    launcher.main(["--hr-no-limits"])
+    launcher.main(["--hr-no-limits"])
+    assert len(offer_world.prompts) == 2 and len(offer_world.launched) == 2
+
+
+def test_dry_run_never_asks(offer_world, capsys):
+    assert launcher.main(["--hr-dry-run", "hello"]) == 0
+    assert offer_world.prompts == [] and offer_world.launched == []
+    assert "double-check" not in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    "argv", [["-p", "hi"], ["--print", "hi", "--output-format", "json"], ["--bg", "x"], ["agents"]]
+)
+def test_headless_background_and_agents_launches_never_ask(offer_world, argv):
+    launcher.main(["--hr-no-limits", *argv])
+    assert offer_world.prompts == [] and len(offer_world.launched) == 1
+
+
+@pytest.mark.parametrize("argv", [["mcp", "list"], ["--version"], ["plugin", "list"], ["doctor"]])
+def test_passthrough_commands_never_ask(offer_world, monkeypatch, argv):
+    import subprocess
+
+    seen = []
+
+    def fake_call(cmd, *a, **k):
+        seen.append(list(cmd))
+        return 0
+
+    def fake_execv(path, cmd):
+        seen.append(list(cmd))
+        raise SystemExit(0)
+
+    monkeypatch.setattr(subprocess, "call", fake_call)
+    monkeypatch.setattr(launcher.os, "execv", fake_execv)
+    try:
+        launcher.main(argv)
+    except SystemExit:
+        pass
+    assert offer_world.prompts == [] and len(seen) == 1
+
+
+def test_a_nested_launch_from_inside_a_session_never_asks(offer_world, monkeypatch):
+    import subprocess
+
+    seen = []
+
+    def fake_call(cmd, *a, **k):
+        seen.append(list(cmd))
+        return 0
+
+    def fake_execv(path, cmd):
+        seen.append(list(cmd))
+        raise SystemExit(0)
+
+    monkeypatch.setattr(subprocess, "call", fake_call)
+    monkeypatch.setattr(launcher.os, "execv", fake_execv)
+    monkeypatch.setenv("CLAUDE_HR_SESSION", "1")
+    monkeypatch.setenv("CLAUDE_HR_NEST", "0")
+    try:
+        launcher.main(["hello"])
+    except SystemExit:
+        pass
+    assert offer_world.prompts == [] and len(seen) == 1
+
+
+def test_without_a_terminal_the_session_is_not_asked(offer_world, monkeypatch):
+    from claude_hr import human
+
+    with monkeypatch.context() as m:
+        m.setattr(human, "not_a_person", lambda: "there is no interactive terminal")
+        launcher.main(["--hr-no-limits"])
+    assert offer_world.prompts == [] and len(offer_world.launched) == 1
+
+
+def test_the_offer_can_be_switched_off_in_the_config(offer_world, monkeypatch):
+    monkeypatch.setenv("CLAUDE_HR_VERIFY__OFFER", "off")
+    launcher.main(["--hr-no-limits"])
+    assert offer_world.prompts == [] and len(offer_world.launched) == 1
+
+
+def test_a_crash_inside_the_offer_never_stops_claude(offer_world, monkeypatch):
+    from claude_hr import gate_offer
+
+    def boom(args, cfg):
+        raise RuntimeError("the offer exploded")
+
+    monkeypatch.setattr(gate_offer, "maybe_offer", boom)
+    launcher.main(["--hr-no-limits", "hello"])
+    assert len(offer_world.launched) == 1
+
+
+def test_a_missing_offer_module_never_stops_claude(offer_world, monkeypatch):
+    import sys
+
+    import claude_hr
+
+    monkeypatch.delattr(claude_hr, "gate_offer", raising=False)
+    monkeypatch.setitem(sys.modules, "claude_hr.gate_offer", None)
+    launcher.main(["--hr-no-limits", "hello"])
+    assert len(offer_world.launched) == 1
+
+
+def _run_launcher_in_a_fresh_process(tmp_path, argv):
+    """Start launcher.main in a new interpreter with the spawn replaced; returns the modules it had loaded."""
+    import os
+    import subprocess
+    import sys
+
+    claude = _exe(tmp_path / "fresh-claude", "claude")
+    code = (
+        "import sys\n"
+        "from claude_hr import launcher\n"
+        "launcher._cli_shape = lambda real: None\n"
+        "def no_exec(*a, **k):\n"
+        "    raise OSError('recorded')\n"
+        "launcher.os.execve = no_exec\n"
+        "launcher._run_windows = lambda *a, **k: 0\n"
+        "launcher.main(['--hr-no-limits', *sys.argv[1:]])\n"
+        "print('LOADED', *sorted(m for m in sys.modules if m.startswith('claude_hr.')))\n"
+    )
+    env = {
+        **os.environ,
+        "PYTHONPATH": str(Path(__file__).resolve().parents[1] / "src"),
+        "CLAUDE_HR_CLAUDE_BIN": str(claude),
+        "CLAUDE_HR_HEADROOM__ENABLED": "false",
+    }
+    env.pop("CLAUDE_HR_SESSION", None)
+    r = subprocess.run(
+        [sys.executable, "-c", code, *argv],
+        env=env,
+        cwd=str(tmp_path),
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    line = next((x for x in r.stdout.splitlines() if x.startswith("LOADED ")), None)
+    assert line is not None, r.stdout + r.stderr
+    return set(line.split()[1:])
+
+
+@pytest.mark.parametrize("argv", [["-p", "hello"], ["--print", "x"], ["agents"], ["--bg", "x"]])
+def test_a_non_interactive_launch_does_not_even_import_the_offer(tmp_path, argv):
+    loaded = _run_launcher_in_a_fresh_process(tmp_path, argv)
+    assert not {"claude_hr.gate_offer", "claude_hr.verify", "claude_hr.audit"} & loaded
+
+
+def test_a_session_without_a_terminal_imports_neither_verify_nor_audit(tmp_path):
+    # stdin is /dev/null here: the cheap checks stop it before any heavy module is touched
+    loaded = _run_launcher_in_a_fresh_process(tmp_path, ["hello"])
+    assert not {"claude_hr.verify", "claude_hr.audit"} & loaded

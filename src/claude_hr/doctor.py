@@ -308,7 +308,7 @@ def run(cfg: Config, cwd: Path, deep: bool = False) -> list[Check]:
                     "verify recipe",
                     WARN,
                     f".claude/hr-verify.toml {why}: the end-of-turn test gate does nothing in this repository",
-                    "review the file, then in a normal terminal (not a Claude Code session): claude-hr-ctl verify trust"
+                    "in a normal terminal (not a Claude Code session): claude-hr-ctl verify enable (shows the commands and asks you)"
                     if state != "invalid"
                     else "claude-hr-ctl verify status shows what is wrong",
                 )

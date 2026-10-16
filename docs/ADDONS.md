@@ -13,7 +13,7 @@ quality*, not popularity.
 | **Anthropic catalog plugins** | `standard`: `claude-md-management`, `security-guidance`, `context7`. `process`: + `superpowers`, `feature-dev`. `audit`: + `claude-security`. `full`: all of those + `skill-creator`. Measured and trimmed 2026-10-16 (see Admission rule) |
 | **hr-gates** (plugin, one Stop hook) | Format the files git reports as changed with the repo's own formatter, run the repo's trusted fast checks, keep a metadata-only audit trail. One process per turn, no context cost, fails open |
 | **hr-core skills** | `hr-plan`, `hr-done`, `hr-gh`, `hr-audit`, `hr-status`, `hr-parallel-worktrees` are manual-only (`disable-model-invocation`: not in the skill listing, 0 always-on tokens); `hr-claudemd-hygiene` is the only listed skill |
-| **Git-safety asks** | The bash guard asks before `--no-verify`, force-push of a protected branch, `reset --hard`, `clean -f`; `gh auth status --show-token` is blocked. The settings baseline asks before Claude edits `.claude/hr-verify.toml` or `.claude/settings*.json`, and before `verify trust` |
+| **Git-safety asks** | The bash guard asks before `--no-verify`, force-push of a protected branch, `reset --hard`, `clean -f`; `gh auth status --show-token` is blocked. The settings baseline asks before Claude edits `.claude/hr-verify.toml` or `.claude/settings*.json`, and before `verify trust` / `verify enable` |
 | **Git worktree helper** | Built-in isolation is `--worktree`; the helper adds a predictable path and exclude rule for scripted parallel runs |
 
 ## Optional (off by default)

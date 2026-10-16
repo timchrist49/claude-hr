@@ -20,9 +20,11 @@ claude-hr-ctl doctor --deep     # also measures ~/.claude size (time-boxed)
 
 ## The development loop (`hr-gates`, `verify`, `audit`, `init-repo`, `footprint`)
 ```
-claude-hr-ctl verify status            # is this repository's recipe trusted? what would the gate run?
-claude-hr-ctl verify init --write      # propose .claude/hr-verify.toml from what the repo declares; then read it
-claude-hr-ctl verify trust             # in a normal terminal, never inside Claude Code
+claude-hr-ctl verify status            # is this repository's recipe trusted? was the folder offered, declined? what would the gate run?
+claude-hr-ctl verify enable            # turn the gate on here (what the launcher offers once per folder): runs the checks once, keeps the passing ones, asks you
+claude-hr-ctl verify disable           # turn it off here, keep the file, stop the launcher asking
+claude-hr-ctl verify init --write      # the manual way: propose .claude/hr-verify.toml from what the repo declares; then read it
+claude-hr-ctl verify trust             # in a normal terminal, never inside Claude Code (enable does this for you)
 claude-hr-ctl trail --tail 20          # what the end-of-turn gate did (metadata only)
 claude-hr-ctl audit [--strict]         # read-only repository audit, zero tokens
 claude-hr-ctl init-repo [--apply]      # scaffold CI, Dependabot, issue/PR templates, docs/plans + decisions, REVIEW.md, .editorconfig, .gitattributes
@@ -32,7 +34,9 @@ The gate runs once per turn, only for a git repository, and not at all in plan m
 tree that did not change since it last passed. A failing trusted check blocks the turn's end at most `verify.gate_max_blocks`
 (2) times for the same tree, then lets Claude stop and names the failure (Claude Code itself gives up after 8 consecutive
 blocks). Turn it off: `CLAUDE_HR_GATES=off` for one session, `gates.enabled = false` everywhere, `format.enabled` or
-`verify.gate` for one step, `claude-hr-ctl verify untrust` for one repository.
+`verify.gate` for one step, `claude-hr-ctl verify disable` for one repository (`verify untrust` revokes the approval but the launcher then offers the file again next time).
+
+**The one-time offer.** The first time you start an interactive `claude-hr` session in a git repository, in a normal terminal, the launcher asks once whether to turn the gate on (`Turn it on? [Y/n]`). It is never asked in `-p`, `agents`, subcommands, a Claude Code shell, with piped input or a redirected stderr (the question is written there), in a home directory, in a bare repository, for a folder that is trusted, invalid, or already answered, or when nothing in the folder tells claude-hr what to run. A yes runs each discovered fast check once (a check gets at most 60 s, the step 120 s, with a scrubbed environment and no shell), keeps only those that exit 0 today, writes them to `.claude/hr-verify.toml`, adds that path to `.git/info/exclude` (only when `.git` is a directory; local to the clone) and trusts the file's exact bytes. A no is remembered in `state/verify-offer.json` (200 folders at most); Ctrl-C or EOF is "not now". A recipe that ships with the repository is shown in full and asked about with No as the default; if it changes after a no, you are asked again. The question adds about 3 ms to an interactive start in a folder that is already trusted or answered and nothing to any other launch. `verify.offer = "off"` (or `CLAUDE_HR_VERIFY__OFFER=off`) never asks; `claude-hr-ctl verify enable` still works.
 
 `hr-plan-execute` runs the independent steps of an approved plan in parallel git worktrees. Commit the plan first (worktrees
 start from the last commit; the run stops when tracked files are dirty). Run `claude-hr-ctl workflows install`, then ask Claude to
@@ -60,6 +64,7 @@ All keys live in `~/.claude-hr/config.toml` (or `/etc/claude-hr/config.toml`, or
 | `format.clean_gate` | true | rewrite a tracked file only if its committed version was already formatted |
 | `format.repo_tools` | "trusted" | in-repo formatter binaries and prettier need a trusted repository; "always" lifts that |
 | `verify.gate` | true | run the trusted recipe at the end of the turn |
+| `verify.offer` | "ask" | ask once per git folder, at the start of an interactive `claude-hr` session in a normal terminal, whether to turn the gate on; `off` never asks (`verify enable` still works). Needs `gates.enabled` and `verify.gate`; the `minimal` plugin profile has no gate, so nothing is asked there. Nothing answers the question for you |
 | `verify.tier` | "fast" | which tier runs unattended (`full` runs the whole list on every turn) |
 | `verify.gate_max_blocks` | 2 | blocks per unchanged tree before the gate lets Claude stop and tells you |
 | `verify.gate_timeout_s` | 120 | cap for all checks together inside the 150 s budget (`format.timeout_s` + this above about 150 s buys nothing) |
@@ -137,7 +142,12 @@ CPU quotas on Linux need the `cpu` controller delegated to user managers (one-ti
 | `~/.claude` huge | `claude-hr-ctl cleanup` (dry-run) then `--apply`. |
 | Plugin token cost too high | `claude-hr-ctl plugins audit`; move big ones to project scope (`plugins suggest`). |
 | Claude shows a non-blocking hook notice every turn | `claude-hr-hook` is not on PATH in the shell Claude runs in: `uv tool update-shell`, open a new terminal (`doctor` says so). |
-| The gate never runs the tests | `verify status`: no recipe, not trusted, or changed since trusted. `verify init --write`, read it, `verify trust` in a terminal. `trail` shows what the last turns did. |
+| The gate never runs the tests | `verify status`: no recipe, not trusted, changed since trusted, or declined ("declined on ..."). `claude-hr-ctl verify enable` in a normal terminal (or the manual way: `verify init --write`, read it, `verify trust`). `trail` shows what the last turns did. Also check `plugins.profile` is not `minimal` (no `hr-gates` hook there) and `claude-hr-hook` is on PATH (`doctor`). |
+| `verify enable` turned on fewer checks than expected, or none | Only checks that pass today are kept (a gate that fails on problems that were already there only wastes Claude's time); the others are listed with the reason ("failing today", "could not start", "did not finish within Ns") and written into the file as comments. Fix them, or add them to `.claude/hr-verify.toml` yourself, then run `verify enable` again or `verify trust`. |
+| `claude-hr` asked about the gate, and I do not want that | Answer `n` (remembered for that folder), or `claude-hr-ctl config set verify.offer off` for everywhere. Nothing is asked in `-p`, `agents` or subcommands. |
+| `claude-hr` never asks about the gate | It asks only in an interactive session with a real terminal on stdin, stdout and stderr (Windows Terminal, PowerShell, a Linux/macOS terminal; Git Bash's default mintty window looks like a pipe to Windows Python: use Windows Terminal or `winpty`), outside a Claude Code session, in a git work tree that is not your home directory, with `verify.offer = "ask"`, `gates.enabled` and `verify.gate` on, a plugin profile other than `minimal`, and project files claude-hr recognises (package.json, pyproject.toml, Cargo.toml, go.mod, Makefile ...). `claude-hr-ctl verify status` shows whether the folder was already answered; `claude-hr-ctl verify enable` asks on request. |
+| `claude-hr` asks again about a folder I declined | The folder's `.claude/hr-verify.toml` changed since you said no (a recipe that arrives with a `git pull` is shown to you before anything runs), or Ctrl-C/EOF at the question counts as "not now". `verify disable` records a no for the current file. |
+| `.claude/hr-verify.toml` is missing from `git status` | `enable` adds it to `.git/info/exclude` so a generated file is never committed by accident. To share it with the team, remove that line and commit the file. |
 | `trail` shows `note=another gate run in progress` or `note=cannot start` | The first: a second session's Stop found the per-repository lock (`state/verify-run-<hash>.lock`, stale after max(180 s, timeout + 60 s) or when its owner is gone); it is retried at the next Stop. The second: a check's tool is missing: the other checks still ran, the tree is remembered until it changes; install the tool or edit the recipe. |
 | `trail` shows `note=time budget` | The hook's one 150 s budget (git, formatter and checks together; the plugin kills the hook at 170 s) ran out. If no check started the turn is retried next time; a run that was cut short is remembered, so an over-long suite is not started again on every Stop. Move slow checks to the `full` tier. |
 | The gate blocks again and again | After `verify.gate_max_blocks` blocks for the same tree it stops and names the failure; fix it or `verify untrust`. A check that is flaky or slow belongs in the `full` tier, not `fast`. |
