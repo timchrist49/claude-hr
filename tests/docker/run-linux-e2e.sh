@@ -106,6 +106,47 @@ check "audit runs"                                    bash -c "cd $GP && claude-
 check "init-repo is a dry run"                        bash -c "cd $GP && claude-hr-ctl init-repo --only docs,editor | grep -q 'dry run' && test ! -e docs"
 check "both workflows installable"                    bash -c "claude-hr-ctl workflows install --dir $GP && test -e $GP/.claude/workflows/hr-plan-execute.js && test -e $GP/.claude/workflows/hr-review-changes.js"
 
+echo "== 6c. the one-time test-gate offer at launch (a real pseudo-terminal, a stand-in claude, a stand-in make) =="
+OD=/tmp/offerdir; rm -rf "$OD"; mkdir -p "$OD/bin"
+printf '#!/bin/sh\nexit 0\n' > "$OD/bin/make"; chmod +x "$OD/bin/make"      # the flow is under test, not GNU make
+printf '#!/bin/sh\ncase "$1" in --help|--version) exec "%s" "$@";; esac\necho "FAKE-CLAUDE-STARTED $*"\n' "$(command -v claude)" > "$OD/fakeclaude"; chmod +x "$OD/fakeclaude"
+new_repo() { rm -rf "$1"; mkdir -p "$1"; git -C "$1" init -q; printf 'test:\n\t@echo ok\n' > "$1/Makefile"; }
+claude_trusts() { "$PY_TOOL" -c "import json, sys; from claude_hr import paths; p = paths.claude_global_json(); d = json.loads(p.read_text(encoding='utf-8')) if p.exists() else {}; d.setdefault('projects', {})[sys.argv[1]] = {'hasTrustDialogAccepted': True}; p.write_text(json.dumps(d), encoding='utf-8')" "$1"; }
+trust_of() { "$PY_TOOL" -c "import sys; from pathlib import Path; from claude_hr import verify, paths; print(verify.trust_state(Path(sys.argv[1]), paths.state_dir()))" "$1"; }
+# run claude-hr in DIR under a pty (answers typed from --answers); the transcript lands in $OD/last.out
+offer() { local dir="$1"; shift; env CLAUDE_HR_CLAUDE_BIN="$OD/fakeclaude" PATH="$OD/bin:$PATH" "$PY_TOOL" /tmp/src/tests/docker/pty_launch.py --cwd "$dir" "$@" > "$OD/last.out" 2>&1; }
+asked()   { grep -q 'Turn it on' "$OD/last.out"; }
+started() { grep -q "$1" "$OD/last.out"; }
+verdict() { "$@" || { sed 's/^/        | /' "$OD/last.out" | tail -25; return 1; }; }
+R1="$OD/proj1"; R2="$OD/proj2"; R3="$OD/proj3"
+new_repo "$R1"; new_repo "$R2"; new_repo "$R3"
+t_untrusted()   { offer "$R1" --answers y -- claude-hr; ! asked && started FAKE-CLAUDE-STARTED && [ ! -e "$R1/.claude" ]; }
+t_first()       { offer "$R1" --answers y -- claude-hr; asked && started 'make test' && started FAKE-CLAUDE-STARTED && started 'EXIT=0'; }
+t_written()     { [ -s "$R1/.claude/hr-verify.toml" ] && grep -q 'hr-verify.toml' "$R1/.git/info/exclude" && [ -z "$(git -C "$R1" status --porcelain | grep -v Makefile)" ] && [ "$(trust_of "$R1")" = trusted ]; }
+t_gate_runs()   { printf '{"cwd":"%s","hook_event_name":"Stop"}' "$R1" | PATH="$OD/bin:$PATH" claude-hr-hook stop > "$OD/stop.out"; [ ! -s "$OD/stop.out" ]; }
+t_second()      { offer "$R1" -- claude-hr; ! asked && started FAKE-CLAUDE-STARTED; }
+t_print()       { offer "$R2" -- claude-hr -p hi; ! asked && started 'FAKE-CLAUDE-STARTED -p hi'; }
+t_claude_shell(){ offer "$R2" --env CLAUDECODE=1 -- claude-hr; ! asked && started FAKE-CLAUDE-STARTED; }
+t_piped()       { (cd "$R2" && echo y | env CLAUDE_HR_CLAUDE_BIN="$OD/fakeclaude" PATH="$OD/bin:$PATH" claude-hr) > "$OD/last.out" 2>&1; started FAKE-CLAUDE-STARTED && ! asked && [ ! -e "$R2/.claude" ]; }
+t_decline()     { offer "$R2" --answers n -- claude-hr; asked && started FAKE-CLAUDE-STARTED && [ ! -e "$R2/.claude/hr-verify.toml" ]; }
+t_stays_no()    { offer "$R2" -- claude-hr; ! asked && started FAKE-CLAUDE-STARTED; }
+t_off()         { CLAUDE_HR_VERIFY__OFFER=off offer "$R3" -- claude-hr; ! asked && started FAKE-CLAUDE-STARTED && [ ! -e "$R3/.claude" ]; }
+t_disable()     { (cd "$R1" && env -u CLAUDECODE -u CLAUDE_CODE_ENTRYPOINT claude-hr-ctl verify disable </dev/null) > "$OD/last.out" 2>&1; [ "$(trust_of "$R1")" != trusted ]; }
+check "an untrusted folder is offered nothing (Claude Code has not been told to trust it)" verdict t_untrusted
+claude_trusts "$R1"; claude_trusts "$R2"; claude_trusts "$R3"
+check "a trusted folder is asked once; claude starts after the answer"  verdict t_first
+check "  ... recipe written, kept out of git status, trusted"          verdict t_written
+check "  ... the end-of-turn gate runs it and stays silent on a pass"   verdict t_gate_runs
+check "a second launch asks nothing"                                     verdict t_second
+check "-p never asks"                                                    verdict t_print
+check "a Claude Code shell never asks"                                   verdict t_claude_shell
+check "piped input never asks"                                           verdict t_piped
+check "the question can be declined"                                     verdict t_decline
+check "  ... and a no stays a no"                                        verdict t_stays_no
+check "verify.offer = off silences it"                                   verdict t_off
+check "claude-hr-ctl verify disable turns the gate off"                  verdict t_disable
+rm -rf "$OD"
+
 echo "== 7. scheduler ($([ $HAVE_SYSTEMD = 1 ] && echo systemd || echo cron fallback)) =="
 check "schedule install"            claude-hr-ctl schedule install
 if [ "$HAVE_SYSTEMD" = 1 ]; then
