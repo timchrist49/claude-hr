@@ -53,7 +53,7 @@ quality*, not popularity.
 | **Unattended LLM routines** (scheduled `claude -p` maintenance) | Deferred, not rejected: needs a stored credential, shares the subscription window with interactive work, and no public per-run cost exists. Deterministic maintenance (Dependabot through `init-repo`, the existing weekly `maintain` job) ships; revisit after a measured pilot |
 
 ## Workflows (opt-in)
-`claude-hr-ctl workflows install` copies `hr-review-changes` and `hr-plan-execute` into the project's `.claude/workflows/`. It reviews the diff on up to five dimensions, then has skeptics try to refute every finding (majority-refute drops it) and reports what survives; anything it could not check is logged, never silently dropped. Cost is roughly 10-25 agents per run, so it is not part of any default flow. Plugins cannot ship workflows, hence the separate installer.
+`claude-hr-ctl workflows install` copies `hr-review-changes` and `hr-plan-execute` into the project's `.claude/workflows/`. `hr-review-changes` reviews the diff on up to five dimensions, then has skeptics try to refute every finding (majority-refute drops it) and reports what survives; anything it could not check is logged, never silently dropped. Cost is typically 10-40 agents per run and up to about 85 with the defaults (`hr-plan-execute` is capped at about 25), so neither is part of any default flow. Plugins cannot ship workflows, hence the separate installer.
 
 ## Enabling an optional piece
 Most are one-liners in `~/.claude-hr/config.toml`, e.g.
