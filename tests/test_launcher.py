@@ -237,8 +237,8 @@ def test_op_run_launch_never_picks_op_from_the_current_directory(
 
     line = planned_command()
     assert (
-        "op run" not in line and planted.name not in line
-    )  # no op anywhere: claude starts as before
+        " run --no-masking" not in line and str(planted) not in line
+    )  # no op anywhere: claude starts as before (the full path: a bare 'op' is also inside pytest's temp path on POSIX)
     assert line == f"{claude} hello"
 
     real_op = _exe(
