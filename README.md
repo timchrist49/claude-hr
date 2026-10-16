@@ -83,6 +83,17 @@ normally never see this).
 On a headless Linux VM run `sudo loginctl enable-linger $USER` once, otherwise the user-level scheduled jobs only run while
 someone is logged in.
 
+### Upgrading from 0.1.x
+
+The daily update job moves claude-hr itself to the newest release. 0.2.0 changes defaults that an unattended update never applies on its own (it installs no plugins and passes no `-y`), so after the update run once:
+
+```bash
+claude-hr-ctl doctor                                          # lists what is stale, with the exact fix
+claude-hr-ctl setup --only settings claude-md plugins         # adds hr-gates, the lean profile and the new permission rules; it only adds
+```
+
+The 0.2.0 `standard` profile no longer includes Superpowers, feature-dev or code-simplifier; a machine that already has them keeps them. Uninstall them by name (`claude plugin uninstall superpowers`) to save their tokens, or keep them with `--profile process`. (`plugins sync --prune` removes *every* user-scope plugin outside the profile, including ones you added yourself.) Then, in each repository where you want the end-of-turn test gate, run `claude-hr-ctl verify init --write`, read `.claude/hr-verify.toml`, and `claude-hr-ctl verify trust` in a normal terminal.
+
 ## What it does about each concern
 
 | Concern | Mechanism | Where |
