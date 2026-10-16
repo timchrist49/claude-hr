@@ -415,3 +415,82 @@ def test_a_mistyped_stop_review_value_is_reported(sandbox, fake_claude, monkeypa
 def test_recognised_stop_review_values_are_not_reported(sandbox, fake_claude, monkeypatch, value):
     monkeypatch.setenv("CLAUDE_HR_SECURITY__STOP_REVIEW", value)
     assert "security.stop_review" not in checks()
+
+
+# ---- a running proxy that was started with other settings than the configuration asks for now ----------------------
+
+RESTART = "apply them when no Claude session is running: claude-hr-ctl headroom restart"
+
+
+@pytest.fixture
+def healthy_proxy(sandbox, fake_claude, monkeypatch):
+    """A proxy that answers /health, whatever started it: doctor takes it from here."""
+    from claude_hr.headroom import Health
+
+    monkeypatch.setenv("CLAUDE_HR_HEADROOM__FOOTPRINT", "full")
+    monkeypatch.setattr(Headroom, "binary", lambda self: Path("/fake/headroom"))
+    monkeypatch.setattr(Headroom, "version", lambda self: "0.41.0")
+    monkeypatch.setattr(
+        Headroom, "health", lambda self, timeout=0.6: Health(True, "healthy", "0.41.0")
+    )
+    monkeypatch.setattr(Headroom, "_listener_pids", lambda self: set())
+
+
+def record_start(**fields):
+    paths.state_dir().mkdir(parents=True, exist_ok=True)
+    rec = {"pid": 1234, "port": 8787, "started": 1.0, **fields}
+    (paths.state_dir() / "headroom-proxy.json").write_text(json.dumps(rec), encoding="utf-8")
+
+
+def test_a_proxy_started_with_older_settings_is_a_warning_with_the_restart(healthy_proxy):
+    record_start(args="0123456789ab")  # what another configuration hashed to
+    got = checks()
+    assert got["headroom proxy"].status == "ok"
+    warn = got["headroom settings"]
+    assert warn.status == "warn"  # a working proxy is never a failure
+    assert warn.fix == f"Headroom is running with older settings; {RESTART}"
+    assert "Headroom is running with older settings; " + RESTART in warn.line()
+
+
+def test_a_proxy_started_by_an_older_claude_hr_is_a_warning_too(healthy_proxy):
+    record_start()  # 0.2.0 recorded pid, port and the start time only
+    warn = checks()["headroom settings"]
+    assert warn.status == "warn"
+    assert warn.fix == f"Headroom was started by an older claude-hr; {RESTART}"
+
+
+def test_a_proxy_started_with_the_current_settings_is_not_warned_about(healthy_proxy):
+    record_start(args=Headroom(config.load()).settings_hash())
+    got = checks()
+    assert got["headroom proxy"].status == "ok" and "headroom settings" not in got
+
+
+def test_a_proxy_claude_hr_has_no_record_of_is_not_judged(healthy_proxy):
+    assert (
+        "headroom settings" not in checks()
+    )  # somebody else's proxy on the port: nothing to compare
+
+
+def test_changing_a_setting_after_the_start_is_noticed(healthy_proxy, monkeypatch):
+    record_start(args=Headroom(config.load()).settings_hash())
+    assert "headroom settings" not in checks()
+    monkeypatch.setenv("CLAUDE_HR_HEADROOM__OUTPUT_SHAPER", "true")
+    assert checks()["headroom settings"].status == "warn"
+
+
+def test_a_proxy_that_is_not_serving_is_not_compared(healthy_proxy, monkeypatch):
+    from claude_hr.headroom import Health
+
+    record_start()
+    monkeypatch.setattr(Headroom, "health", lambda self, timeout=0.6: Health(False, "down"))
+    got = checks()
+    assert got["headroom proxy"].status == "warn" and "headroom settings" not in got
+
+
+def test_the_settings_comparison_never_breaks_doctor(healthy_proxy, monkeypatch):
+    def boom(self):
+        raise RuntimeError("cannot compare")
+
+    monkeypatch.setattr(Headroom, "settings_state", boom)
+    got = checks()
+    assert got["headroom proxy"].status == "ok" and "headroom settings" not in got

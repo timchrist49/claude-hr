@@ -104,12 +104,31 @@ GIT_RISKS: list[tuple[re.Pattern, str]] = [
 # Trusting a verify recipe is what lets a repository's own commands run unattended at the end of every turn, so only the
 # user does it (in their own terminal). The CLI refuses a Claude Code shell; this refuses the agent that tries anyway,
 # in every permission mode, as long as hooks run. Like every pattern here it is not a boundary (`sh -c "$(echo ...)"`).
+#
+# The gaps between the words are BOUNDED and trust_attempt() scans a bounded amount of text: with an open-ended gap the
+# match time grows with the cube of the line, so one comment line of padded keywords ran the hook past its timeout, and a
+# hook that is killed lets the command through. The bounds are far longer than any typed command.
+_GAP = 256  # `claude-hr ... verify trust`: other words between the program name and the verb
+_GAP_PY = 128  # `claude_hr ... verify` / `claude_hr ... gate_offer` inside python -c
+_GAP_CALL = 64  # `verify ... trust(`
+_SCAN = 65_536  # characters scanned from the start and from the end of an over-long command
 _VERIFY_TRUST = re.compile(
-    r"(?ism)claude[-_]hr[\w.-]*\b[^\n;&|]*?\bverify\s+(?:(?:un)?trust|enable|disable)\b"
+    rf"(?ism)claude[-_]hr[\w.-]{{0,32}}\b[^\n;&|]{{0,{_GAP}}}?\bverify\s+(?:(?:un)?trust|enable|disable)\b"
     r"|\bverify-(?:trust|offer)\.json\b"
-    r"|\bclaude_hr\b[^\n]*\bverify\b[^\n]*\b(?:un)?trust\s*\("
-    r"|\bclaude_hr\b[^\n]*\bgate_offer\b[^\n]*\b(?:enable|disable|record|forget|offer_now)\s*\("
+    rf"|\bclaude_hr\b[^\n]{{0,{_GAP_PY}}}\bverify\b[^\n]{{0,{_GAP_CALL}}}\b(?:un)?trust\s*\("
+    rf"|\bclaude_hr\b[^\n]{{0,{_GAP_PY}}}\bgate_offer\b[^\n]{{0,{_GAP_CALL}}}"
+    r"\b(?:enable|disable|record|forget|offer_now)\s*\("
 )
+
+
+def trust_attempt(command: str) -> bool:
+    """Does `command` try to trust, enable or disable a verify recipe, or touch the trust or the offer record?
+
+    A command longer than 2 * _SCAN is looked at from its first and its last _SCAN characters only, so the time this takes
+    has a ceiling however the command is padded."""
+    if len(command) > 2 * _SCAN:
+        return bool(_VERIFY_TRUST.search(command[:_SCAN]) or _VERIFY_TRUST.search(command[-_SCAN:]))
+    return bool(_VERIFY_TRUST.search(command))
 
 
 def git_risk(command: str) -> str | None:
@@ -161,10 +180,21 @@ def bash_guard() -> int:
     try:
         payload = read_stdin_json()
         command = str(payload.get("tool_input", {}).get("command", ""))
+        return _judge(command) if command else 0
     except Exception:
-        return 0
-    if not command:
-        return 0
+        return 0  # a guard must never break the session: an error of its own lets the command through, silently
+
+
+def _judge(command: str) -> int:
+    # The trust check goes first: it is the one with a ceiling on its time (see _VERIFY_TRUST), so padding aimed at the
+    # slower patterns below cannot keep it from running before the hook is killed.
+    if trust_attempt(command):
+        sys.stderr.write(
+            "Blocked by the claude-hr guard: trusting or enabling (or editing the trust record of) a verify recipe lets "
+            "commands run unattended after every turn, so only the user does it. Show the user .claude/hr-verify.toml "
+            "and ask them to run `claude-hr-ctl verify enable` (or `verify trust`) in their own terminal.\n"
+        )
+        return 2
     for pattern, why in RULES:
         if pattern.search(command):
             sys.stderr.write(
@@ -173,13 +203,6 @@ def bash_guard() -> int:
                 "run it themselves.\n"
             )
             return 2
-    if _VERIFY_TRUST.search(command):
-        sys.stderr.write(
-            "Blocked by the claude-hr guard: trusting or enabling (or editing the trust record of) a verify recipe lets "
-            "commands run unattended after every turn, so only the user does it. Show the user .claude/hr-verify.toml "
-            "and ask them to run `claude-hr-ctl verify enable` (or `verify trust`) in their own terminal.\n"
-        )
-        return 2
     mode = os.environ.get("CLAUDE_HR_GIT_GUARD", "ask").strip().lower()
     if mode != "off":
         why = git_risk(command)

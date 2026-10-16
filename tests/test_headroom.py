@@ -1,14 +1,24 @@
+import json
 from pathlib import Path
 
-from claude_hr import config, paths, sysinfo
-from claude_hr.headroom import Headroom
+import pytest
+
+from claude_hr import config, ctl, headroom, paths, resources, sysinfo
+from claude_hr.headroom import Headroom, Health
 
 
 def hr(monkeypatch=None, **env):
     return Headroom(config.load())
 
 
-def test_proxy_args_are_safe_for_parallel_agents(sandbox, monkeypatch):
+@pytest.fixture
+def full(monkeypatch):
+    """The footprint these tests are about, set explicitly: `auto` reads the machine's RAM, and under 8 GB it drops the
+    memory and code-aware flags, which made a test of "memory is off" pass whatever the default was."""
+    monkeypatch.setenv("CLAUDE_HR_HEADROOM__FOOTPRINT", "full")
+
+
+def test_proxy_args_are_safe_for_parallel_agents(sandbox, full, monkeypatch):
     monkeypatch.setenv(
         "CLAUDE_HR_HEADROOM__MEMORY", "true"
     )  # the memory path is only built when it is switched on
@@ -24,9 +34,19 @@ def test_proxy_args_are_safe_for_parallel_agents(sandbox, monkeypatch):
     )  # never cwd-relative
 
 
-def test_memory_is_off_by_default_because_in_cache_mode_it_is_pure_overhead(sandbox):
+def test_memory_is_off_by_default_because_in_cache_mode_it_is_pure_overhead(
+    sandbox, full, monkeypatch
+):
+    assert config.load().get("headroom.memory") is False  # defaults.toml itself
     args = hr().proxy_args()
+    assert "--code-aware" in args, (
+        "the full footprint is in effect: no memory flag is missing for lack of RAM"
+    )
     assert "--memory" not in args and "--memory-db-path" not in args
+    monkeypatch.setenv(
+        "CLAUDE_HR_HEADROOM__MEMORY", "true"
+    )  # the same footprint does build them when asked
+    assert "--memory" in hr().proxy_args()
 
 
 def test_lite_footprint_drops_ml_features(sandbox, monkeypatch):
@@ -46,7 +66,7 @@ def test_auto_footprint_goes_lite_on_small_machines(sandbox, monkeypatch):
     assert hr().effective_extras() == "all"
 
 
-def test_install_spec_pins(sandbox, monkeypatch):
+def test_install_spec_pins(sandbox, full, monkeypatch):
     monkeypatch.setenv("CLAUDE_HR_HEADROOM__VERSION", "0.41.0")
     assert hr().install_spec() == "headroom-ai[all]==0.41.0"
     assert hr().install_spec("0.40.0") == "headroom-ai[all]==0.40.0"
@@ -115,3 +135,150 @@ def test_health_down_when_nothing_listens(sandbox, monkeypatch):
     h = hr().health(timeout=0.3)
     assert not h.ok
     assert h.status == "down"
+
+
+# ---- the settings the running proxy was started with -------------------------------------------------------------
+
+
+class FakeProc:
+    pid = 4242
+
+
+@pytest.fixture
+def spawn(sandbox, full, monkeypatch):
+    """start() against a stand-in binary and a stand-in Popen: what it spawned, and nothing else."""
+    spawned = []
+    monkeypatch.setattr(Headroom, "binary", lambda self: Path("/fake/headroom"))
+
+    def popen(cmd, **kwargs):
+        spawned.append((cmd, kwargs))
+        return FakeProc()
+
+    monkeypatch.setattr(headroom.subprocess, "Popen", popen)
+    return spawned
+
+
+def record():
+    return json.loads((paths.state_dir() / "headroom-proxy.json").read_text(encoding="utf-8"))
+
+
+def test_start_records_a_hash_of_the_settings_it_used(spawn):
+    h = hr()
+    assert h.start() is not None
+    rec = record()
+    assert rec["pid"] == 4242 and rec["port"] == h.port and rec["started"] > 0
+    assert rec["args"] == h.settings_hash() and len(rec["args"]) == 12
+    cmd, _kwargs = spawn[0]
+    assert cmd[1:] == h.proxy_args()  # what is hashed is what was spawned
+
+
+@pytest.mark.parametrize(
+    "name, value",
+    [
+        ("MEMORY", "true"),
+        ("OUTPUT_SHAPER", "true"),
+        ("OUTPUT_HOLDOUT", "0.1"),
+        ("SAVINGS_PROFILE", "balanced"),
+        ("PROXY_MODE", "token"),
+        ("PORT", "18787"),
+        ("LEARN", "true"),
+        ("EXTRA_PROXY_ARGS", '["--some-flag"]'),
+        ("TELEMETRY", "true"),
+    ],
+)
+def test_the_hash_changes_with_every_setting_that_reaches_the_proxy(
+    sandbox, full, monkeypatch, name, value
+):
+    before = hr().settings_hash()
+    monkeypatch.setenv(f"CLAUDE_HR_HEADROOM__{name}", value)
+    assert hr().settings_hash() != before
+
+
+def test_the_hash_ignores_what_is_not_a_setting(sandbox, full, monkeypatch, tmp_path):
+    before = hr().settings_hash()
+    monkeypatch.setenv(
+        "HEADROOM_OUTPUT_SHAPER", "1"
+    )  # the shell this process runs in is not the configuration
+    monkeypatch.setenv("HF_HOME", str(tmp_path / "hf"))
+    (tmp_path / "hf" / "hub" / "models--chopratejas--kompress-v2-base").mkdir(parents=True)
+    assert hr()._offline_models() is True  # the model got cached since the proxy started
+    assert hr().settings_hash() == before
+
+
+def write_record(data):
+    paths.state_dir().mkdir(parents=True, exist_ok=True)
+    text = data if isinstance(data, str) else json.dumps(data)
+    (paths.state_dir() / "headroom-proxy.json").write_text(text, encoding="utf-8")
+
+
+def test_settings_state(sandbox, full):
+    h = hr()
+    assert h.settings_state() == "unknown", "no record of a start by claude-hr: not judged"
+    write_record({"pid": 1, "port": 8787, "started": 1.0})
+    assert h.settings_state() == "older", "a record without a hash: an older claude-hr started it"
+    write_record({"pid": 1, "port": 8787, "started": 1.0, "args": "0123456789ab"})
+    assert h.settings_state() == "changed"
+    write_record({"pid": 1, "port": 8787, "started": 1.0, "args": h.settings_hash()})
+    assert h.settings_state() == "current"
+    for broken in ("{not json", "[]", '"x"'):
+        write_record(broken)
+        assert h.settings_state() == "unknown"
+
+
+def test_a_proxy_started_with_the_0_2_0_defaults_is_not_current(sandbox, full, monkeypatch):
+    """0.2.0 started the proxy with --memory and the output shaper on; the flipped defaults must not read as "current"."""
+    monkeypatch.setenv("CLAUDE_HR_HEADROOM__MEMORY", "true")
+    monkeypatch.setenv("CLAUDE_HR_HEADROOM__OUTPUT_SHAPER", "true")
+    write_record({"pid": 1, "port": 8787, "started": 1.0, "args": hr().settings_hash()})
+    assert hr().settings_state() == "current"
+    monkeypatch.delenv("CLAUDE_HR_HEADROOM__MEMORY")
+    monkeypatch.delenv("CLAUDE_HR_HEADROOM__OUTPUT_SHAPER")
+    assert hr().settings_state() == "changed"
+
+
+# ---- `headroom restart` with sessions running ----------------------------------------------------------------------
+
+
+@pytest.fixture
+def restart(sandbox, monkeypatch):
+    calls = []
+    monkeypatch.setattr(Headroom, "stop", lambda self: calls.append("stop") or True)
+    monkeypatch.setattr(
+        Headroom,
+        "ensure",
+        lambda self, wait_s=0.0, announce=None: calls.append("ensure") or Health(True),
+    )
+    return calls
+
+
+def test_restart_warns_with_the_number_of_running_sessions_but_restarts(
+    restart, monkeypatch, capsys
+):
+    monkeypatch.setattr(resources, "live_sessions", lambda: [{"pid": 1}, {"pid": 2}])
+    assert ctl.main(["headroom", "restart"]) == 0
+    out = capsys.readouterr().out
+    assert "warning: 2 claude-hr sessions running" in out and "healthy" in out
+    assert restart == ["stop", "ensure"]
+
+
+def test_restart_warning_is_singular_for_one_session(restart, monkeypatch, capsys):
+    monkeypatch.setattr(resources, "live_sessions", lambda: [{"pid": 1}])
+    ctl.main(["headroom", "restart"])
+    assert "warning: 1 claude-hr session running" in capsys.readouterr().out
+
+
+def test_restart_without_sessions_says_nothing_extra(restart, monkeypatch, capsys):
+    monkeypatch.setattr(resources, "live_sessions", lambda: [])
+    assert ctl.main(["headroom", "restart"]) == 0
+    assert "warning" not in capsys.readouterr().out and restart == ["stop", "ensure"]
+
+
+def test_restart_still_restarts_when_the_session_registry_cannot_be_read(
+    restart, monkeypatch, capsys
+):
+    def boom():
+        raise OSError("registry unreadable")
+
+    monkeypatch.setattr(resources, "live_sessions", boom)
+    assert ctl.main(["headroom", "restart"]) == 0
+    assert "warning" not in capsys.readouterr().out and restart == ["stop", "ensure"]

@@ -260,16 +260,63 @@ strict = true
 """
 
 
-def test_discover_python_tools_and_the_confirm_note(tmp_path):
+def on_path(monkeypatch, *found, windows=False):
+    """The platform and the programs on PATH that discover() sees (it asks shutil.which at discovery time)."""
+    monkeypatch.setattr(verify, "_WIN", windows)
+    monkeypatch.setattr(
+        verify.shutil, "which", lambda name, *a, **k: f"/usr/bin/{name}" if name in found else None
+    )
+
+
+def test_discover_python_tools_and_the_confirm_note(tmp_path, monkeypatch):
+    on_path(monkeypatch, "python3", windows=False)
     put(tmp_path, "pyproject.toml", PYPROJECT)
     r = verify.discover(tmp_path)
     assert [c.argv for c in r.fast] == [
         ["ruff", "check", "."],
-        ["python", "-m", "mypy", "."],
-        ["python", "-m", "pytest", "-q"],
+        ["python3", "-m", "mypy", "."],
+        ["python3", "-m", "pytest", "-q"],
     ]
     assert names(r.fast) == ["ruff", "mypy", "pytest"]
-    assert any("confirm the executable" in n for n in r.notes)
+    assert any("confirm the executable" in n and "'python3 -m" in n for n in r.notes)
+
+
+@pytest.mark.parametrize(
+    "windows, found, expected",
+    [
+        (
+            True,
+            (),
+            "python",
+        ),  # Windows: python, whatever else is there (python3 is often the Store stub)
+        (True, ("python3",), "python"),
+        (True, ("python", "python3"), "python"),
+        (False, ("python", "python3"), "python3"),  # both: the one every Linux and macOS has
+        (False, ("python3",), "python3"),
+        (False, ("python",), "python"),  # only python on PATH: the one that runs
+        (False, (), "python3"),  # nothing found now: the name Debian, Ubuntu and macOS ship
+    ],
+)
+def test_discover_python_picks_the_interpreter_name_for_the_machine(
+    tmp_path, monkeypatch, windows, found, expected
+):
+    """A bare `python` does not exist on a stock Debian, Ubuntu or macOS: the probe could not start it and the folder was
+    declined for good. The name stays bare either way: the gate finds the program when it runs the recipe."""
+    on_path(monkeypatch, *found, windows=windows)
+    put(tmp_path, "pyproject.toml", PYPROJECT)
+    r = verify.discover(tmp_path)
+    assert r.fast[-1].argv == [expected, "-m", "pytest", "-q"]
+    assert r.fast[1].argv[0] == expected  # the mypy check too
+    assert any(f"'{expected} -m" in n for n in r.notes)
+
+
+def test_discover_python_keeps_the_interpreter_the_repo_documents(tmp_path, monkeypatch):
+    on_path(monkeypatch, "python3", windows=False)
+    put(tmp_path, "pyproject.toml", PYPROJECT)
+    put(tmp_path, "README.md", "Run the tests with `python -m pytest`.\n")
+    r = verify.discover(tmp_path)
+    assert r.fast[-1].argv == ["python", "-m", "pytest", "-q"]
+    assert not any("confirm the executable" in n for n in r.notes)
 
 
 def test_discover_python_executable_documented_by_the_repo(tmp_path):

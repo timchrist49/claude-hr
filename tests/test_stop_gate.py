@@ -514,3 +514,154 @@ def test_the_stop_path_does_not_import_the_control_cli_or_heavy_modules(sandbox)
         "PYTHONPATH": str(Path(__file__).resolve().parents[1] / "src"),
     }
     assert subprocess.run([sys.executable, "-c", code], env=env).returncode == 0
+
+
+# ---- the trust record must come from a folder the repository cannot have written ----------------------------------
+
+
+@pytest.mark.parametrize("rel", ["", ".hr", "sub/.claude-hr", "a/b/c/hr"])
+def test_a_state_directory_inside_the_repository_means_the_gate_does_nothing(
+    fakes, repo, monkeypatch, rel
+):
+    """CLAUDE_HR_HOME can come from the repository's own .claude/settings.json (Claude Code hands the hook the environment it
+    built from it): the repository could ship a trust record for its own recipe and have it run without being asked."""
+    monkeypatch.setenv("CLAUDE_HR_HOME", str(repo / rel) if rel else str(repo))
+    assert stop_gate.handle(payload(repo)) is None
+    assert fakes.fingerprint_calls == [] and fakes.fmt_calls == [] and fakes.gate_calls == []
+    row = auditlog.tail(1)[0]
+    assert row["event"] == "gate" and row["verify"] == "skip"
+    assert "state directory inside the repository" in row["note"]
+    assert not (paths.state_dir() / "gates.json").exists(), "it did not even remember the tree"
+
+
+def test_the_working_folder_counts_as_well_as_the_repository_root(
+    fakes, repo, tmp_path, monkeypatch
+):
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    sub = repo / "sub"
+    sub.mkdir()
+    monkeypatch.setattr(stop_gate, "_git_root", lambda cwd, timeout=0: elsewhere)
+    monkeypatch.setenv("CLAUDE_HR_HOME", str(sub / ".hr"))
+    assert stop_gate.handle(payload(sub)) is None and fakes.gate_calls == []
+
+
+def test_a_state_directory_outside_the_repository_is_still_honoured(
+    fakes, repo, tmp_path, monkeypatch
+):
+    assert not paths.state_dir().is_relative_to(repo)  # the sandbox keeps it beside the repository
+    assert stop_gate.handle(payload(repo)) is None
+    assert len(fakes.gate_calls) == 1
+    # a folder whose name merely STARTS with the repository's is not inside it
+    twin = tmp_path / (repo.name + "-home")
+    monkeypatch.setenv("CLAUDE_HR_HOME", str(twin / ".claude-hr"))
+    fakes.tree = "B"
+    stop_gate.handle(payload(repo))
+    assert len(fakes.gate_calls) == 2
+
+
+def test_when_it_cannot_tell_where_the_state_directory_is_it_does_nothing(fakes, repo, monkeypatch):
+    def boom(path):
+        raise OSError("cannot resolve")
+
+    monkeypatch.setattr(stop_gate, "_fold", boom)
+    assert stop_gate.handle(payload(repo)) is None and fakes.gate_calls == []
+
+
+def test_a_link_into_the_repository_is_followed(fakes, repo, tmp_path, monkeypatch):
+    target = repo / ".hr"
+    target.mkdir()
+    link = tmp_path / "hr-link"
+    try:
+        link.symlink_to(target, target_is_directory=True)
+    except (OSError, NotImplementedError):
+        # no symlink privilege on Windows: a directory junction needs none, and resolves the same way
+        made = paths.IS_WINDOWS and (
+            subprocess.run(
+                ["cmd", "/c", "mklink", "/J", str(link), str(target)], capture_output=True
+            ).returncode
+            == 0
+        )
+        if not made:
+            pytest.skip("neither symlinks nor junctions are available")
+    monkeypatch.setenv("CLAUDE_HR_HOME", str(link))
+    assert stop_gate.handle(payload(repo)) is None and fakes.gate_calls == []
+
+
+@pytest.mark.skipif(not paths.IS_WINDOWS, reason="Windows paths are not case sensitive")
+def test_the_comparison_ignores_case_on_windows(fakes, repo, monkeypatch):
+    monkeypatch.setenv("CLAUDE_HR_HOME", str(repo).upper() + "/.hr")
+    assert stop_gate.handle(payload(repo)) is None and fakes.gate_calls == []
+
+
+RECIPE = """
+[[fast]]
+name = "marker"
+argv = [{py}, "-c", "open('ran.txt', 'w').write('x')"]
+timeout_s = 30
+"""
+
+
+@pytest.fixture
+def real_repo(tmp_path, monkeypatch):
+    """A real repository with a recipe whose one check leaves ran.txt behind, and the real verify / stop_gate code."""
+    from claude_hr import verify
+
+    r = tmp_path / "work" / "real repo"
+    r.mkdir(parents=True)
+
+    def git(*args):
+        subprocess.run(["git", *args], cwd=r, check=True, capture_output=True, timeout=60)
+
+    git("init", "-q")
+    (r / "app.py").write_text("x = 1\n", encoding="utf-8", newline="\n")
+    verify.config_path(r).parent.mkdir(parents=True, exist_ok=True)
+    verify.config_path(r).write_text(
+        RECIPE.format(py=json.dumps(sys.executable)), encoding="utf-8", newline="\n"
+    )
+    git("add", "-A")
+    git(
+        "-c",
+        "user.name=t",
+        "-c",
+        "user.email=t@example.com",
+        "-c",
+        "commit.gpgsign=false",
+        "commit",
+        "-q",
+        "-m",
+        "init",
+    )
+    monkeypatch.delenv(verify.ACTIVE_ENV, raising=False)
+    monkeypatch.delenv("CLAUDE_HR_GATES", raising=False)
+    monkeypatch.setenv("CLAUDE_HR_FORMAT__ENABLED", "false")
+    return r
+
+
+def test_a_trust_record_the_repository_shipped_does_not_run_its_recipe(real_repo, monkeypatch):
+    """The reproduction of the review finding: .claude/settings.json {"env": {"CLAUDE_HR_HOME": "<repo>/.hr"}} plus a
+    .hr/state/verify-trust.json for the recipe next to it ran the recipe at the end of the first turn, with no question."""
+    from claude_hr import verify
+
+    monkeypatch.setenv("CLAUDE_HR_HOME", str(real_repo / ".hr"))
+    verify.trust(
+        real_repo, paths.state_dir()
+    )  # what the repository would ship, written by the same code
+    assert (real_repo / ".hr" / "state" / "verify-trust.json").is_file()
+    assert verify.trust_state(real_repo, paths.state_dir()) == "trusted", (
+        "a valid record, so only the location rejects it"
+    )
+    assert stop_gate.handle(payload(real_repo)) is None
+    assert not (real_repo / "ran.txt").exists(), "the repository's recipe must not have run"
+    row = auditlog.tail(1)[0]
+    assert row["verify"] == "skip" and "state directory inside the repository" in row["note"]
+
+
+def test_a_trust_record_in_the_users_own_state_directory_runs_the_recipe(real_repo):
+    from claude_hr import verify
+
+    assert not paths.state_dir().is_relative_to(real_repo)
+    verify.trust(real_repo, paths.state_dir())
+    assert stop_gate.handle(payload(real_repo)) is None  # a pass prints nothing
+    assert (real_repo / "ran.txt").is_file(), "the trusted recipe ran"
+    assert auditlog.tail(1)[0]["verify"] == "pass"
