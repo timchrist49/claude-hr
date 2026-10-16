@@ -1804,6 +1804,15 @@ def offer_now(root: Path, cfg, say, *, explicit: bool = False) -> str:
     from . import verify
 
     sdir = paths.state_dir()
+    if paths.state_inside(root):
+        # the end-of-turn hook refuses a state folder inside the repository (see paths.state_inside), so an approval recorded
+        # there would be believed and never honoured: say nothing from the launcher, explain under `verify enable`
+        if explicit:
+            say(
+                f"Not turned on: the state folder {verify.safe_text(str(sdir))} is inside this repository, so the "
+                "end-of-turn hook would ignore the approval. Set CLAUDE_HR_HOME to a folder outside the repository, or unset it."
+            )
+        return "unavailable"
     try:
         loaded = verify.load_checked(root)
     except verify.VerifyConfigError as exc:

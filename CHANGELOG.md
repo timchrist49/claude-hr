@@ -41,7 +41,7 @@ is unchanged: the checks still run only after a person approved the exact file, 
   - The Stop hook ignores a state folder that lies inside the repository or the working folder, so a repository can no longer
     ship its own trust record through project settings (`CLAUDE_HR_HOME`). This closes a gap that existed in 0.2.0.
   - The bash guard's verify/trust patterns can no longer be made to time out with a padded command (bounded gaps, first and
-    last 64 KiB; the secret and git patterns are unchanged and still unbounded).
+    last 16 KiB, about 0.05 s per command; the secret and git patterns are unchanged and still unbounded).
   - Recipes are kept out of git in linked worktrees and submodules too; a check that edits tracked files while it is probed is
     left out; a folder turned on and then emptied is not asked again; a folder with nothing to propose is remembered until a
     project file changes (no repeated discovery cost); a broken `config.toml` no longer drops `verify.offer = "off"`; discovery
@@ -51,6 +51,18 @@ is unchanged: the checks still run only after a person approved the exact file, 
   - Known limits, documented in SECURITY.md: the approval covers the recipe's bytes, not the scripts it runs; a process that fakes
     a terminal can still answer the question (as with `verify trust` in 0.2.0); the guard's secret and git patterns can be padded
     past the hook time limit (fails open); a check that starts failing for reasons outside Claude's edits blocks twice per turn.
+- **Second review round (the fixes themselves), fixed before release:**
+  - A hostile `rm -r -r ...` line in a script could freeze the launcher for minutes before the question appeared: the
+    suspicious-script scan is now linear, bounded (2,000 characters per line, 0.25 s per scan, over that the default is No).
+  - The Makefile view shows the last rule that defines the target and its prerequisites, and says (default No) when it cannot
+    show what make would run (defined twice, `include`, unreadable prerequisite, cut short). A script the screen cannot read
+    (`--prefix`, `-C`, workspaces) says so and defaults to No. Ordinary scripts no longer trip the pattern list (`.env.example`,
+    `localhost`, `jest tests/base64.test.js`, comments).
+  - "Later" instead of a permanent no: Enter on a default-No screen asks again after 7 days, a yes where nothing passes yet
+    (a clone before `npm install`) after 3 days, an unanswered question after 1 day; `n`/`no`/`nope`/`no thanks` still decline for good.
+  - The edit probe compares file content, so a check that only touches a file is not "editing tracked files".
+  - The hooks write nothing into a state folder the repository chose (config read, crash log, status line cache), never write
+    through a link, and `doctor` / `verify status` / the offer say when the gate cannot run for that reason.
 - Tests no longer depend on the machine: the sandbox hides git's global and system configuration and `XDG_CONFIG_HOME`, the
   CLAUDE.md tests read only files inside their own folder, the Headroom footprint tests set the footprint they need, and the
   "never asked" tests fail when an unscripted question is asked (they used to pass vacuously because the launcher swallowed

@@ -157,7 +157,7 @@ provably there: starting an interactive session in a normal terminal.
   `hasTrustDialogAccepted` for the repository's top folder (a trusted parent or launch subfolder does not count: Claude Code
   inherits parent trust silently, which is the case to exclude). `verify enable` works anywhere.
 - *The answer has to be a person's.* Pending console input is discarded right before the question (a habitual Enter typed during the
-  start-up cannot answer it), the wait ends after five minutes as "not now", and two unclear answers are "not now" too: only an
+  start-up cannot answer it), the wait ends after five minutes as "not now" (asked again after a day), and two unclear answers are "not now" too: only an
   explicit yes or no is ever recorded. On Windows a real console is required (`NUL` is not a person).
 - *What the person approves is what runs.* The offer shows the discovered commands in plain words, and for a check that goes
   through a task runner (`npm run`, `make`, `just`) the script it will run; `yes` runs each once while they

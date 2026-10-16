@@ -155,8 +155,10 @@ your clone, never committed by accident). If the folder's agent settings look ri
 the findings are shown first and the default answer is No; so it is when a script shown on the screen looks like fetching or
 sending data, decoding and running something, reading credentials or deleting your home (a short pattern list, not proof).
 
-**How to say no.** Type `n`: you are not asked again for that folder. Ctrl-C, closing the terminal, two unclear answers or
-five minutes without an answer mean "not now" and it asks again next time. To stop the question everywhere: `claude-hr-ctl config set verify.offer off`.
+**How to say no.** Type `n` (or `no`, `nope`, `nah`, `no thanks`): you are not asked again for that folder. Pressing Enter on a
+question whose default was No (the screen shows `[y/N]`) means "later": it asks again after a week. If no check passes yet (a
+fresh clone before `npm install`, say) it asks again after three days, and after five minutes without an answer, after a day.
+Ctrl-C, closing the terminal, `later`, `skip` and two unclear answers are "not now" and record nothing. To stop the question everywhere: `claude-hr-ctl config set verify.offer off`.
 
 **How to undo it.** `claude-hr-ctl verify disable` turns the gate off for this folder and keeps the file;
 `claude-hr-ctl verify enable` turns it on again; `claude-hr-ctl verify status` shows where the folder stands (on, off, or never

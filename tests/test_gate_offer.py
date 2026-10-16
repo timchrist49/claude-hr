@@ -3795,3 +3795,22 @@ def test_the_budget_does_not_count_the_time_the_patterns_take_to_compile(monkeyp
     monkeypatch.setattr(gate_offer, "time", Clock())
     monkeypatch.setattr(gate_offer, "_suspicious_checks", slow_first_build)
     assert gate_offer._suspicion(["eslint ."]) is None
+
+
+# ---- a state folder inside the repository: the hook would ignore every approval, so nothing is offered ------------
+def test_nothing_is_offered_when_the_state_folder_is_inside_the_repository(
+    repo, person, keys, offered, cfg, monkeypatch
+):
+    monkeypatch.setenv("CLAUDE_HR_HOME", str(repo / ".hr"))
+    run_offer(cfg)  # `keys` fails on any question
+    assert not (repo / ".claude").exists() and keys.prompts == []
+
+
+def test_verify_enable_says_why_it_will_not_turn_the_gate_on_there(
+    repo, person, keys, offered, cfg, monkeypatch
+):
+    monkeypatch.setenv("CLAUDE_HR_HOME", str(repo / ".hr"))
+    said: list[str] = []
+    assert gate_offer.offer_now(repo, cfg, said.append, explicit=True) == "unavailable"
+    assert any("inside this repository" in line and "CLAUDE_HR_HOME" in line for line in said)
+    assert not (repo / ".claude").exists() and keys.prompts == []
