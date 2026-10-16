@@ -13,14 +13,17 @@ medium finding (so the trust preflight shows it and `--strict` fails).
 
 Limits (stated, not hidden): these are pattern checks, not proof. Surface names (`.claude/settings.json`, `CLAUDE.md`,
 ...) match case-insensitively on every OS. Agent-surface files are never counted against the file cap; ordinary files
-beyond it, and directories beyond the directory/time budgets, are reported as a medium `scan-truncated` finding.
-Dependency directories (node_modules, venvs, caches) are only searched, to a bounded depth and size, for agent-facing
-names (CLAUDE.md, AGENTS.md, SKILL.md, anything under .claude/); their other files are not scanned.
+beyond it (when git cannot account for them), and directories beyond the directory/time budgets, are reported as a
+medium `scan-truncated` finding. Dependency directories (node_modules, venvs, caches) are only searched, to a bounded
+depth and size, for agent-facing names (CLAUDE.md, AGENTS.md, SKILL.md, anything under .claude/); their other files
+are not scanned, and where the bound cut a search that is reported (medium when git says the directory is part of the
+repository, info for an installed, ignored one). A hook's scripts are followed through source/bash/python/node
+references to a bounded depth and size; a chain that goes beyond is reported, not skipped. Task runners (make, npm
+run, ...) are not followed into their Makefile or package.json.
 """
 
 from __future__ import annotations
 
-import fnmatch
 import itertools
 import json
 import math
@@ -30,7 +33,7 @@ import re
 import stat
 import time
 from bisect import bisect_left
-from collections import Counter
+from collections import Counter, deque
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import NamedTuple
@@ -46,18 +49,25 @@ MAX_WALK_ENTRIES = 50_000  # ordinary files; agent-surface files never count aga
 MAX_WALK_DIRS = 200_000
 MAX_SURFACE_FILES = 5_000
 MAX_ALIAS_DIRS = (
-    500  # re-expansions of an already visited directory (symlink aliases under .claude/)
+    2_000  # surface-only expansions of directories reached through symlinks (.claude/skills -> ...)
 )
 MAX_PRUNED_DIRS = (
     20_000  # directories searched inside node_modules, venvs, caches (agent-facing names only)
 )
 MAX_PRUNED_DEPTH = 3
 MAX_PRUNED_ENTRIES = 2_000  # entries read per directory inside a pruned tree
-MAX_SCAN_SECONDS = 120.0  # wall clock for the walk and the secret scan
+MAX_SCAN_SECONDS = 120.0  # wall clock for the walk and every check of a full scan
+MAX_PREFLIGHT_SECONDS = 20.0  # the verify-trust preflight is interactive: it gets a short budget
 MAX_SCAN_BYTES = 64 * 1024 * 1024
 MAX_SECRET_FINDINGS = 200
 MAX_TOOL_OUTPUT = 2 * 1024 * 1024
-MAX_HIDDEN_MATCHES = 20_000  # invisible characters examined per file (the counts saturate)
+# a hook runs a.sh, which runs b.sh, ...: how many links of that chain are read
+MAX_SCRIPT_DEPTH = 4
+MAX_SCRIPTS_PER_COMMAND = 24  # scripts read for one hook command
+MAX_SCRIPT_BYTES = 8 * 1024 * 1024  # script text analysed per scan (each script is read once)
+MAX_GITIGNORE_PATTERN = 256  # characters; longer patterns are not evaluated (and reported)
+MAX_GITIGNORE_LINES = 5_000
+MAX_LINK_FINDINGS = 500  # symlinks that leave the repo or loop, listed individually
 VCS_DIRS = frozenset({".git", ".hg", ".svn"})  # never entered
 PRUNE_DIRS = frozenset(
     {".git", ".hg", ".svn", "node_modules", ".venv", "venv", "__pycache__", ".tox"}
@@ -179,9 +189,15 @@ KINDS: dict[str, tuple[str, str]] = {
         "agent-config",
         "Replace the symlink with a real in-repo file; it points outside the repository (not read).",
     ),
+    "symlink-to-ancestor": (
+        "agent-config",
+        "Replace the symlink with real files: a directory that links to one of its own parents makes the same "
+        "files appear under several names (`.claude -> .` makes the repo root a `.claude` folder).",
+    ),
     "file-not-scanned": (
         "agent-config",
-        "Review the file by hand: it is binary, over the size limit, unreadable or crashed a check, so it was not scanned.",
+        "Review the file or directory by hand: it is binary, over the size limit, unreadable, a script chain "
+        "too deep to follow, or crashed a check, so it was not scanned.",
     ),
     "hidden-unicode": (
         "hidden-unicode",
@@ -250,7 +266,8 @@ KINDS: dict[str, tuple[str, str]] = {
     ),
     "scan-truncated": (
         "secrets",
-        "The scan is incomplete (file, directory, size or time budget); scan the rest with gitleaks and review the agent files by hand.",
+        "The scan is incomplete (file, directory, size or time budget, or a dependency directory cut short); "
+        "scan the rest with gitleaks and review the agent files by hand.",
     ),
     "env-file-tracked": (
         "hygiene",
@@ -405,6 +422,33 @@ def _within(real: str, root_real: str) -> bool:
         return os.path.commonpath([root_real, real]) == root_real
     except ValueError:
         return False
+
+
+def _read_regular(path: str, limit: int) -> bytes | None:
+    """At most `limit` bytes of a regular file, or None for anything else (FIFO, device, directory).
+
+    A repository chooses what its paths are: a FIFO or `/dev/ptmx` behind a name would block a plain `open().read()`
+    forever. The file is opened without blocking and checked again after opening (a swap between the first check
+    and the open must not matter), and the read is bounded.
+    """
+    if not stat.S_ISREG(os.stat(path).st_mode):
+        return None
+    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NONBLOCK", 0)
+    fd = os.open(path, flags)
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            return None
+        chunks: list[bytes] = []
+        left = limit
+        while left > 0:
+            part = os.read(fd, min(left, 1 << 20))
+            if not part:
+                break
+            chunks.append(part)
+            left -= len(part)
+        return b"".join(chunks)
+    finally:
+        os.close(fd)
 
 
 class _Proc(NamedTuple):
@@ -608,30 +652,88 @@ def _secret_like_value(value: str) -> bool:
 # the repo view: one bounded walk, safe reads, optional `git ls-files`
 # ---------------------------------------------------------------------------------------------
 _PRIORITY_DIRS = frozenset({".claude", ".github"})
+# inside a surface-only alias (`.claude -> .`) the directories Claude Code reads come first
+_ALIAS_FIRST = frozenset(
+    {".claude", ".github", "agents", "commands", "rules", "output-styles", "workflows", "routines"}
+    | {"skills", "hooks"}
+)
 _TRUNCATION = {
     "files": "only the first {n} ordinary files were listed (agent-surface files were still scanned)",
     "dirs": "directory limit reached; directories after it were not visited",
     "surface": "too many agent-surface files; the rest were not scanned",
     "time": "time budget used up while listing files",
+    "checks": "time budget used up during the checks; files after that point were not examined",
     "aliases": "symlink alias budget used up; some linked directories were not listed",
+    "links": "more symlinks leave the repository or loop than are listed one by one",
 }
+# names that can still be opened in a `.claude` directory that cannot be listed (execute-only: an unpacked archive)
+_CLAUDE_PROBE_NAMES = (
+    "agents commands hooks output-styles routines rules skills workflows "
+    "CLAUDE.md settings.json settings.local.json"
+).split()
+
+
+class _Probe:
+    """Stands in for an `os.DirEntry` when a directory cannot be listed but a known name inside it can be opened."""
+
+    __slots__ = ("is_dir_", "is_file_", "is_link_", "name", "path")
+
+    def __init__(self, name: str, path: str) -> None:
+        self.name, self.path = name, path
+        st = os.stat(path)
+        self.is_dir_, self.is_file_ = stat.S_ISDIR(st.st_mode), stat.S_ISREG(st.st_mode)
+        self.is_link_ = os.path.islink(path)
+
+    def is_dir(self) -> bool:
+        return self.is_dir_
+
+    def is_file(self) -> bool:
+        return self.is_file_
+
+    def is_symlink(self) -> bool:
+        return self.is_link_
+
+    def stat(self, *, follow_symlinks: bool = True):
+        return os.stat(self.path) if follow_symlinks else os.lstat(self.path)
+
+
+def _maybe_link(entry) -> bool:
+    """A symlink, or on Windows any reparse point (a junction is a directory link that is not a symlink there).
+    Cheap: both answers come with the directory listing, no extra system call."""
+    try:
+        if entry.is_symlink():
+            return True
+        if os.name == "nt":
+            return bool(getattr(entry.stat(follow_symlinks=False), "st_file_attributes", 0) & 0x400)
+    except OSError:
+        return True
+    return False
 
 
 class _Repo:
-    def __init__(self, root: Path) -> None:
+    def __init__(self, root: Path, seconds: float | None = None) -> None:
         self.root = root
         self.real = os.path.realpath(root)
         self.files: list[str] = []
         self.fileset: set[str] = set()
-        # casefolded path -> listed path (Windows and macOS open `X.SH` for `x.sh`)
-        self._folded: dict[str, str] = {}
+        # casefolded path -> every listed spelling (a case-sensitive file system can hold `Run.sh` and `run.sh`;
+        # Windows and macOS open `X.SH` for `x.sh`)
+        self._folded: dict[str, list[str]] = {}
         self.escaped: list[str] = []  # symlinks that leave the root: never read
+        self.loops: list[str] = []  # directory symlinks that resolve to one of their own parents
+        # directories/entries that could not be listed or examined: (path, severity)
+        self.unscanned: list[tuple[str, str]] = []
+        self.cuts: list[str] = []  # directory prefixes where a dependency-tree limit cut the search
         self.trunc: set[str] = set()  # keys of _TRUNCATION: why the listing is incomplete
         # text files whose NUL bytes were dropped before scanning: path -> (count, first line)
         self.nul: dict[str, tuple[int, int]] = {}
-        self.deadline = time.monotonic() + MAX_SCAN_SECONDS
+        self.deadline = time.monotonic() + (MAX_SCAN_SECONDS if seconds is None else seconds)
         self._cache: dict[tuple[str, bool], tuple[str | None, str]] = {}
         self._git: tuple[set[str], set[str]] | None | bool = False  # False = not asked yet
+        # memo: a script named by many hooks is analysed once, and a token is resolved once
+        self.scripts: dict[str, _ScriptInfo] = {}
+        self.resolved: dict[tuple[str, str | None], list[str]] = {}
+        self.script_bytes = 0
 
     @property
     def truncated(self) -> bool:
@@ -640,50 +742,82 @@ class _Repo:
     def expired(self) -> bool:
         return time.monotonic() > self.deadline
 
+    def out_of_time(self) -> bool:
+        """Checks call this between files: past the deadline the remaining files are not examined, and the scan
+        says so (`scan-truncated`) instead of running for minutes on a hostile repository."""
+        if self.expired():
+            self.trunc.add("checks")
+            return True
+        return False
+
     def inside(self, real: str) -> bool:
         return _within(real, self.real)
 
     def _add(self, rel: str) -> None:
         self.files.append(rel)
         self.fileset.add(rel)
-        self._folded.setdefault(rel.casefold(), rel)
+        self._folded.setdefault(rel.casefold(), []).append(rel)
+
+    def lookup_all(self, rel: str) -> list[str]:
+        """Every listed spelling of `rel`, exact case first (Windows and macOS open `X.SH` for `x.sh`; on a
+        case-sensitive file system `Run.sh` and `run.sh` are two files and any of them may be what runs), or `rel`
+        itself when it is a file on disk the listing skipped (past the cap, or inside a dependency directory)."""
+        found = list(self._folded.get(rel.casefold(), ()))
+        if rel in found:
+            found.remove(rel)
+            return [rel, *found]
+        try:
+            path = os.path.join(str(self.root), *rel.split("/"))
+            # a file on disk the listing skipped; but on a case-insensitive file system `rel` is just another
+            # spelling of a file that is listed, and then the listed spelling is the answer
+            if os.path.isfile(path) and not any(
+                os.path.samefile(path, os.path.join(str(self.root), *f.split("/"))) for f in found
+            ):
+                return [rel, *found]
+        except (OSError, ValueError):
+            pass
+        return found
 
     def lookup(self, rel: str) -> str | None:
-        """The listed spelling of `rel` (case-insensitive: Windows and macOS open `X.SH` for `x.sh`), or `rel`
-        itself when it is a file on disk the listing skipped (past the cap, or inside a dependency directory)."""
-        hit = self._folded.get(rel.casefold())
-        if hit is not None:
-            return hit
-        try:
-            ok = os.path.isfile(os.path.join(str(self.root), *rel.split("/")))
-        except (OSError, ValueError):
-            return None
-        return rel if ok else None
+        hit = self.lookup_all(rel)
+        return hit[0] if hit else None
+
+    def _note_link(self, bucket: list[str], rel: str) -> None:
+        if len(bucket) < MAX_LINK_FINDINGS:
+            bucket.append(rel)
+        else:
+            self.trunc.add("links")
+
+    def _cut(self, rel: str) -> None:
+        if len(self.cuts) < 64:
+            self.cuts.append(rel.rstrip("/") + "/")
 
     def walk(self) -> None:
         """List the files, agent-surface ones first-class.
 
         Agent-surface files (`_walk_surface`) are always recorded: the cap counts ordinary files only, and after it
         is reached the walk keeps visiting directories to find them. Dependency directories are searched, to a
-        bounded depth and size, for agent-facing names only (`_pruned_surface`). Every real directory is fully
-        expanded once, so symlink forests cannot make the walk exponential. A directory reached again through a
-        symlink alias is expanded once more per alias, surface names only and within a global budget, because the
-        audit must see the files at the path Claude Code reads them from (`.claude/skills` -> `shared/skills`);
-        such surface-only subtrees never claim a directory, so they cannot hide ordinary files of the real one.
+        bounded depth and size, for agent-facing names only (`_pruned_surface`).
+
+        A real directory is expanded once, under its real path, so symlink forests cannot make the walk
+        exponential and ordinary files are always listed under the name git knows them by. A symlinked directory
+        (or Windows junction) never claims anything: it is expanded as a surface-only alias under its own name,
+        within a global budget, because the audit must see the files at the path Claude Code reads them from
+        (`.claude/skills` -> `shared/skills`, and even `.claude` -> `.`). Loops are cut by remembering the real
+        directories on the way down (`ancestors`), and a link to one of its own parents is itself a finding.
         """
         root_n = os.path.normcase(self.real)
-        visited = {root_n}
         alias_budget = MAX_ALIAS_DIRS
         dirs_seen = pruned_seen = surface_n = ordinary_n = 0
-        # (path, prefix, ancestors, depth in a pruned tree, True inside a symlink alias)
-        stack: list[tuple[str, str, frozenset[str], int, bool]] = [
-            (str(self.root), "", frozenset({root_n}), 0, False)
+        # (path, prefix, real path, real dirs on the way down, depth in a pruned tree, True inside a symlink alias)
+        stack: list[tuple[str, str, str, frozenset[str], int, bool]] = [
+            (str(self.root), "", self.real, frozenset({root_n}), 0, False)
         ]
         while stack:
             if time.monotonic() > self.deadline:
                 self.trunc.add("time")
                 return
-            base, prefix, ancestors, depth, alias = stack.pop()
+            base, prefix, base_real, ancestors, depth, alias = stack.pop()
             dirs_seen += 1
             if dirs_seen > MAX_WALK_DIRS:
                 self.trunc.add("dirs")
@@ -693,8 +827,15 @@ class _Repo:
                 with os.scandir(base) as it:
                     chosen = itertools.islice(it, MAX_PRUNED_ENTRIES) if limited else it
                     entries = sorted(chosen, key=lambda e: e.name)
+                    if limited and next(it, None) is not None:
+                        if alias:
+                            self.trunc.add("aliases")
+                        else:
+                            self._cut(prefix)
             except OSError:
-                continue
+                if not prefix:
+                    raise  # the root itself cannot be listed: the audit could not run
+                entries = self._unlisted(base, prefix)
             subdirs = []
             for e in entries:
                 rel = prefix + e.name
@@ -702,6 +843,7 @@ class _Repo:
                     is_dir = e.is_dir()
                     is_file = e.is_file()
                 except OSError:
+                    self._unscanned(rel)
                     continue
                 if is_dir:
                     if e.name in VCS_DIRS:
@@ -710,28 +852,37 @@ class _Repo:
                     if not alias and (depth or e.name in PRUNE_DIRS):
                         child_depth = depth if _CLAUDE_DIR_RE.search(rel) else depth + 1
                         if child_depth > MAX_PRUNED_DEPTH or pruned_seen >= MAX_PRUNED_DIRS:
+                            self._cut(rel)
                             continue
                         pruned_seen += 1
-                    real = os.path.realpath(e.path)
-                    if not self.inside(real):
-                        if _is_agent_surface(rel):
-                            self.escaped.append(rel)
+                    # the real path is known without asking the OS unless the entry is a link
+                    real, link = os.path.join(base_real, e.name), False
+                    if _maybe_link(e):
+                        target = os.path.realpath(e.path)
+                        if os.path.normcase(target) != os.path.normcase(real):
+                            real, link = target, True
+                    surface_dir = bool(_SURFACE_DIR_RE.search(rel))
+                    if link and not self.inside(real):
+                        if surface_dir or _is_agent_surface(rel):
+                            self._note_link(self.escaped, rel)
                         continue
                     n = os.path.normcase(real)
-                    if n in ancestors:
-                        continue
-                    if alias or (n in visited and not child_depth):
+                    if link and n in ancestors:
+                        if not alias:
+                            self._note_link(self.loops, rel)
+                        if alias or not surface_dir:
+                            continue  # a loop is only ever expanded once, and only where Claude Code reads it
+                    if link or alias:
                         if alias_budget <= 0:
                             self.trunc.add("aliases")
                             continue
                         alias_budget -= 1
                         child_alias = True
-                    elif not child_depth:
-                        visited.add(n)
-                    entry = (e.path, rel + "/", ancestors | {n}, child_depth, child_alias)
+                    entry = (e.path, rel + "/", real, ancestors | {n}, child_depth, child_alias)
                     # `.claude` and `.github` are walked before their siblings, so that a directory or time
                     # budget spent on thousands of decoy directories can never be what hides them
-                    if e.name.casefold() in _PRIORITY_DIRS:
+                    low = e.name.casefold()
+                    if low in _PRIORITY_DIRS or (child_alias and low in _ALIAS_FIRST):
                         subdirs.insert(0, entry)
                     else:
                         subdirs.append(entry)
@@ -742,7 +893,7 @@ class _Repo:
                         continue
                     if e.is_symlink() and not self.inside(os.path.realpath(e.path)):
                         if _is_agent_surface(rel):
-                            self.escaped.append(rel)
+                            self._note_link(self.escaped, rel)
                         continue
                     if limited or _walk_surface(rel):
                         surface_n += 1
@@ -756,6 +907,54 @@ class _Repo:
                             continue
                     self._add(rel)
             stack.extend(reversed(subdirs))
+
+    def _unscanned(self, rel: str) -> None:
+        """A directory or entry the walk could not examine: a medium finding where Claude Code reads (`.claude`,
+        `.github`), low elsewhere (root-owned volumes and 0700 caches are ordinary)."""
+        sev = "medium" if _SURFACE_DIR_RE.search(rel) else "low"
+        if len(self.unscanned) < MAX_LINK_FINDINGS:
+            self.unscanned.append((rel, sev))
+        else:
+            self.trunc.add("links")
+
+    def _unlisted(self, base: str, prefix: str) -> list:
+        """Entries to visit in a directory that cannot be listed: the directory is reported, and for `.claude` the
+        names Claude Code opens by name are probed directly, so an execute-only `.claude` (what an unpacked
+        archive can leave) still has its settings, commands and skills audited."""
+        rel = prefix.rstrip("/")
+        self._unscanned(rel)
+        if not _CLAUDE_DIR_RE.search(rel) or rel.casefold().rsplit("/", 1)[-1] != ".claude":
+            return []
+        probes = []
+        for name in _CLAUDE_PROBE_NAMES:
+            try:
+                probes.append(_Probe(name, os.path.join(base, name)))
+            except OSError:
+                continue
+        return sorted(probes, key=lambda p: p.name)
+
+    def complete_from_git(self) -> None:
+        """After the ordinary-file cap: take the rest of the file list from git.
+
+        What fills the cap is usually build output (`target/`, `dist/`) that git ignores and never lists. When git
+        can list the repository, every file it names that the walk missed is added (dependency trees stay the
+        walk's business), and if that accounts for all of them the cap lost nothing and is not reported.
+        """
+        git = self.git_files()
+        if git is None:
+            return
+        budget = MAX_WALK_ENTRIES
+        for rel in sorted(git[0] | git[1]):
+            if rel in self.fileset:
+                continue
+            parts = rel.split("/")
+            if any(p in PRUNE_DIRS for p in parts[:-1]) or ".." in parts:
+                continue
+            if budget <= 0:
+                return  # still incomplete: the cap stays reported
+            budget -= 1
+            self._add(rel)
+        self.trunc.discard("files")
 
     def read(self, rel: str, *, cache: bool = True, text: bool = False) -> tuple[str | None, str]:
         """(text, reason): reason is ok | nul | binary | too-large | unreadable | outside.
@@ -783,11 +982,10 @@ class _Repo:
             real = os.path.realpath(path)
             if not self.inside(real):
                 return None, "outside"
-            if not stat.S_ISREG(os.stat(real).st_mode):
-                return None, "unreadable"
-            with open(real, "rb") as fh:
-                data = fh.read(limit + 1)
+            data = _read_regular(real, limit + 1)
         except (OSError, ValueError):
+            return None, "unreadable"
+        if data is None:
             return None, "unreadable"
         if len(data) > limit:
             return None, "too-large"
@@ -841,8 +1039,10 @@ COPILOT_RE = re.compile(r"(?:^|/)(?:\.github/copilot-instructions\.md|\.cursorru
 WORKFLOW_RE = re.compile(r"^\.github/workflows/[^/]+\.ya?ml$", re.I)
 
 
-_SURFACE_DIR_RE = re.compile(r"(?:^|/)\.claude(?:/(?:skills|agents|commands|rules|hooks))?$", re.I)
 _CLAUDE_DIR_RE = re.compile(r"(?:^|/)\.claude(?:/|$)", re.I)
+# Anything at or below a `.claude` directory (skills, commands, agents, output-styles, any depth) and the `.github`
+# directory is where Claude Code and CI read from: a link there that leaves the repo or loops is a finding.
+_SURFACE_DIR_RE = re.compile(r"(?:^|/)\.claude(?:/|$)|^\.github(?:/|$)", re.I)
 
 
 def _is_agent_surface(rel: str) -> bool:
@@ -1016,7 +1216,112 @@ def _write_outside(cmd: str) -> tuple[int, int] | None:
                 found = (base + c.start(), base + o.end())
         if found and (best is None or found[0] < best[0]):
             best = found
+    if _DESTRUCTIVE_HINT.search(cmd):
+        for words in _shell_commands(cmd):
+            hit = _destructive_outside(_strip_redirects(words))
+            if hit:
+                pos = max(cmd.find(hit), 0)
+                if best is None or pos < best[0]:
+                    best = (pos, pos + len(hit))
+                break
     return best
+
+
+# Commands that delete, create or change files, judged by their ARGUMENTS: `rm -rf ~`, `touch ~/.ssh/x`, `mkdir
+# ~/.config/autostart`, `cp -t ~/.ssh k`, `sed -i s/a/b/ ~/.bashrc`, `find / -delete`, `dd of=~/x`. (A copy/move
+# to a last-argument destination and redirections are `_write_outside`'s own text checks above.)
+_DESTRUCTIVE_HINT = re.compile(
+    r"\b(?:rm|rmdir|unlink|shred|truncate|touch|mkdir|chmod|chown|chgrp|mv|cp|ln|install|dd|del|erase"
+    r"|rd|remove-item|sed|find|sh|bash|zsh|dash|ksh|ash)\b",
+    re.I,
+)
+_DESTRUCTIVE = frozenset(
+    "rm rmdir unlink shred truncate touch mkdir chmod chown chgrp mv cp ln install dd del erase rd "
+    "remove-item".split()
+)
+_TARGET_DIR_VERBS = frozenset({"cp", "mv", "ln", "install"})
+_FIND_EXEC = ("-exec", "-execdir", "-ok", "-okdir")
+_FIND_WRITES = frozenset({"-delete", "-fprint", "-fprint0", "-fprintf", "-fls", *_FIND_EXEC})
+_SED_INPLACE = re.compile(r"-[A-Za-z]*i.*|--in-place.*", re.S)
+
+
+def _outside_arg(arg: str) -> bool:
+    """An argument that names a place outside the project: home, a system path, a parent directory, a drive.
+    `--out=~/x` and `of=~/x` are looked at after the `=`."""
+    s = arg.strip("\"'")
+    if "=" in s and (s.startswith("-") or s.startswith("of=")):
+        s = s.split("=", 1)[1].strip("\"'")
+    return _is_external_path(s) or s == ".." or s.endswith(("/..", "\\.."))
+
+
+def _destructive_outside(words: list[str], depth: int = 0) -> str | None:
+    """The first argument through which a destructive simple command reaches outside the project, else None.
+
+    Also looks into `sh -c '...'` and `find ... -exec ...`, whose commands are words of the outer command.
+    """
+    i = _command_head(words, through_sudo=True)
+    if i >= len(words) or depth > 3:
+        return None
+    exe, args = _exe_base(words[i]), words[i + 1 :]
+    if exe in _SHELLS:
+        inner = _shell_c_script(exe, args)
+        for sub in _shell_commands(inner) if inner else ():
+            hit = _destructive_outside(_strip_redirects(sub), depth + 1)
+            if hit:
+                return hit
+        return None
+    if exe == "find":
+        for j, a in enumerate(args):
+            if a in _FIND_EXEC:
+                end = next(
+                    (k for k in range(j + 1, len(args)) if args[k] in (";", "+", "\\")), None
+                )
+                hit = _destructive_outside(args[j + 1 : end], depth + 1)
+                if hit:
+                    return hit
+        if any(a in _FIND_WRITES for a in args):
+            return next((a for a in args if _outside_arg(a)), None)
+        return None
+    if exe == "sed":
+        if not any(_SED_INPLACE.fullmatch(a) for a in args if a.startswith("-")):
+            return None
+        return next((a for a in _operands(exe, args) if _outside_arg(a)), None)
+    if exe not in _DESTRUCTIVE:
+        return None
+    if exe in _TARGET_DIR_VERBS:  # `cp -t DIR a b`: the destination is not the last word
+        for j, a in enumerate(args):
+            if a in ("-t", "--target-directory") and j + 1 < len(args):
+                return args[j + 1] if _outside_arg(args[j + 1]) else None
+            if a.startswith("--target-directory=") and _outside_arg(a):
+                return a
+        return None
+    return next((a for a in args if not a.startswith("-") and _outside_arg(a)), None)
+
+
+_WIPE_VERBS = frozenset("rm rmdir shred truncate del erase rd remove-item".split())
+_WIPE_TARGET = re.compile(
+    r"(?:(?:~|\$\{?HOME\}?|%USERPROFILE%|\$env:USERPROFILE|[A-Za-z]:)[/\\]*|[/\\]+)\*?", re.I
+)
+
+
+def _wipes_home(cmd: str, depth: int = 0) -> bool:
+    """`rm -rf ~`, `rm -rf "$HOME"`, `rm -rf /`, `rd /s C:\\`: deleting a whole home directory or drive."""
+    for words in _shell_commands(cmd):
+        words = _strip_redirects(words)
+        i = _command_head(words, through_sudo=True)
+        if i >= len(words):
+            continue
+        exe, args = _exe_base(words[i]), words[i + 1 :]
+        if exe in _WIPE_VERBS:
+            for a in args:
+                s = a.strip("\"'")
+                if s and not a.startswith("-") and _WIPE_TARGET.fullmatch(s):
+                    return True
+        elif exe in _SHELLS and depth < 2:
+            inner = _shell_c_script(exe, args)
+            if inner and _wipes_home(inner, depth + 1):
+                return True
+    return False
 
 
 _PERSIST = re.compile(
@@ -1363,18 +1668,129 @@ def _local_script_word(word: str) -> bool:
     return bool(_SCRIPT_EXT.search(word)) and not _is_external_path(word) and "://" not in word
 
 
+# Builtins that only print or test: their arguments are data, whatever they look like.
+_INERT = frozenset("echo printf true false : exit test [ [[ pwd cd".split())
+# Options that make an otherwise local tool run a program or fetch something (`rg --pre`, `uv run --with pkg`).
+_EXEC_OPTIONS = frozenset(
+    "--pre --compress-program --exec --shell --with --from --with-requirements --index --index-url "
+    "--extra-index-url --find-links --registry".split()
+)
+_AWK_SHELLS = re.compile(r"system\s*\(|\bgetline\b|\bENVIRON\b|\bprintf?\b[^;{}]*[|>]")
+_SED_SHELLS = re.compile(
+    r"^[sy](\W).*\1[A-Za-z0-9]*[ew][A-Za-z0-9]*(?:[\s;].*)?$|(?:^|[;{}\s])[ew]\s", re.S
+)
+_SUBSTITUTION = re.compile(r"\$\(([^()]{0,300})\)|`([^`]{0,300})`")
+
+
+_PROGRAM_TOOLS = frozenset("sed awk gawk mawk grep egrep fgrep rg tr jq".split())
+
+
+def _operands(exe: str, args: list[str]) -> list[str]:
+    """The arguments of a tool that can be paths or options: not the program/pattern text of sed, awk, grep, rg, jq
+    and tr (`sed -i '/foo/d' f`, `grep '/etc' f`, `tr / _`), nor the message of `git commit -m`."""
+    if exe == "git":
+        out, i = [], 0
+        while i < len(args):
+            if args[i] in ("-m", "--message", "--grep") and i + 1 < len(args):
+                i += 2
+            elif args[i].startswith(("--message=", "--grep=")):
+                i += 1
+            else:
+                out.append(args[i])
+                i += 1
+        return out
+    if exe not in _PROGRAM_TOOLS:
+        return args
+    if exe == "tr":
+        return [a for a in args if a.startswith("-")]  # both operands are character sets
+    out, i, have_program = [], 0, False
+    while i < len(args):
+        a = args[i]
+        if a in ("-e", "--expression", "--regexp") and i + 1 < len(args):
+            have_program = True
+            i += 2
+        elif a.startswith(("--expression=", "--regexp=")):
+            have_program = True
+            i += 1
+        elif a.startswith("-"):
+            have_program = have_program or a in (
+                "-f",
+                "--file",
+            )  # a script FILE is a path, kept below
+            out.append(a)
+            i += 1
+        elif not have_program:
+            have_program = True  # the first operand is the program or pattern
+            i += 1
+        else:
+            out.append(a)
+            i += 1
+    return out
+
+
+def _substitutions_local(arg: str, depth: int) -> bool:
+    """`$(...)` and backticks inside an argument: fine when the inner command is itself clearly local."""
+    for m in _SUBSTITUTION.finditer(arg):
+        inner = m.group(1) or m.group(2) or ""
+        if depth >= 2 or not _clearly_local_text(inner, depth + 1):
+            return False
+    return True
+
+
+def _args_local(exe: str, args: list[str], depth: int) -> bool:
+    """No argument makes a local tool reach out: not a URL, not a path outside the project, not an option that runs
+    a program, not a shell-out (`find -exec`, `awk system()`, `sed s///e`, `$(curl ...)`)."""
+    if exe == "find":
+        for j, a in enumerate(args):
+            if a in _FIND_EXEC:  # `find -exec CMD ;` is as local as CMD
+                end = next(
+                    (k for k in range(j + 1, len(args)) if args[k] in (";", "+", "\\")), None
+                )
+                if depth >= 2 or not _simple_is_local(args[j + 1 : end], depth + 1):
+                    return False
+    if exe == "awk" and any(_AWK_SHELLS.search(a) for a in args):
+        return False
+    if exe == "sed" and any(_SED_SHELLS.search(a) for a in args if not a.startswith("-")):
+        return False
+    for a in _operands(exe, args):
+        if "://" in a or _outside_arg(a) or a.split("=", 1)[0] in _EXEC_OPTIONS:
+            return False
+    return all(
+        _substitutions_local(a, depth) for a in args if "$(" in a or "`" in a
+    )  # also inside program text
+
+
+def _git_is_local(args: list[str], depth: int) -> bool:
+    """Read-only or worktree-local git, with no `-c`/`--config-env`/`--exec-path` (those make git run a program
+    of the caller's choosing: `git -c core.fsmonitor='sh x' status`)."""
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a in ("-c", "--config-env") or a.startswith(("--config-env=", "--exec-path")):
+            return False
+        if a in ("-C", "--git-dir", "--work-tree", "--namespace"):
+            i += 2
+        elif a.startswith("-"):
+            i += 1
+        else:
+            break
+    return _git_subcommand(args) in _LOCAL_GIT and _args_local("git", args, depth)
+
+
 def _simple_is_local(words: list[str], depth: int) -> bool:
     i = _command_head(words)
+    if any(_risky_assignment(w) for w in words[:i]):
+        return False  # `LD_PRELOAD=./x.so ls`, `NODE_OPTIONS='--require ./x.js' echo hi`
     if i >= len(words):
         return True  # only assignments, redirects or keywords
     exe, args = _exe_base(words[i]), words[i + 1 :]
     if exe in _LOCAL_TOOLS:
-        return True
+        return exe in _INERT or _args_local(exe, args, depth)
     if exe == "git":
-        return _git_subcommand(args) in _LOCAL_GIT
+        return _git_is_local(args, depth)
     if exe in _LOCAL_RUNNERS:
         sub = next((a for a in args if not a.startswith("-")), "")
-        return sub in _LOCAL_RUNNERS[exe]
+        return sub in _LOCAL_RUNNERS[exe] and _args_local(exe, args, depth)
     family = _interp_family(exe)
     if family == "python" or exe in _INTERP_LOCAL:
         inner = _shell_c_script(exe, args) if exe in _SHELLS else None
@@ -1386,7 +1802,11 @@ def _simple_is_local(words: list[str], depth: int) -> bool:
         while j < len(args):
             a = args[j]
             if family == "python" and a == "-m":
-                return j + 1 < len(args) and args[j + 1] in _LOCAL_PY_MODULES
+                return (
+                    j + 1 < len(args)
+                    and args[j + 1] in _LOCAL_PY_MODULES
+                    and _args_local(args[j + 1], args[j + 2 :], depth)
+                )
             if a.startswith("-"):
                 j += 1
                 continue
@@ -1439,7 +1859,8 @@ def _analyze_command(cmd: str) -> list[tuple[str, str, str]]:
         )
     w = _write_outside(cmd)
     if w:
-        sev = "high" if _PERSIST.search(cmd[w[0] : w[1] + 60]) else "medium"
+        wipe = _DESTRUCTIVE_HINT.search(cmd) and _wipes_home(cmd)
+        sev = "high" if wipe or _PERSIST.search(cmd[w[0] : w[1] + 60]) else "medium"
         out.append(
             (
                 "cmd-writes-outside",
@@ -1461,16 +1882,23 @@ def _command_findings(
         _finding(sev, kind, rel, f"{source}: {label}") for kind, sev, label in _analyze_command(cmd)
     ]
     if scripts:
-        found = 0
-        for tok in _script_refs(cmd):
-            script = _resolve_script(repo, tok)
-            if script and found < 3:
-                found += 1
-                out.extend(_script_findings(repo, script, source))
+        out.extend(_follow_scripts(repo, cmd, rel, source))
     return out
 
 
-def _resolve_script(repo: _Repo, token: str) -> str | None:
+def _resolve_script(repo: _Repo, token: str, base_dir: str | None = None) -> list[str]:
+    """Listed repo paths a script token can mean (several when a case-sensitive file system holds `Run.sh` and
+    `run.sh`). `base_dir` is set for a reference found inside a script: `./b.sh`, `$SCRIPT_DIR/b.sh` and the
+    `/b.sh` that `$(dirname "$0")/b.sh` leaves behind are tried next to that script as well as at the root."""
+    key = (token, base_dir)
+    hit = repo.resolved.get(key)
+    if hit is not None:
+        return hit
+    repo.resolved[key] = out = _resolve_script_uncached(repo, token, base_dir)
+    return out
+
+
+def _resolve_script_uncached(repo: _Repo, token: str, base_dir: str | None) -> list[str]:
     t = token.strip("\"'")
     had_var = False
     low = t.lower()
@@ -1479,31 +1907,103 @@ def _resolve_script(repo: _Repo, token: str) -> str | None:
             t, had_var = t[len(var) :], True
             break
     t = t.replace("\\", "/")
-    if (
-        t.startswith(("~", "$", "%"))
-        or re.match(r"[A-Za-z]:", t)
-        or (t.startswith("/") and not had_var)
-    ):
-        return None
-    norm = posixpath.normpath(t.lstrip("/") if had_var else t)
-    if norm.startswith("..") or norm == ".":
-        return None
-    return repo.lookup(norm)
+    if t.startswith(("~", "%", "$HOME", "${HOME}")) or re.match(r"[A-Za-z]:", t):
+        return []
+    if had_var:
+        wanted = [t.lstrip("/")]
+    elif t.startswith("$"):
+        m = re.match(r"\$\{?\w+\}?/+(.*)$", t, re.S) if base_dir is not None else None
+        if not m:
+            return []
+        wanted = [m.group(1)]  # `$SCRIPT_DIR/b.sh`
+    elif t.startswith("/"):
+        if base_dir is None:
+            return []
+        wanted = [t.lstrip("/")]  # what `$(dirname "$0")/b.sh` leaves behind
+    else:
+        wanted = [t]
+    found: list[str] = []
+    for w in wanted:
+        for b in ("", base_dir) if base_dir and not had_var else ("",):
+            norm = posixpath.normpath(posixpath.join(b, w) if b else w)
+            if norm.startswith("..") or norm.startswith("/") or norm == ".":
+                continue
+            found.extend(x for x in repo.lookup_all(norm) if x not in found)
+    return found
 
 
-def _script_findings(repo: _Repo, rel: str, source: str) -> list[Finding]:
-    """A hook usually just names a script: read that script (never run it) and apply the same checks.
+class _ScriptInfo(NamedTuple):
+    hits: tuple[tuple[str, str, str, int], ...]  # (kind, severity, label, first line): one per kind
+    refs: tuple[str, ...]  # scripts this one runs, sources or imports (not resolved yet)
+    problem: str  # "" or why it was not read: a `_WHY` key, "budget" (script bytes spent) or "time"
 
-    The script is read as text whatever its bytes (an interpreter runs it, NUL or not). One that cannot be read is
-    a medium finding rather than silence. Besides the command patterns, network APIs of the script's own language
-    (urllib, require('https'), fetch(), sockets ...) count as a medium network finding.
-    """
+
+_PY_IMPORT = re.compile(
+    r"^[ \t]*(?:from[ \t]+(\.*)([\w.]*)[ \t]+import[ \t]+\(?([\w, \t]*)"
+    r"|import[ \t]+([\w.]+(?:[ \t]*,[ \t]*[\w.]+)*))",
+    re.M,
+)
+
+_JS_IMPORT = re.compile(
+    r"""(?:require\(|import\(|\bfrom[ \t]+|\bimport[ \t]+)\s*['"](\.{1,2}/[^'"\n]{1,200})['"]"""
+)
+_JS_EXTS = (".js", ".mjs", ".cjs", ".ts", ".mts", ".cts", ".jsx", ".tsx")
+_HOME_HINT = re.compile(
+    r"expanduser|homedir|HOME|[\"']~|USERPROFILE|\.ssh|\.bashrc|authorized_keys", re.I
+)
+_HOME_API = re.compile(
+    r"\b(?:rmtree|rmSync|rmdirSync|unlinkSync|unlink|rmdir|writeFileSync|writeFile|appendFileSync"
+    r"|copyFileSync|mkdirSync|makedirs|write_text|write_bytes|chmod|remove|rename)\s*\([^)\n]{0,200}"
+    r"(?:expanduser|homedir\(\)|\$HOME|[\"']~[/\\]|os\.environ\[[\"']HOME|USERPROFILE|\.ssh\b|\.bashrc"
+    r"|authorized_keys)",
+    re.I,
+)
+
+
+def _import_refs(rel: str, text: str) -> list[str]:
+    """Repo files a python or node script imports by relative or sibling name (`import helper` -> `helper.py`,
+    `require('./lib/x')` -> `./lib/x.js`, ...): candidates only, `_resolve_script` keeps the ones that exist."""
+    ext = posixpath.splitext(rel)[1].lower()
+    out: dict[str, None] = {}
+    if ext == ".py":
+        for m in _PY_IMPORT.finditer(text):
+            if len(out) >= 64:
+                break
+            if m.group(4) is not None:  # import a.b, c
+                dots, names = "", [n.strip() for n in m.group(4).split(",")]
+            else:  # from [.]pkg import x, y: the module, and each name (it may be a submodule)
+                dots, base = m.group(1), m.group(2)
+                listed = re.findall(r"\w+", m.group(3))[:16]
+                names = [base, *(f"{base}.{n}" if base else n for n in listed)]
+
+            for name in names:
+                path = "/".join(p for p in name.split(".") if p)
+                if path:
+                    prefix = "../" * (len(dots) - 1) if dots else ""
+                    out[prefix + path + ".py"] = None
+                    out[prefix + path + "/__init__.py"] = None
+    elif ext in _JS_EXTS:
+        for m in itertools.islice(_JS_IMPORT.finditer(text), 64):
+            spec = m.group(1)
+            out[spec] = None
+            if not posixpath.splitext(spec)[1]:
+                for e in (*_JS_EXTS, "/index.js"):
+                    out[spec + e] = None
+    return list(out)
+
+
+def _analyze_script(repo: _Repo, rel: str) -> _ScriptInfo:
+    if repo.script_bytes > MAX_SCRIPT_BYTES:
+        return _ScriptInfo((), (), "budget")
     text, reason = repo.read(rel, text=True)
     if text is None:
-        why = _WHY.get(reason, reason)
-        return [_finding("medium", "file-not-scanned", rel, f"hook script not scanned: {why}")]
-    first: dict[str, tuple[int, str, str]] = {}
+        return _ScriptInfo((), (), reason)
+    repo.script_bytes += len(text)
+    first: dict[str, tuple[str, str, int]] = {}
+    refs: dict[str, None] = {}
     for n, line in enumerate(text.split("\n"), 1):
+        if n % 512 == 0 and repo.out_of_time():
+            break
         if not line.strip() or line.lstrip().startswith("#"):
             continue
         hits = _analyze_command(line)
@@ -1511,17 +2011,94 @@ def _script_findings(repo: _Repo, rel: str, source: str) -> list[Finding]:
             hits.append(
                 ("cmd-network-fetch", "medium", "uses network APIs (sockets, http clients)")
             )
+        if _HOME_HINT.search(line) and _HOME_API.search(line):
+            hits.append(
+                (
+                    "cmd-writes-outside",
+                    "medium",
+                    "changes files in the home directory or a system path through file APIs",
+                )
+            )
         for kind, sev, label in hits:
             if kind == "cmd-external-exe":
                 continue  # the first token of a script line is not an interpreter choice
             if kind == "cmd-network-fetch":
                 sev = "medium"  # scripts legitimately fetch things; the hook line itself is judged separately
             if kind not in first:
-                first[kind] = (n, sev, label)
-    return [
-        _finding(sev, kind, rel, f"script run by {source}: {label}", n)
-        for kind, (n, sev, label) in first.items()
-    ]
+                first[kind] = (sev, label, n)
+        if len(refs) < 64:
+            for ref in _script_refs(line):
+                refs.setdefault(ref)
+    for ref in _import_refs(rel, text):
+        refs.setdefault(ref)
+    return _ScriptInfo(
+        tuple((kind, sev, label, n) for kind, (sev, label, n) in first.items()), tuple(refs), ""
+    )
+
+
+def _follow_scripts(repo: _Repo, cmd: str, rel: str, source: str) -> list[Finding]:
+    """A hook usually just names a script: read it (never run it), apply the command checks to every line, and
+    follow what it runs or imports, to MAX_SCRIPT_DEPTH links, MAX_SCRIPTS_PER_COMMAND scripts and MAX_SCRIPT_BYTES
+    of text. A chain longer than that is a medium finding: silence about unread scripts would read as clean.
+
+    Each script is read as text whatever its bytes (an interpreter runs it, NUL or not) and analysed once per scan.
+    One that cannot be read is a medium finding. Besides the command patterns, network APIs of the script's own
+    language (urllib, require('https'), fetch(), sockets ...) count as a medium network finding.
+    """
+    out: list[Finding] = []
+    queue: deque[tuple[str, int]] = deque()
+    for tok in _script_refs(cmd):
+        queue.extend((s, 1) for s in _resolve_script(repo, tok))
+    seen: set[str] = set()
+    skipped: set[str] = set()
+    while queue:
+        script, depth = queue.popleft()
+        if script in seen:
+            continue
+        seen.add(script)
+        if len(seen) > MAX_SCRIPTS_PER_COMMAND or repo.out_of_time():
+            skipped.add(script)
+            continue
+        info = _script_info(repo, script)
+        if info.problem == "budget":
+            skipped.add(script)
+            continue
+        if info.problem:
+            why = _WHY.get(info.problem, info.problem)
+            out.append(
+                _finding("medium", "file-not-scanned", script, f"hook script not scanned: {why}")
+            )
+            continue
+        out.extend(
+            _finding(sev, kind, script, f"script run by {source}: {label}", n)
+            for kind, sev, label, n in info.hits
+        )
+        for ref in info.refs:
+            for nxt in _resolve_script(repo, ref, posixpath.dirname(script)):
+                if nxt in seen:
+                    continue
+                if depth >= MAX_SCRIPT_DEPTH:
+                    skipped.add(nxt)
+                else:
+                    queue.append((nxt, depth + 1))
+    if skipped:
+        out.append(
+            _finding(
+                "medium",
+                "file-not-scanned",
+                rel,
+                f"{source}: script chain not followed ({len(skipped)} referenced script(s) beyond the depth, "
+                "count or size limit were not read)",
+            )
+        )
+    return out
+
+
+def _script_info(repo: _Repo, rel: str) -> _ScriptInfo:
+    info = repo.scripts.get(rel)
+    if info is None:
+        info = repo.scripts[rel] = _analyze_script(repo, rel)
+    return info
 
 
 # ---------------------------------------------------------------------------------------------
@@ -1532,23 +2109,118 @@ _ENDPOINT_ENV = re.compile(
     r"|OTEL_EXPORTER_OTLP_(?:[A-Z]+_)?ENDPOINT|AWS_ENDPOINT_URL(?:_[A-Z0-9_]+)?)$"
 )
 _CREDENTIAL_ENV = re.compile(r"(?i)^(?:ANTHROPIC_(?:API_KEY|AUTH_TOKEN)|CLAUDE_CODE_OAUTH_TOKEN)$")
-# Project settings `env` is applied to Claude and every process it starts once the folder is trusted. These names
-# load code, choose which program runs, or redirect traffic. Names are compared upper-cased (Windows variables are
-# case-insensitive). The list is a pattern check, not a complete inventory of dangerous variables.
-_INJECTION_ENV = frozenset(
+# Project settings `env` is applied to Claude and every process it starts once the folder is trusted. Some names
+# load code or redirect where a program looks for its home, config or shell whatever the value (`always`); some
+# take a program as their value and are ordinary with a plain pager or editor name (`program`); some take
+# flags and only matter when a flag loads code or points at a path (`options`); PYTHONPATH takes directories and
+# only matters outside the project or where a `sitecustomize.py` would run (`pathlist`). Names are compared
+# upper-cased (Windows variables are case-insensitive). The list is a pattern check, not a complete inventory.
+_ENV_ALWAYS = frozenset(
     (
         "LD_PRELOAD LD_LIBRARY_PATH LD_AUDIT DYLD_INSERT_LIBRARIES DYLD_LIBRARY_PATH DYLD_FRAMEWORK_PATH "
-        "NODE_OPTIONS NODE_PATH NODE_EXTRA_CA_CERTS NODE_TLS_REJECT_UNAUTHORIZED "
-        "BASH_ENV ENV PROMPT_COMMAND SHELL EDITOR VISUAL PAGER MANPAGER BROWSER LESSOPEN "
-        "PYTHONSTARTUP PYTHONPATH PYTHONHOME PYTHONBREAKPOINT PYTHONUSERBASE PYTHONEXECUTABLE "
-        "RUBYOPT RUBYLIB PERL5OPT PERL5LIB JAVA_TOOL_OPTIONS _JAVA_OPTIONS JDK_JAVA_OPTIONS CLASSPATH "
-        "GIT_SSH GIT_SSH_COMMAND GIT_PROXY_COMMAND GIT_EXTERNAL_DIFF GIT_ASKPASS GIT_PAGER GIT_EDITOR "
-        "GIT_SEQUENCE_EDITOR GIT_EXEC_PATH GIT_TEMPLATE_DIR SSH_ASKPASS "
-        "SSL_CERT_FILE SSL_CERT_DIR REQUESTS_CA_BUNDLE CURL_CA_BUNDLE PIP_CONFIG_FILE"
+        "NODE_PATH NODE_EXTRA_CA_CERTS NODE_TLS_REJECT_UNAUTHORIZED "
+        "BASH_ENV ENV PROMPT_COMMAND PS4 SHELL SHELLOPTS BASHOPTS LESSOPEN "
+        "PYTHONSTARTUP PYTHONHOME PYTHONBREAKPOINT PYTHONUSERBASE PYTHONEXECUTABLE PYTHONINSPECT "
+        "RUBYOPT RUBYLIB PERL5OPT PERL5LIB CLASSPATH "
+        "GIT_SSH GIT_SSH_COMMAND GIT_PROXY_COMMAND GIT_EXTERNAL_DIFF GIT_ASKPASS GIT_EXEC_PATH "
+        "GIT_TEMPLATE_DIR SSH_ASKPASS SSH_AUTH_SOCK GNUPGHOME "
+        "SSL_CERT_FILE SSL_CERT_DIR REQUESTS_CA_BUNDLE CURL_CA_BUNDLE PIP_CONFIG_FILE "
+        "HOME USERPROFILE HOMEDRIVE HOMEPATH APPDATA LOCALAPPDATA ZDOTDIR PATHEXT "
+        "XDG_CONFIG_HOME XDG_CONFIG_DIRS XDG_DATA_HOME XDG_DATA_DIRS XDG_CACHE_HOME XDG_STATE_HOME "
+        "XDG_RUNTIME_DIR DOTNET_STARTUP_HOOKS"
     ).split()
 )
-_INJECTION_PREFIXES = ("LD_", "DYLD_", "GIT_CONFIG", "NPM_CONFIG_")
+_INJECTION_PREFIXES = ("LD_", "DYLD_", "GIT_CONFIG", "NPM_CONFIG_", "COR_", "CORECLR_")
 _INJECTION_PATTERN = re.compile(r"^(?:PIP|UV|POETRY|YARN)_[A-Z_]*(?:INDEX|REGISTRY|URL)[A-Z_]*$")
+_ENV_PROGRAM = frozenset(
+    "EDITOR VISUAL PAGER MANPAGER GIT_PAGER GIT_EDITOR GIT_SEQUENCE_EDITOR BROWSER COMSPEC CC CXX "
+    "RUSTC_WRAPPER RUSTC_WORKSPACE_WRAPPER".split()
+)
+_ENV_OPTIONS = frozenset(
+    "NODE_OPTIONS JAVA_TOOL_OPTIONS _JAVA_OPTIONS JDK_JAVA_OPTIONS MAVEN_OPTS GRADLE_OPTS GOFLAGS "
+    "RUSTFLAGS".split()
+)
+_ENV_PATHLIST = frozenset({"PYTHONPATH"})
+# a plain program name is ordinary as a pager, editor or compiler; anything with a path or a pipe is not
+_BENIGN_PROGRAMS = frozenset(
+    "cat less more most bat head tail vi vim nvim nano emacs ed pico code true false none : gcc g++ cc "
+    "c++ clang clang++ ccache sccache".split()
+)
+# flags that load code or run a command, and anything shaped like a path, a pipe or a substitution
+_RISKY_OPTION = re.compile(
+    r"(?:^|\s)(?:--?(?:require|import|loader|experimental-loader|eval|print|inspect[\w-]*|env-file"
+    r"|openssl-config)\b|-r(?=[\s=./\\~]|$)|-e(?=\s|$)|-p(?=\s|$)|-javaagent|-agentpath|-agentlib"
+    r"|-Xbootclasspath|-XX:(?:OnError|OnOutOfMemoryError|Flags|VMOptionsFile)|-toolexec|-exec\b"
+    r"|-overlay\b|-ldflags=[^\s]*-X\b)",
+    re.I,
+)
+_META = re.compile(r"[;|&`\n]|\$\(|\$\{")
+
+
+def _env_class(up: str) -> str | None:
+    if up in _ENV_ALWAYS or up.startswith(_INJECTION_PREFIXES) or _INJECTION_PATTERN.match(up):
+        return "always"
+    if up in _ENV_PROGRAM:
+        return "program"
+    if up in _ENV_OPTIONS:
+        return "options"
+    return "pathlist" if up in _ENV_PATHLIST else None
+
+
+def _env_risky(up: str, value: str, repo: _Repo | None) -> bool:
+    """True when setting this variable to this value loads code or redirects what a child process uses.
+
+    Not an injection variable at all, or an ordinary value (`PAGER=cat`, `NODE_OPTIONS=--max-old-space-size=4096`,
+    `PYTHONPATH=src`), is False.
+    """
+    cls = _env_class(up)
+    v = value.strip().strip("\"'")
+    if cls is None:
+        return False
+    if cls == "always":
+        return True
+    if not v:
+        return False
+    if cls == "program":
+        cmds = _shell_commands(v)
+        if len(cmds) != 1 or _META.search(v):
+            return True
+        exe, args = cmds[0][0], cmds[0][1:]
+        bare = exe == ":" or re.fullmatch(r"[a-z][a-z0-9+_-]*", exe) is not None
+        return not (
+            bare
+            and exe in _BENIGN_PROGRAMS
+            and all(a.startswith("-") and not _outside_arg(a) for a in args)
+        )
+    if cls == "options":
+        return bool(_RISKY_OPTION.search(v) or _META.search(v) or any(map(_outside_arg, v.split())))
+    for entry in _path_entries(v):  # pathlist
+        e = entry.strip().strip("\"'")
+        if not e:
+            continue
+        if _outside_arg(e) or e.startswith(("$", "%")):
+            return True
+        norm = posixpath.normpath(e.replace("\\", "/"))
+        if any(p.startswith(".") and p != "." for p in norm.split("/")):
+            return True  # `.claude/py`: a hidden directory is where payloads live
+        if repo is not None and any(
+            repo.lookup(f"{norm}/{name}") for name in ("sitecustomize.py", "usercustomize.py")
+        ):
+            return True  # imported by every Python process at start-up
+    return False
+
+
+def _risky_assignment(word: str) -> bool:
+    """`NAME=value` in front of a command (`LD_PRELOAD=./x.so ls`) that would be a finding in settings `env`."""
+    m = re.match(r"([A-Za-z_]\w*)=(.*)$", word, re.S)
+    if not m:
+        return False
+    up = m.group(1).upper()
+    if up == "PATH":
+        return any(_relative_path_entry(p) for p in _path_entries(m.group(2)))
+    return _env_risky(up, m.group(2), None)
+
+
 _CREDENTIAL_HELPER_KEYS = (
     "apiKeyHelper",
     "awsAuthRefresh",
@@ -1746,6 +2418,8 @@ def _check_settings(repo: _Repo, rel: str, text: str) -> list[Finding]:
     events: list[str] = []
     unvetted: list[str] = []
     for event, h in _iter_hooks(data):
+        if repo.out_of_time():
+            break
         events.append(event)
         if h.get("type") == "http" or ("url" in h and "command" not in h):
             url = h.get("url")
@@ -1851,19 +2525,16 @@ def _check_settings(repo: _Repo, rel: str, text: str) -> list[Finding]:
                     else "env sets PATH: it chooses which programs every process Claude starts runs",
                 )
             )
-        elif (
-            up in _INJECTION_ENV
-            or up.startswith(_INJECTION_PREFIXES)
-            or _INJECTION_PATTERN.match(up)
-        ):
-            out.append(
-                _finding(
-                    "high",
-                    "env-code-injection",
-                    rel,
-                    f"env sets {k}: loads code into, or redirects, child processes",
+        elif _env_class(up):
+            if _env_risky(up, val, repo):  # PAGER=cat or PYTHONPATH=src are ordinary: quiet
+                out.append(
+                    _finding(
+                        "high",
+                        "env-code-injection",
+                        rel,
+                        f"env sets {k}: loads code into, or redirects, child processes",
+                    )
                 )
-            )
         elif _secretish_key(key) and not _placeholder(val) and len(val) >= 8:
             if not _token_shaped(val):  # token-shaped values are reported by the secret scan
                 out.append(
@@ -2002,23 +2673,25 @@ def _runner_problems(tokens: list[str]) -> list[str]:
     for i, base in enumerate(bases):
         nxt = bases[i + 1] if i + 1 < len(bases) else ""
         nxt2 = bases[i + 2] if i + 2 < len(bases) else ""
-        rest = tokens[i + 1 :]
+        # the argument list is cut out only for a token that IS a runner: slicing it for every token was
+        # quadratic in the number of arguments
         if base in ("npx", "bunx", "pnpx"):
-            kind, args = "js", rest
+            kind, skip = "js", 1
         elif base in ("pnpm", "yarn") and nxt == "dlx":
-            kind, args = "js", rest[1:]
+            kind, skip = "js", 2
         elif base == "npm" and nxt in ("exec", "x"):
-            kind, args = "js", rest[1:]
+            kind, skip = "js", 2
         elif base == "bun" and nxt == "x":
-            kind, args = "js", rest[1:]
+            kind, skip = "js", 2
         elif base == "uvx":
-            kind, args = "py", rest
+            kind, skip = "py", 1
         elif base == "uv" and nxt == "tool" and nxt2 == "run":
-            kind, args = "py", rest[2:]
+            kind, skip = "py", 3
         elif base == "pipx" and nxt == "run":
-            kind, args = "py", rest[1:]
+            kind, skip = "py", 2
         else:
             continue
+        args = tokens[i + skip :]
         spec = _runner_spec(args)
         problem = _spec_problem(kind, spec) if spec else None
         return [f"{base} {problem}"] if problem else []
@@ -2050,6 +2723,8 @@ def _check_mcp(repo: _Repo, rel: str, text: str) -> list[Finding]:
     for name, spec in servers.items() if isinstance(servers, dict) else ():
         if not isinstance(spec, dict):
             continue
+        if repo.out_of_time():
+            break
         sname = _safe(name, 40)
         command = spec.get("command")
         if isinstance(command, str) and command.strip():
@@ -2118,9 +2793,23 @@ _IGNORE_RULES = [
         r"earlier|system|safety)\s+(?:instructions?|prompts?|rules?|guidelines?|polic(?:y|ies))\b",
         re.I,
     ),
+    # concealment, not house rules: "do not tell the user", "never mention THIS to the user", "hide it from the
+    # user". Ordinary rules such as "never show the user raw stack traces" or "don't mention the developer's name
+    # in commit messages" have a different object and are not matched.
     re.compile(
-        r"\b(?:do\s+not|don'?t|never)\s+(?:tell|inform|mention|reveal|disclose|alert|notify|show)\b"
-        r"[^.\n]{0,40}\b(?:user|human|operator|developer)\b",
+        r"\b(?:do\s+not|don'?t|never)\s+(?:tell|inform|alert|notify)\s+(?:the\s+|your\s+)?"
+        r"(?:user|human|operator)s?\b(?!\s+(?:to|how|which)\b)",
+        re.I,
+    ),
+    re.compile(
+        r"\b(?:do\s+not|don'?t|never)\s+(?:tell|mention|reveal|disclose|show|say|report)\s+"
+        r"(?:this|that|it|these|those|any\s+of\s+(?:this|that|it))\b[^.\n]{0,40}\b"
+        r"(?:user|human|operator|developer)\b",
+        re.I,
+    ),
+    re.compile(
+        r"\b(?:hide|conceal|withhold|keep\s+\w+\s+secret)\b[^.\n]{0,30}\bfrom\s+"
+        r"(?:the\s+|your\s+)?(?:user|human|operator|developer)\b",
         re.I,
     ),
     re.compile(
@@ -2244,6 +2933,8 @@ def _check_agent_config(repo: _Repo) -> list[Finding]:
             check, severity = None, "info"
         else:
             continue
+        if repo.out_of_time():
+            break
         # one hostile file (deeply nested JSON, ...) must not discard the findings of the others
         try:
             text = _load(repo, rel, out, severity)
@@ -2258,6 +2949,32 @@ def _check_agent_config(repo: _Repo) -> list[Finding]:
                     "medium", "symlink-outside-root", rel, "symlink resolves outside the repository"
                 )
             )
+    for rel in repo.loops:
+        surface = bool(_SURFACE_DIR_RE.search(rel))
+        out.append(
+            _finding(
+                "high" if surface else "low",
+                "symlink-to-ancestor",
+                rel,
+                "directory symlink resolves to one of its own parent directories: the same files appear under "
+                "several names"
+                + (
+                    "; Claude Code reads them as agent configuration (audited under this name)"
+                    if surface
+                    else ""
+                ),
+            )
+        )
+    for rel, sev in repo.unscanned:
+        out.append(
+            _finding(
+                sev,
+                "file-not-scanned",
+                rel,
+                "not scanned: the directory or entry cannot be listed or examined (permission denied or an "
+                "I/O error)",
+            )
+        )
     return out
 
 
@@ -2272,6 +2989,8 @@ _HIDDEN_OTHER = re.compile(
     "\u2060-\u2064\u2066-\u206f\u2800\u3164\ufe00-\ufe0f\ufeff\uffa0\ufff9-\ufffb"
     "\U0001d173-\U0001d17a\U000e0100-\U000e01ef]"
 )
+# a run of one repeated invisible character
+_HIDDEN_RUN = re.compile("(" + _HIDDEN_OTHER.pattern + ")\\1*")
 _TAGS = re.compile("[\U000e0000-\U000e007f]+")
 # The only tag sequences with a use: the three RGI subdivision flags (England, Scotland, Wales) = black flag + the
 # tag letters of gbeng/gbsct/gbwls + cancel tag. Anything else made of tag characters is hidden text, however it
@@ -2417,7 +3136,9 @@ def hidden_unicode(text: str) -> dict[str, tuple[int, list[int], set[int]]]:
 
     Benign uses (a leading BOM, emoji joiners and presentation selectors, direction marks inside right-to-left
     text, the England/Scotland/Wales flags) are ignored; every other tag character is reported, including the
-    ones inside a flag-shaped wrapper. At most MAX_HIDDEN_MATCHES characters are examined (counts saturate).
+    ones inside a flag-shaped wrapper. The whole text is examined, however many invisible characters it holds:
+    benign ones cost a cheap test and never use up anything, so a pile of them cannot push a payload out of
+    reach, and the counts are the real counts. (The file size is already bounded by the reader.)
     """
     counts: dict[str, int] = {}
     lines: dict[str, set[int]] = {}
@@ -2430,21 +3151,36 @@ def hidden_unicode(text: str) -> dict[str, tuple[int, list[int], set[int]]]:
             newlines = [m.start() for m in re.finditer("\n", text)]
         return bisect_left(newlines, off) + 1
 
-    def add(cat: str, n: int, off: int, cps) -> None:
+    def add(cat: str, n: int, off: int, cp: int) -> None:
         counts[cat] = counts.get(cat, 0) + n
-        lines.setdefault(cat, set()).add(line_of(off))
-        seen.setdefault(cat, set()).update(cps)
+        found = lines.setdefault(cat, set())
+        if len(found) < 64:  # matches come in order: the first lines are the ones that get reported
+            found.add(line_of(off))
+        seen.setdefault(cat, set()).add(cp)
 
-    for m in itertools.islice(_HIDDEN_OTHER.finditer(text), MAX_HIDDEN_MATCHES):
-        idx, cp = m.start(), ord(m.group())
-        if not _benign_hidden(text, idx, cp):
-            add(_hidden_category(cp), 1, idx, (cp,))
+    for m in _HIDDEN_RUN.finditer(text):
+        start, end = m.span()
+        cp = ord(m.group(1))
+        # Only the ends of a run of one repeated character can be excused by what is next to it (a joiner beside
+        # an emoji, a mark beside Arabic): a long run is judged at its edges and the middle is counted in bulk.
+        if end - start > 8:
+            middle = end - start - 6
+            add(_hidden_category(cp), middle, start + 3, cp)
+            idxs = [*range(start, start + 3), *range(end - 3, end)]
+        else:
+            idxs = range(start, end)
+        for idx in idxs:
+            if not _benign_hidden(text, idx, cp):
+                add(_hidden_category(cp), 1, idx, cp)
     # blank out the genuine flags (same length, so offsets and line numbers stay valid), flag every tag left
     scan = (
         _FLAG_SEQ.sub(lambda m: "\ufffd" * len(m.group()), text) if "\U0001f3f4" in text else text
     )
-    for m in itertools.islice(_TAGS.finditer(scan), MAX_HIDDEN_MATCHES):
-        add("tag-character", m.end() - m.start(), m.start(), set(map(ord, m.group())))
+    for m in _TAGS.finditer(scan):
+        n = m.end() - m.start()
+        add("tag-character", n, m.start(), ord(scan[m.start()]))
+        if n > 1:
+            seen["tag-character"].update(map(ord, set(m.group())))
     return {k: (n, sorted(lines[k]), seen[k]) for k, n in counts.items()}
 
 
@@ -2453,6 +3189,8 @@ def _check_hidden_unicode(repo: _Repo) -> list[Finding]:
     for rel in repo.files:
         if not any(p.search(rel) for p in _HIDDEN_SCOPE):
             continue
+        if repo.out_of_time():
+            break
         try:
             text, reason = repo.read(rel)
             if text is None:
@@ -2506,13 +3244,17 @@ _ADDRESS = [
     ),
     re.compile(r"\bwhen\s+(?:an?\s+)?(?:ai|llm|coding)\s+agent\s+(?:reads|sees|finds|is)\b", re.I),
 ]
+# What makes an address to agents worth a look: an install, a download, a sign-in, a paste of credentials. The bare
+# nouns (token, password, credentials, API key) are not enough: "never commit a token" is an ordinary rule.
 _ACTION = re.compile(
     r"\b(?:install(?:ing|ation)?|set\s?up|run\s+(?:the\s+following|this|these)|execute|download|"
-    r"sign[\s-]?in|log[\s-]?in|login|authenticat\w+|paste\s+(?:your|the)|api[_\s-]?key|token|"
-    r"credentials?|password|npx|pipx?\s+install|npm\s+(?:i|install)|brew\s+install|apt(?:-get)?\s+install|"
-    r"git\s+clone|curl|wget|iex|irm)\b",
+    r"sign[\s-]?in|log[\s-]?in|login|authenticat\w+|paste\s+(?:your|the)|"
+    r"(?:enter|provide|send|share|upload|post|submit|reveal|print|echo|type)\s+(?:\w+\s+){0,3}"
+    r"(?:api[_\s-]?key|token|credentials?|password)|npx|pipx?\s+install|npm\s+(?:i|install)|"
+    r"brew\s+install|apt(?:-get)?\s+install|git\s+clone|curl|wget|iex|irm)\b",
     re.I,
 )
+_HEADING = re.compile(r"^\s{0,3}#{1,6}\s")
 _TEXT_SCOPE = (README_RE, LLMS_RE, COPILOT_RE, CLAUDE_MD_RE)
 
 
@@ -2529,6 +3271,9 @@ def _agent_text_findings(rel: str, text: str) -> list[Finding]:
     directed: list[int] = []
     piped = False
     address_only: list[int] = []
+    # the whole of CLAUDE.md / AGENTS.md is addressed to agents: a heading such as "## Instructions for coding
+    # agents" is its title, not an aside, so it is only worth a note (a download piped into a shell still is)
+    for_agents = bool(CLAUDE_MD_RE.search(rel) or COPILOT_RE.search(rel))
     for i, line in enumerate(lines):
         if not any(p.search(line) for p in _ADDRESS):
             continue
@@ -2536,6 +3281,8 @@ def _agent_text_findings(rel: str, text: str) -> list[Finding]:
         if _pipe_to_shell(window):
             piped = True
             directed.append(i + 1)
+        elif for_agents and _HEADING.match(line):
+            address_only.append(i + 1)
         elif _ACTION.search(window):
             directed.append(i + 1)
         else:
@@ -2586,6 +3333,8 @@ def _check_agent_text(repo: _Repo) -> list[Finding]:
     for rel in repo.files:
         if not _in_text_scope(rel):
             continue
+        if repo.out_of_time():
+            break
         try:
             text, _ = repo.read(rel)
             if text is not None:
@@ -2600,16 +3349,21 @@ def _check_agent_text(repo: _Repo) -> list[Finding]:
 # ---------------------------------------------------------------------------------------------
 _USES = re.compile(r"""^\s*(?:-\s+)?uses\s*:\s*["']?([^\s"'#]+)["']?\s*$""")
 _PRIVILEGED = ("pull_request_target", "issue_comment", "workflow_run")
-_REF_KEY = re.compile(r"\bref\s*:")
+# `repository:` names the fork a head checkout comes from
+_REF_KEY = re.compile(r"\b(?:ref|repository)\s*:")
 _HEAD_TAIL = re.compile(
-    r"pull_request\.head|head_ref|refs/pull/|head\.sha|head\.ref|workflow_run\.head", re.I
+    r"pull_request\.head|head_ref|refs/pull/|head\.sha|head\.ref|workflow_run\.head|merge_commit_sha",
+    re.I,
 )
 _HEAD_OTHER = re.compile(r"\bgh\s+pr\s+checkout\b|refs/pull/|\bpull/\d+/head\b")
 _SECRET_USE = re.compile(r"\bsecrets\.(?!GITHUB_TOKEN\b)\w+|\bsecrets\s*:\s*inherit\b", re.I)
+# Fields a stranger controls (GitHub's own list): titles, bodies, labels, commit messages, author names, the pull
+# request's HEAD branch and its fork's default branch. `base.ref`, `repository.default_branch` and the like name
+# the target repository's own branches, which an attacker cannot choose, and stay quiet.
 _UNTRUSTED_CONTEXT = re.compile(
     r"\bgithub\.head_ref\b|\bgithub\.event\.(?:[\w*-]+\.){0,6}"
-    r"(?:title|body|ref|label|message|page_name|head_branch|default_branch|description|email|"
-    r"author\.name|committer\.name|pusher\.name)\b"
+    r"(?:title|body|label|message|page_name|head_branch|display_title|description|email|"
+    r"author\.name|committer\.name|pusher\.name|head\.(?:ref|repo\.default_branch))\b"
 )
 _SECRET_EXPR = re.compile(r"\bsecrets\.|\btojson\(\s*secrets\s*\)")
 _BRACKET = re.compile(r"""\[\s*(?:'([^'\[\]]{0,64})'|"([^"\[\]]{0,64})"|(\d{1,6}))\s*\]""")
@@ -2643,7 +3397,32 @@ def _expressions(body: str) -> list[str]:
 
 
 def _strip_comment(line: str) -> str:
-    return re.sub(r"(?:^|\s)#.*$", "", line) if "#" in line else line
+    """The line without its trailing comment: a `#` that starts the line or follows whitespace, outside quotes.
+
+    `#123` and `"a #b"` are text. Used for the lines YAML defines comments on (keys, plain values, the header of a
+    block scalar) and for judging what a shell would run; NOT for the body of a `run:` block as a whole: GitHub
+    expands `${{ }}` even inside a shell comment, so expressions are read from the raw body. Linear.
+    """
+    if "#" not in line:
+        return line
+    quote = ""
+    prev = " "
+    i, n = 0, len(line)
+    while i < n:
+        c = line[i]
+        if quote:
+            if c == "\\" and quote == '"' and i + 1 < n:
+                i += 1
+                c = line[i]  # an escaped character is text
+            elif c == quote:
+                quote = ""
+        elif c in "\"'":
+            quote = c
+        elif c == "#" and prev in " \t":
+            return line[:i].rstrip()
+        prev = c
+        i += 1
+    return line
 
 
 def _workflow_triggers(code: list[str]) -> set[str]:
@@ -2660,12 +3439,16 @@ def _workflow_triggers(code: list[str]) -> set[str]:
     return set()
 
 
-def _run_blocks(code: list[str]) -> list[tuple[int, str]]:
+def _run_blocks(code: list[str], raw: list[str] | None = None) -> list[tuple[int, str]]:
     """(line, text) of every `run:` body and every `script:` body (actions/github-script runs it as JavaScript).
 
-    Index-based (a slice per block was quadratic in the number of `run:` lines), and the total text taken is
-    bounded; an outer block always contains the blocks nested in it, so the bound never hides a later one.
+    `code` is the file with YAML comments stripped (where the keys and block ends are read); the body text comes
+    from `raw`, the same lines as written: inside a block scalar `#` is part of the script, and a `#123` or a
+    shell comment must not hide what follows it. Index-based (a slice per block was quadratic in the number of
+    `run:` lines), and the total text taken is bounded; an outer block always contains the blocks nested in it,
+    so the bound never hides a later one.
     """
+    raw = code if raw is None else raw
     blocks = []
     budget = MAX_BLOCK_CHARS
     n = len(code)
@@ -2681,8 +3464,11 @@ def _run_blocks(code: list[str]) -> list[tuple[int, str]]:
             nxt = code[j]
             if nxt.strip() and len(nxt) - len(nxt.lstrip(" ")) <= col:
                 break
-            body.append(nxt)
-            budget -= len(nxt) + 1
+            text = raw[j]
+            if not nxt.strip() and text.strip() and len(text) - len(text.lstrip(" ")) <= col:
+                break  # a whole-line comment at or left of the key sits outside the scalar
+            body.append(text)
+            budget -= len(text) + 1
             j += 1
         blocks.append((i + 1, "\n".join(body)))
         if budget <= 0:
@@ -2718,7 +3504,8 @@ def _jobs_without_permissions(code: list[str]) -> tuple[int, int] | None:
 
 
 def _workflow_findings(rel: str, text: str) -> list[Finding]:
-    code = [_strip_comment(ln) for ln in text.split("\n")]
+    raw = text.split("\n")
+    code = [_strip_comment(ln) for ln in raw]
     out: list[Finding] = []
 
     unpinned: dict[str, list[tuple[str, int]]] = {"medium": [], "low": []}
@@ -2799,9 +3586,10 @@ def _workflow_findings(rel: str, text: str) -> list[Finding]:
                 )
             )
 
-    for start, body in _run_blocks(code):
+    for start, body in _run_blocks(code, raw):
         # run: bodies and github-script `script:` bodies; wrapped (format(), fromJSON()), bracketed and
         # mixed-case spellings of an untrusted context are caught because the expression is normalised first
+        # (read from the raw body: GitHub expands ${{ }} before the shell sees a comment)
         exprs = _expressions(body)
         injected = [m.group(0) for e in exprs if (m := _UNTRUSTED_CONTEXT.search(e))]
         secrets = [e for e in exprs if _SECRET_EXPR.search(e)]
@@ -2827,7 +3615,7 @@ def _workflow_findings(rel: str, text: str) -> list[Finding]:
                     start,
                 )
             )
-        if _pipe_to_shell(body):
+        if _pipe_to_shell("\n".join(_strip_comment(ln) for ln in body.split("\n"))):
             out.append(
                 _finding(
                     "medium",
@@ -2844,6 +3632,8 @@ def _check_workflows(repo: _Repo) -> list[Finding]:
     out: list[Finding] = []
     for rel in repo.files:
         if WORKFLOW_RE.match(rel):
+            if repo.out_of_time():
+                break
             try:
                 text, reason = repo.read(rel)
                 if text is not None:
@@ -2919,6 +3709,23 @@ def _candidates(repo: _Repo) -> list[str]:
     return [f for f in repo.files if f in git[0] or f in git[1]]
 
 
+_SAMPLE_JWT = (
+    "eyJzdWIiOiIxMjM0NTY3ODkwIiwibmFtZSI6IkpvaG4gRG9lIiwiaWF0IjoxNTE2MjM5MDIyfQ"  # jwt.io's example
+)
+_BASE64_LINE = re.compile(r"[A-Za-z0-9+/=]+")
+
+
+def _sample_secret(label: str, value: str, text: str, end: int) -> bool:
+    """A match that is documentation, not a credential: the examples every vendor prints (`AKIA...EXAMPLE`,
+    jwt.io's token), a placeholder word in the value, a value made of a few repeated characters (`ghp_xxxx...`),
+    or a PEM header with no key under it (a real private key has hundreds of base64 characters after the line)."""
+    if label == "private key":
+        chunk = text[end : end + 2000].replace("\\n", "\n").split("-----END", 1)[0]
+        body = sum(len(s) for s in map(str.strip, chunk.split("\n")) if _BASE64_LINE.fullmatch(s))
+        return body < 64
+    return _placeholder(value) or _SAMPLE_JWT in value or len(set(value)) < 8
+
+
 def _secret_hits(text: str) -> list[tuple[int, str, str]]:
     """(line, label, matched text) for up to 20 token-shaped secrets, scanning line by line in bounded windows."""
     low_has_aws = "aws_secret" in text.lower()
@@ -2937,6 +3744,8 @@ def _secret_hits(text: str) -> list[tuple[int, str, str]]:
                 span = (off + m.start(), off + m.end())
                 if len(hits) >= 20 or any(a < span[1] and span[0] < b for a, b in taken):
                     continue
+                if _sample_secret(label, m.group(0), text, span[1]):
+                    continue  # documentation, not a credential (and not remembered: `taken` stays small)
                 taken.append(span)
                 hits.append((line_no, label, m.group(0)))
     return hits
@@ -3015,18 +3824,86 @@ def _check_secrets(repo: _Repo) -> list[Finding]:
     return out
 
 
-def _gitignore_covers(text: str, name: str) -> bool:
-    ignored = False
-    for raw in text.split("\n"):
+def _glob_match(pat: str, name: str) -> bool:
+    """`*`, `?`, `[set]`, `[!set]` / `[^set]` and `\\x` against a short file name, without `fnmatch`: its pattern
+    compiler is quadratic in the number of unclosed `[` (a 5,000-character line took seconds, a 512 KB one hours).
+    This is the usual one-restart wildcard match: at most len(pat) x len(name) steps, and a `[` is looked for with
+    str.find (C speed)."""
+    p = n = 0
+    star = mark = -1
+    while n < len(name):
+        step = 0  # characters of `pat` consumed by a single-character match at p
+        if p < len(pat):
+            c = pat[p]
+            if c == "*":
+                star, mark = p, n
+                p += 1
+                continue
+            if c == "?":
+                step = 1
+            elif c == "[":
+                close = pat.find("]", p + (3 if pat[p + 1 : p + 2] in ("!", "^") else 2))
+                if close == -1:
+                    step = 1 if name[n] == "[" else 0  # unclosed: a literal `[`
+                else:
+                    body = pat[p + 1 : close]
+                    neg = body[:1] in ("!", "^")
+                    body = body[1:] if neg else body
+                    hit = False
+                    i = 0
+                    while i < len(body):
+                        if i + 2 < len(body) and body[i + 1] == "-":
+                            hit = hit or body[i] <= name[n] <= body[i + 2]
+                            i += 3
+                        else:
+                            hit = hit or body[i] == name[n]
+                            i += 1
+                    step = close + 1 - p if hit != neg else 0
+            elif c == "\\" and p + 1 < len(pat):
+                step = 2 if pat[p + 1] == name[n] else 0
+            else:
+                step = 1 if c == name[n] else 0
+        if step:
+            p += step
+            n += 1
+        elif star != -1:
+            mark += 1
+            p, n = star + 1, mark
+        else:
+            return False
+    while p < len(pat) and pat[p] == "*":
+        p += 1
+    return p == len(pat)
+
+
+def _gitignore_patterns(text: str) -> tuple[list[tuple[bool, str]], int]:
+    """([(negated, glob)], skipped): the patterns worth evaluating, and how many lines were too long or past the
+    line limit (the hygiene check reports those instead of spending unbounded time on them)."""
+    pats: list[tuple[bool, str]] = []
+    skipped = 0
+    lines = text.split("\n")
+    for i, raw in enumerate(lines):
+        if i >= MAX_GITIGNORE_LINES:
+            skipped += sum(1 for ln in lines[i:] if ln.strip() and not ln.lstrip().startswith("#"))
+            break
         pat = raw.strip()
         if not pat or pat.startswith("#") or pat.endswith("/"):
             continue
+        if len(pat) > MAX_GITIGNORE_PATTERN:
+            skipped += 1
+            continue
         neg = pat.startswith("!")
-        pat = pat[1:] if neg else pat
-        pat = pat.lstrip("/")
+        pat = (pat[1:] if neg else pat).lstrip("/")
         if pat.startswith("**/"):
             pat = pat[3:]
-        if fnmatch.fnmatchcase(name, pat):
+        pats.append((neg, pat))
+    return pats, skipped
+
+
+def _gitignore_covers(text: str, name: str) -> bool:
+    ignored = False
+    for neg, pat in _gitignore_patterns(text)[0]:
+        if _glob_match(pat, name):
             ignored = not neg
     return ignored
 
@@ -3081,6 +3958,17 @@ def _check_hygiene(repo: _Repo) -> list[Finding]:
     if has_git:
         gi, _ = repo.read(".gitignore")
         gi = gi or ""
+        skipped = _gitignore_patterns(gi)[1]
+        if skipped:
+            out.append(
+                _finding(
+                    "low",
+                    "file-not-scanned",
+                    ".gitignore",
+                    f"{skipped} pattern line(s) were not evaluated (over {MAX_GITIGNORE_PATTERN} characters, or "
+                    f"past line {MAX_GITIGNORE_LINES}): the .env and CLAUDE.local.md checks below may be wrong",
+                )
+            )
         if not _gitignore_covers(gi, ".env"):
             present = bool(env_files)
             out.append(
@@ -3118,12 +4006,39 @@ _CHECKS = (
 )
 
 
-def _scan(root: Path | str, groups: frozenset[str]) -> list[Finding]:
+def _dependency_cut_finding(repo: _Repo) -> Finding | None:
+    """The dependency-tree limits (depth, entries per directory, directory budget) cut a search: say so.
+
+    Every installed node_modules or venv exceeds them, so a cut in an installed (git-ignored) tree is only a note;
+    where git says files of a cut directory are part of the repository (a committed node_modules), agent files
+    hidden below the limit are a real blind spot and the finding is medium.
+    """
+    if not repo.cuts:
+        return None
+    git = repo.git_files()
+    prefixes = tuple(repo.cuts)
+    in_repo = git is not None and any(f.startswith(prefixes) for f in itertools.chain(*git))
+    if in_repo:
+        sev, why = "medium", "some of them are part of the repository"
+    elif git is None:
+        sev, why = "info", "git could not say whether they are part of the repository"
+    else:
+        sev, why = "info", "they are installed or ignored, not part of the repository"
+    return _finding(
+        sev,
+        "scan-truncated",
+        ".",
+        f"dependency directories ({len(prefixes)} cut) were searched only to a bounded depth and size; agent "
+        f"files below the limit were not looked for ({why})",
+    )
+
+
+def _scan(root: Path | str, groups: frozenset[str], seconds: float | None = None) -> list[Finding]:
     try:
         root = Path(root)
         if not root.is_dir():
             return [_root_finding("info", "root-missing", root, "not a directory")]
-        repo = _Repo(root)
+        repo = _Repo(root, seconds)
         repo.walk()
     except Exception as exc:  # noqa: BLE001 - never raises; the audit just reports that it could not run
         return [
@@ -3134,17 +4049,12 @@ def _scan(root: Path | str, groups: frozenset[str]) -> list[Finding]:
                 f"could not read the repository: {type(exc).__name__}",
             )
         ]
+    if "files" in repo.trunc:
+        try:
+            repo.complete_from_git()  # build output fills the cap; git only lists what is part of the repo
+        except Exception:  # noqa: BLE001 - fail open: the cap stays reported
+            pass
     out: list[Finding] = []
-    if repo.truncated:
-        why = "; ".join(_TRUNCATION[k].format(n=MAX_WALK_ENTRIES) for k in sorted(repo.trunc))
-        out.append(
-            _finding(
-                "medium",
-                "scan-truncated",
-                ".",
-                f"the scan is incomplete: {why}",
-            )
-        )
     for group, check in _CHECKS:
         if group not in groups:
             continue
@@ -3156,6 +4066,15 @@ def _scan(root: Path | str, groups: frozenset[str]) -> list[Finding]:
                     "medium", "audit-error", ".", f"{group} check failed: {type(exc).__name__}"
                 )
             )
+    # after the checks: they can run out of time too
+    if repo.truncated:
+        why = "; ".join(_TRUNCATION[k].format(n=MAX_WALK_ENTRIES) for k in sorted(repo.trunc))
+        if seconds is not None and repo.trunc & {"time", "checks"}:
+            why += " (preflight incomplete: run `claude-hr-ctl audit` for the full scan)"
+        out.append(_finding("medium", "scan-truncated", ".", f"the scan is incomplete: {why}"))
+    cut = _dependency_cut_finding(repo)
+    if cut:
+        out.append(cut)
     return _sorted(out)
 
 
@@ -3168,9 +4087,12 @@ def preflight(root: Path | str) -> list[Finding]:
     """High and medium findings of the agent-config, hidden-Unicode and agent-text checks.
 
     The question it answers is "is this repo safe to run agent automation in?", so it skips workflow lint,
-    secrets and hygiene, and it is cheap enough for the verify gate.
+    secrets and hygiene, and it is cheap enough for the verify gate: it has its own short time budget
+    (MAX_PREFLIGHT_SECONDS), and when that runs out the result says "preflight incomplete" as a finding
+    instead of making `verify trust` wait for a hostile repository.
     """
-    return [f for f in _scan(root, PREFLIGHT_GROUPS) if f.severity in ("high", "medium")]
+    found = _scan(root, PREFLIGHT_GROUPS, MAX_PREFLIGHT_SECONDS)
+    return [f for f in found if f.severity in ("high", "medium")]
 
 
 # ---------------------------------------------------------------------------------------------
@@ -3351,11 +4273,28 @@ def _run_npm_audit(root: Path, timeout_s: float) -> ToolRun:
     name = "npm audit"
     if not (root / "package-lock.json").is_file():
         return ToolRun(name, "skipped", "no package-lock.json")
-    try:
-        with open(root / ".npmrc", "rb") as fh:
-            npmrc = fh.read(64 * 1024)
-    except OSError:
-        npmrc = b""
+    # the repository chooses what `.npmrc` is: only a plain file inside it, up to 64 KB, is read (a FIFO or a device
+    # would block, a link out of the repository would read someone else's file, and an unread tail could hide a
+    # `${NAME}`); anything else means npm is not run at all
+    npmrc_path = root / ".npmrc"
+    npmrc = b""
+    if os.path.lexists(npmrc_path):
+        try:
+            real = os.path.realpath(npmrc_path)
+            data = (
+                _read_regular(real, 64 * 1024 + 1)
+                if _within(real, os.path.realpath(root))
+                else None
+            )
+        except (OSError, ValueError):
+            data = None
+        if data is None or len(data) > 64 * 1024:
+            return ToolRun(
+                name,
+                "skipped",
+                "the repository's .npmrc is not a plain file inside it (or is over 64 KB); not run, review it first",
+            )
+        npmrc = data
     if b"${" in npmrc:
         # `registry=https://host/${NAME}` or `_authToken=${NAME}` sends an environment variable wherever the repo
         # says; the scrubbed environment already removes the obvious ones, so do not run npm at all
