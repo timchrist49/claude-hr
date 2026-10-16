@@ -1,0 +1,32 @@
+name: Feature request
+description: Propose a change or an addition
+title: "[feature] "
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What is hard or impossible today, and for whom. Describe the problem, not the solution.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed change
+      description: What you would like to happen. Include the commands, options or output you expect.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Other approaches and why they fall short, including doing nothing.
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: How we will know it works
+      description: Observable outcomes that show the change is done.
+      placeholder: |
+        - [ ] ...
+        - [ ] ...
