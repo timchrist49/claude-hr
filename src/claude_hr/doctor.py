@@ -8,7 +8,17 @@ import shutil
 import sys
 from pathlib import Path
 
-from . import claudemd, creds, paths, procutil, resources, schedule, sysinfo
+from . import (
+    baseline,
+    claude_setup,
+    claudemd,
+    creds,
+    paths,
+    procutil,
+    resources,
+    schedule,
+    sysinfo,
+)
 from .checks import FAIL, INFO, OK, WARN, Check
 from .claude_setup import ClaudeSetup
 from .config import Config
@@ -61,13 +71,106 @@ def _security_guidance() -> dict | None:
 
 
 def _verify_state(cwd: Path) -> str | None:
-    """no-config | invalid | untrusted | modified | trusted for the repository in `cwd`; None if it cannot be told."""
+    """no-config | invalid | untrusted | modified | trusted for the repository that contains `cwd` (the end-of-turn gate and
+    `verify status` both use the git top level, so doctor run from a subdirectory must too); None if it cannot be told."""
     try:
-        from . import verify
+        from . import verify, worktree
 
-        return verify.trust_state(cwd, paths.state_dir())
+        return verify.trust_state(worktree.repo_root(cwd) or cwd, paths.state_dir())
     except Exception:  # noqa: BLE001 - doctor must never crash on an optional check
         return None
+
+
+def _footprint_check(cfg: Config, listing: list[dict]) -> Check | None:
+    """Estimated always-on tokens of the installed plugins against footprint.budget_standard_tokens (standard profile only).
+
+    Costs nothing extra: it reuses the `claude plugin list --json` data the plugins check already fetched, and reads only the
+    plugin files `claude-hr-ctl footprint` would. None (no check) when there is nothing to measure or anything goes wrong."""
+    if str(cfg.get("plugins.profile", "standard")) != "standard" or not listing:
+        return None
+    try:
+        from . import footprint
+
+        fps = footprint.scan_installed(listing)
+        tokens = footprint.always_on_tokens(fps)
+        budget = int(cfg.get("footprint.budget_standard_tokens", 1500))
+    except Exception:  # noqa: BLE001 - an optional estimate must never break doctor
+        return None
+    over = tokens > budget
+    return Check(
+        "footprint",
+        WARN if over else OK,
+        f"~{tokens:,} always-on tokens from {len(fps)} plugin(s); budget {budget:,}"
+        + (f": OVER by {tokens - budget:,}" if over else ""),
+        "claude-hr-ctl footprint   (per-plugin table; `claude-hr-ctl plugins audit` shows what to disable)"
+        if over
+        else "",
+    )
+
+
+REAPPLY = "claude-hr-ctl setup --only settings claude-md plugins"
+
+
+def _managed_settings_check(cfg: Config, hr: Headroom, claude: Path | None) -> Check:
+    """Is the managed baseline applied, and is it the one this release would apply?
+
+    Two things make an applied baseline stale: setup was last run by another claude-hr version (the unattended self-update
+    replaces the code but applies nothing; the daily update job re-applies it, doctor says so until then), and a pending
+    change in `setup`'s own dry run (config edited since, a value added by a release). Keys the user changed (`kept`) are
+    theirs and never counted."""
+    state_file = paths.state_dir() / "settings-merge.json"
+    try:
+        st = read_json(state_file, None)
+    except JsonFileError as exc:
+        return Check(
+            "managed settings",
+            FAIL,
+            str(exc),
+            f"fix or delete {state_file}, then: claude-hr-ctl setup --only settings",
+        )
+    if not st:
+        return Check("managed settings", WARN, "baseline not applied", "claude-hr-ctl setup")
+    detail = f"{len(st.get('leaves', {}))} keys managed"
+    problems: list[str] = []
+    stale, applied = claude_setup.baseline_is_stale()
+    if stale:
+        problems.append(
+            f"applied by claude-hr {applied or 'before 0.2.0'}, this is {claude_setup.running_version()}: "
+            "settings, CLAUDE.md and plugins may lack what this release adds"
+        )
+    try:
+        rep = ClaudeSetup(cfg, hr, claude, dry=True).plan_settings()[3]
+    except Exception:  # noqa: BLE001 - an unreadable settings.json is reported by its own check
+        rep = None
+    if rep is not None and rep.set:
+        shown = ", ".join(rep.set[:3]) + (" ..." if len(rep.set) > 3 else "")
+        problems.append(f"{len(rep.set)} baseline setting(s) not applied yet ({shown})")
+    if not problems:
+        return Check("managed settings", OK, detail)
+    return Check(
+        "managed settings",
+        WARN,
+        f"{detail}; " + "; ".join(problems),
+        REAPPLY if stale else "claude-hr-ctl setup --only settings",
+    )
+
+
+def _read_user_json(path: Path, name: str, out: list[Check]) -> dict:
+    """A JSON file Claude or claude-hr wrote. Unparsable: report it as a failed check and carry on with {} (doctor is the tool
+    that finds such problems, so it must not die on them, and claude-hr never rewrites the file)."""
+    try:
+        data = read_json(path, {}) or {}
+    except JsonFileError as exc:
+        out.append(
+            Check(
+                name,
+                FAIL,
+                str(exc),
+                "fix the JSON by hand or restore a backup (claude-hr never overwrites an unparsable file)",
+            )
+        )
+        return {}
+    return data if isinstance(data, dict) else {}
 
 
 def run(cfg: Config, cwd: Path, deep: bool = False) -> list[Check]:
@@ -210,6 +313,17 @@ def run(cfg: Config, cwd: Path, deep: bool = False) -> list[Check]:
             )
         )
 
+    if baseline.stop_review_mode(cfg) == "unknown":
+        out.append(
+            Check(
+                "security.stop_review",
+                WARN,
+                f"unrecognised value {cfg.get('security.stop_review')!r}: treated like plugin-default, so "
+                "security-guidance's per-turn Opus review stays ON",
+                "claude-hr-ctl config set security.stop_review off   (or plugin-default to keep the review on purpose)",
+            )
+        )
+
     # ---- tools ----------------------------------------------------------------------------
     out.append(
         Check(
@@ -230,6 +344,7 @@ def run(cfg: Config, cwd: Path, deep: bool = False) -> list[Check]:
     )
 
     # ---- Headroom -------------------------------------------------------------------------
+    reg = _read_user_json(paths.claude_global_json(), ".claude.json", out)
     if cfg.flag("headroom.enabled", True):
         b = hr.binary()
         if not b:
@@ -263,7 +378,6 @@ def run(cfg: Config, cwd: Path, deep: bool = False) -> list[Check]:
                         "claude-hr-ctl headroom start   (cold start takes up to ~1 min)",
                     )
                 )
-            reg = read_json(paths.claude_global_json(), {}) or {}
             have = set((reg.get("mcpServers") or {}).keys())
             if cfg.flag("headroom.mcp", True) and "headroom" not in have:
                 out.append(
@@ -289,15 +403,7 @@ def run(cfg: Config, cwd: Path, deep: bool = False) -> list[Check]:
                 )
 
     # ---- config drift ---------------------------------------------------------------------
-    st = read_json(paths.state_dir() / "settings-merge.json", None)
-    out.append(
-        Check(
-            "managed settings",
-            OK if st else WARN,
-            f"{len(st.get('leaves', {}))} keys managed" if st else "baseline not applied",
-            "" if st else "claude-hr-ctl setup",
-        )
-    )
+    out.append(_managed_settings_check(cfg, hr, claude))
     md = paths.claude_user_md()
     has_block = md.exists() and "CLAUDE-HR:BEGIN" in md.read_text(encoding="utf-8", errors="ignore")
     out.append(
@@ -323,14 +429,16 @@ def run(cfg: Config, cwd: Path, deep: bool = False) -> list[Check]:
     # ---- plugins --------------------------------------------------------------------------
     if claude:
         setup = ClaudeSetup(cfg, hr, claude)
-        installed = {
-            p["id"].split("@")[0] for p in setup._installed_plugins() if p.get("scope") == "user"
-        }
+        # the one `claude plugin list` call: the footprint check below reuses its answer
+        listing = setup._installed_plugins()
+        installed = {p["id"].split("@")[0] for p in listing if p.get("scope") == "user"}
         plan = setup.plugin_plan()
         try:
+            # what `plugins sync` would install: a plugin from a marketplace that is switched off (headroom.install_plugins
+            # = false) is not wanted, or the warning below could never be cleared
             wanted = {
                 w.split("@")[0]
-                for w in setup.profile_plugins(plan, str(cfg.get("plugins.profile", "standard")))
+                for w in setup.effective_plugins(plan, str(cfg.get("plugins.profile", "standard")))
             }
         except KeyError:
             wanted = set()
@@ -343,6 +451,9 @@ def run(cfg: Config, cwd: Path, deep: bool = False) -> list[Check]:
                 f"claude-hr-ctl plugins sync   (missing: {', '.join(missing)})" if missing else "",
             )
         )
+        fp_check = _footprint_check(cfg, listing)
+        if fp_check:
+            out.append(fp_check)
 
     # ---- resources ------------------------------------------------------------------------
     total, avail = sysinfo.memory_gb()
@@ -418,7 +529,10 @@ def run(cfg: Config, cwd: Path, deep: bool = False) -> list[Check]:
             "claude-hr-ctl schedule install" if "no scheduled" in jobs[0] else "",
         )
     )
-    out += creds.run_checks(cfg)
+    try:
+        out += creds.run_checks(cfg)
+    except Exception as exc:  # noqa: BLE001 - e.g. an unparsable ~/.claude.json, already reported above
+        out.append(Check("credentials", WARN, f"credential checks could not run: {exc}"))
     return out
 
 

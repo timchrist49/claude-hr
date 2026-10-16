@@ -18,7 +18,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 
 from . import paths, procutil, resources
-from .claude_setup import ClaudeSetup
+from .claude_setup import ClaudeSetup, Step, baseline_is_stale, record_applied_version
 from .config import Config
 from .headroom import Headroom
 from .jsonio import read_json, write_json
@@ -461,6 +461,53 @@ class Updater:
             res.action, res.detail = "failed", "; ".join(step.lines)[-160:]
         return res
 
+    # ---- baseline (what the new claude-hr release wants in settings.json, CLAUDE.md and the plugin set) ---------------------
+    def reapply_baseline(self) -> Result | None:
+        """After claude-hr itself was upgraded, make the machine match the new release: run the idempotent `setup` steps
+        `settings`, `claude-md` and `plugins` (exactly what `claude-hr-ctl setup --only settings claude-md plugins` does:
+        no Headroom install, no scheduler change). The unattended self-update only replaces the code, so without this a new
+        release's settings baseline (permission rules, env defaults) and plugins would wait for a person to run `setup`.
+
+        Keyed on state/applied-version.json (written by `setup`): nothing happens when it names the running version, on a dry
+        run, or on a machine `setup` never ran on. The version is recorded only when every step succeeded, so a failure
+        (offline, unparsable settings.json) is retried by the next run. Never raises."""
+        if self.dry:
+            return None
+        from . import __version__
+
+        res = Result("baseline")
+        try:
+            stale, applied = baseline_is_stale()
+            if not stale:
+                return None
+            res.current, res.target = applied or "before 0.2.0", __version__
+            setup = ClaudeSetup(self.cfg, self.hr, self.claude)
+            steps = [
+                setup.apply_settings(),
+                setup.sync_claude_md(),
+                setup.sync_plugins()
+                if self.claude
+                else Step("plugins", ok=False, lines=["claude not found"]),
+            ]
+            parts = []
+            for st in steps:
+                part = (
+                    f"{st.name} {'ok' if st.ok else 'FAILED'}{' (changed)' if st.changed else ''}"
+                )
+                if not st.ok and st.lines:
+                    part += f": {st.lines[0][:120]}"
+                parts.append(part)
+            if all(st.ok for st in steps):
+                record_applied_version()
+                res.action = "updated"
+            else:
+                res.action = "failed"
+                parts.append("will retry at the next update")
+            res.detail = "re-applied the managed baseline after the upgrade: " + ", ".join(parts)
+        except Exception as exc:  # noqa: BLE001 - fail open: the update job must go on
+            res.action, res.detail = "failed", f"{type(exc).__name__}: {exc}"
+        return res
+
     # ---- self (claude-hr itself) ----------------------------------------------------------------------
     def update_self(self) -> Result:
         repo = paths.hr_home() / "repo"
@@ -652,11 +699,16 @@ class Updater:
             "self": self.update_self,
         }
         report = Report()
-        for name in order:
+        # a full update starts by bringing the machine up to the release that is already installed (see reapply_baseline)
+        steps = [("baseline", self.reapply_baseline)] if components is None else []
+        steps += [(name, fns[name]) for name in order]
+        for name, fn in steps:
             try:
-                res = fns[name]()
+                res = fn()
             except Exception as exc:  # one broken component must not block the others
                 res = Result(name, action="failed", detail=f"{type(exc).__name__}: {exc}")
+            if res is None:  # nothing to do for this step: no row, no log line
+                continue
             report.results.append(res)
             _log(
                 {

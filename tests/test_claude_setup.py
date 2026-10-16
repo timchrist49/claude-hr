@@ -235,3 +235,239 @@ def test_profiles_are_lean_and_resolve(setup):
     assert set(process) < full and "skill-creator@claude-plugins-official" in full
     assert "ponytail@claude-hr" not in full  # third-party behaviour layer stays a deliberate choice
     assert "code-simplifier@claude-plugins-official" in plan["redundant"]
+
+
+# ---- wiring review: permission rules follow the claude-hr home, setup records what it applied -------------------------
+def _deny_ask():
+    from claude_hr import baseline
+
+    doc, _ = baseline.build(config.load())
+    return doc["permissions"]["deny"], doc["permissions"]["ask"]
+
+
+def test_state_deny_follows_a_claude_hr_home_outside_the_user_home(sandbox, tmp_path, monkeypatch):
+    """The deny rule was the literal ~/.claude-hr/state/**: with CLAUDE_HR_HOME elsewhere the trust record was unprotected."""
+    custom = tmp_path / "data" / "hrhome"
+    monkeypatch.setenv("CLAUDE_HR_HOME", str(custom))
+    deny, ask = _deny_ask()
+    state = [r for r in deny if "hrhome" in r]
+    assert sorted(r.split("(")[0] for r in state) == ["Edit", "Write"]
+    for rule in state:
+        inner = rule[rule.index("(") + 1 : -1]
+        assert inner.startswith("//") and inner.endswith("/hrhome/state/**"), rule
+        assert (
+            "\\" not in rule and "~" not in rule
+        )  # an absolute, forward-slash rule, not home-relative
+    # the default home stays protected too: an install whose runtime falls back to it is still covered
+    assert "Edit(~/.claude-hr/state/**)" in deny and "Write(~/.claude-hr/state/**)" in deny
+    # config.toml (formatter trust, launch flags, alert command ...) is asked about, not denied
+    cfg_rules = [r for r in ask if r.endswith("/hrhome/config.toml)")]
+    assert sorted(r.split("(")[0] for r in cfg_rules) == ["Edit", "Write"]
+    assert "Edit(~/.claude-hr/config.toml)" in ask and "Write(~/.claude-hr/config.toml)" in ask
+    assert not [r for r in deny if "config.toml" in r]
+
+
+def test_state_deny_uses_a_home_relative_rule_below_the_user_home(sandbox, monkeypatch):
+    monkeypatch.setenv("CLAUDE_HR_HOME", str(sandbox / "tools" / "hr"))
+    deny, ask = _deny_ask()
+    assert "Edit(~/tools/hr/state/**)" in deny and "Write(~/tools/hr/state/**)" in deny
+    assert "Edit(~/tools/hr/config.toml)" in ask and "Write(~/tools/hr/config.toml)" in ask
+
+
+def test_default_home_adds_each_rule_exactly_once(sandbox):
+    deny, ask = _deny_ask()
+    assert deny.count("Edit(~/.claude-hr/state/**)") == 1
+    assert ask.count("Write(~/.claude-hr/config.toml)") == 1
+    assert len(deny) == len(set(deny)) and len(ask) == len(set(ask))
+
+
+@pytest.mark.skipif(paths.IS_WINDOWS, reason="POSIX spelling")
+def test_rule_path_spellings_posix(sandbox):
+    from claude_hr import baseline
+
+    assert baseline.rule_path("/data/hr/state") == "//data/hr/state"
+    assert baseline.rule_path(sandbox / ".claude-hr") == "~/.claude-hr"
+
+
+@pytest.mark.skipif(not paths.IS_WINDOWS, reason="Windows spelling")
+def test_rule_path_spellings_windows(sandbox):
+    from claude_hr import baseline
+
+    assert baseline.rule_path("D:\\hr\\state") == "//d/hr/state"
+    assert baseline.rule_path(sandbox / ".claude-hr") == "~/.claude-hr"
+
+
+def test_home_rules_merge_once_move_with_the_home_and_uninstall_removes_exactly_them(
+    setup, sandbox, tmp_path, monkeypatch
+):
+    target = paths.claude_settings()
+    mine = {"permissions": {"deny": ["Read(mine)"], "ask": ["Bash(mine)"]}, "model": "opusplan"}
+    target.write_text(json.dumps(mine), encoding="utf-8")
+    monkeypatch.setenv("CLAUDE_HR_HOME", str(tmp_path / "data" / "hrhome"))
+    setup.cfg = config.load()
+    setup.apply_settings()
+    setup.apply_settings()  # a second setup must not duplicate anything
+    doc = json.loads(target.read_text(encoding="utf-8"))
+    for key in ("deny", "ask"):
+        assert len(doc["permissions"][key]) == len(set(doc["permissions"][key]))
+    assert any(r.endswith("/hrhome/state/**)") for r in doc["permissions"]["deny"])
+    assert any(r.endswith("/hrhome/config.toml)") for r in doc["permissions"]["ask"])
+    # the home is moved (its state/ goes with it): the old home's rules are retired, the new one's added, no duplicates
+    record = (paths.state_dir() / "settings-merge.json").read_text(encoding="utf-8")
+    monkeypatch.setenv("CLAUDE_HR_HOME", str(tmp_path / "data" / "other"))
+    paths.state_dir().mkdir(parents=True)
+    (paths.state_dir() / "settings-merge.json").write_text(record, encoding="utf-8")
+    setup2 = claude_setup.ClaudeSetup(config.load(), setup.hr, setup.claude)
+    setup2.apply_settings()
+    deny = json.loads(target.read_text(encoding="utf-8"))["permissions"]["deny"]
+    assert not [r for r in deny if "/hrhome/" in r] and any("/other/state/**" in r for r in deny)
+    assert len(deny) == len(set(deny))
+    # uninstall removes exactly what claude-hr added: the user's own rules and keys are all that is left
+    setup2.revert_settings()
+    assert json.loads(target.read_text(encoding="utf-8")) == mine
+
+
+@pytest.mark.parametrize(
+    "value, mode",
+    [
+        ("off", "off"),
+        ("Off", "off"),
+        ("OFF", "off"),
+        ("false", "off"),  # stored as a TOML boolean by `config set`
+        ("0", "off"),  # stored as an integer
+        ("no", "off"),
+        ("disabled", "off"),
+        ("plugin-default", "plugin-default"),
+        ("true", "plugin-default"),
+        ("of", "unknown"),  # a typo is neither: the review stays on and doctor says so
+    ],
+)
+def test_stop_review_accepts_the_usual_spellings_of_off(sandbox, monkeypatch, value, mode):
+    from claude_hr import baseline
+
+    monkeypatch.setenv("CLAUDE_HR_SECURITY__STOP_REVIEW", value)
+    cfg = config.load()
+    assert baseline.stop_review_mode(cfg) == mode
+    doc, _ = baseline.build(cfg)
+    assert (doc["env"].get("ENABLE_STOP_REVIEW") == "0") is (mode == "off")
+
+
+def test_config_set_false_turns_the_stop_review_off(sandbox):
+    """The reported case: `config set security.stop_review false` stored a boolean and the review silently stayed on."""
+    from claude_hr import baseline, ctl
+
+    assert ctl._run(["config", "set", "security.stop_review", "false"]) == 0
+    doc, _ = baseline.build(config.load())
+    assert doc["env"]["ENABLE_STOP_REVIEW"] == "0"
+
+
+def test_setup_records_the_version_whose_baseline_it_applied(sandbox, monkeypatch):
+    from claude_hr import __version__, ctl
+
+    assert claude_setup.applied_version() is None
+    assert ctl._run(["setup", "--only", "claude-md", "--dry-run"]) == 0
+    assert ctl._run(["setup", "--only", "claude-md"]) == 0
+    assert claude_setup.applied_version() is None  # the settings baseline was not part of that run
+    assert ctl._run(["setup", "--only", "settings", "--dry-run"]) == 0
+    assert claude_setup.applied_version() is None  # a dry run applies nothing
+    assert ctl._run(["setup", "--only", "settings", "claude-md"]) == 0
+    assert claude_setup.applied_version() == __version__
+    assert claude_setup.baseline_is_stale() == (False, __version__)
+    monkeypatch.setattr("claude_hr.__version__", "9.9.9")  # a newer release is installed unattended
+    assert claude_setup.baseline_is_stale() == (True, __version__)
+
+
+def test_a_failed_baseline_step_is_not_recorded_as_applied(sandbox):
+    from claude_hr import ctl
+
+    paths.claude_settings().write_text("{ not json", encoding="utf-8")
+    assert ctl._run(["setup", "--only", "settings", "claude-md"]) == 1
+    assert claude_setup.applied_version() is None
+
+
+def test_baseline_is_not_stale_on_a_machine_setup_never_ran_on(sandbox):
+    assert claude_setup.baseline_is_stale() == (False, None)
+
+
+def test_revert_survives_an_unparsable_settings_file_and_keeps_the_record(setup, sandbox):
+    setup.apply_settings()
+    state = paths.state_dir() / "settings-merge.json"
+    paths.claude_settings().write_text('{"theme": "dark",}', encoding="utf-8")
+    step = setup.revert_settings()
+    assert not step.ok and "settings.json" in step.lines[0]
+    assert "NOT reverted" in " ".join(step.lines)
+    assert paths.claude_settings().read_text(encoding="utf-8") == '{"theme": "dark",}'
+    assert state.exists()  # a later uninstall still knows which keys are ours
+    state.write_text("{ broken", encoding="utf-8")
+    assert (
+        not setup.revert_settings().ok
+    )  # a damaged ownership record is reported too, never a traceback
+    assert not setup.apply_settings().ok
+
+
+def test_unreadable_claude_json_fails_the_mcp_steps_without_a_traceback(setup, sandbox):
+    paths.claude_global_json().write_text('{"mcpServers": {"a":', encoding="utf-8")
+    assert not setup.register_mcp().ok
+    assert not setup.unregister_mcp().ok
+    assert paths.claude_global_json().read_text(encoding="utf-8") == '{"mcpServers": {"a":'
+
+
+def _quiet_uninstall(monkeypatch):
+    """Nothing in an uninstall test may reach the real machine: no scheduler, no claude, no proxy."""
+    from claude_hr import ctl
+
+    monkeypatch.setattr(ctl.schedule, "remove", lambda: [])
+    monkeypatch.setattr(ctl.procutil, "find_claude", lambda *a, **k: None)
+    monkeypatch.setattr(ctl.Headroom, "stop", lambda self: False)
+    monkeypatch.setattr(
+        ctl.procutil, "run", lambda *a, **k: subprocess.CompletedProcess(a, 0, "", "")
+    )
+    return ctl
+
+
+def test_uninstall_skips_an_unreadable_settings_file_runs_the_rest_and_exits_nonzero(
+    setup, sandbox, monkeypatch, capsys
+):
+    setup.apply_settings()
+    setup.sync_claude_md()
+    broken = '{"theme": "dark",}'
+    paths.claude_settings().write_text(broken, encoding="utf-8")
+    ctl = _quiet_uninstall(monkeypatch)
+    assert ctl._run(["uninstall"]) == 1
+    text = capsys.readouterr().out
+    assert "[ERR] settings-revert" in text and "INCOMPLETE" in text
+    assert paths.claude_settings().read_text(encoding="utf-8") == broken  # untouched
+    assert (paths.state_dir() / "settings-merge.json").exists()
+    md = paths.claude_user_md()
+    assert "CLAUDE-HR:BEGIN" not in (md.read_text(encoding="utf-8") if md.exists() else "")
+    # ... the steps after the failed one still ran
+
+
+def test_uninstall_purge_keeps_the_ownership_record_when_settings_could_not_be_reverted(
+    setup, sandbox, monkeypatch, capsys
+):
+    setup.apply_settings()
+    paths.claude_settings().write_text("{ nope", encoding="utf-8")
+    ctl = _quiet_uninstall(monkeypatch)
+    assert ctl._run(["uninstall", "--purge"]) == 1
+    assert (
+        paths.state_dir() / "settings-merge.json"
+    ).exists()  # purge must not destroy what a retry needs
+    assert "was kept" in capsys.readouterr().out
+
+
+def test_effective_plugins_drop_a_marketplace_that_is_switched_off(setup, monkeypatch):
+    plan = setup.plugin_plan()
+    assert "headroom-snip@headroom-marketplace" in setup.effective_plugins(plan, "standard")
+    monkeypatch.setenv("CLAUDE_HR_HEADROOM__INSTALL_PLUGINS", "false")
+    setup.cfg = config.load()
+    eff = setup.effective_plugins(plan, "standard")
+    assert "headroom-snip@headroom-marketplace" not in eff and "hr-gates@claude-hr" in eff
+    assert "headroom-snip@headroom-marketplace" in setup.profile_plugins(plan, "standard")
+
+
+def test_plugin_listing_tolerates_wrapped_or_odd_output(setup):
+    setup.fake.installed = {"plugins": [{"id": "a@b", "scope": "user"}, "junk", {"nope": 1}]}
+    assert setup._installed_plugins() == [{"id": "a@b", "scope": "user"}]
+    setup.fake.installed = "text"
+    assert setup._installed_plugins() == []
