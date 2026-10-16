@@ -313,22 +313,36 @@ def _cmd_shim_unsafe(argv: list[str]) -> bool:
 
 # ---- locating tools --------------------------------------------------------------------------------------------
 
-_WHICH_CACHE: dict[tuple[str, str], str] = {}
+_WHICH_CACHE: dict[tuple[str, str, str], str] = {}
 
 
-def _which(name: str) -> str | None:
+def _inside(p: str | Path, root: Path) -> str | None:
+    """`p` relative to `root` (posix) when it lives inside it, else None. Purely lexical, like the refusals below."""
+    try:
+        return Path(os.path.abspath(p)).relative_to(os.path.abspath(root)).as_posix()
+    except ValueError:
+        return None
+
+
+def _which(name: str, outside: Path | None = None) -> str | None:
     """First `name` on PATH. Relative PATH entries are ignored: the hook's cwd is the (untrusted) repo and a bare
-    relative entry (or Windows' implicit current directory) would resolve a planted binary there."""
+    relative entry (or Windows' implicit current directory) would resolve a planted binary there.
+
+    outside: skip hits that live inside this directory (an activated project .venv is on PATH, but it is the
+    project's own copy, not a global one)."""
     path_env = os.pathsep.join(
         d for d in os.environ.get("PATH", "").split(os.pathsep) if d and os.path.isabs(d)
     )
-    key = (name, path_env)
+    key = (name, path_env, os.path.abspath(outside) if outside is not None else "")
     hit = _WHICH_CACHE.get(key)
     if hit and os.path.isfile(hit):
         return hit
     for found in procutil.iter_which(name, path_env):
-        _WHICH_CACHE[key] = os.path.abspath(found)
-        return _WHICH_CACHE[key]
+        found = os.path.abspath(found)
+        if outside is not None and _inside(found, outside) is not None:
+            continue
+        _WHICH_CACHE[key] = found
+        return found
     return None
 
 
@@ -415,7 +429,13 @@ def _toml_has_table(text: str, *names: str) -> bool:
     return False
 
 
-def _find_python_tool(name: str, dirs: list[Path]) -> str | None:
+def _find_python_tool(
+    name: str, dirs: list[Path], *, where: str = "any", root: Path | None = None
+) -> str | None:
+    """Where a python formatter is installed. where="any": the project's own .venv copy, else PATH (the pinned version
+    wins over a global one); where="path": only a copy on PATH outside `root`, never the project's own."""
+    if where == "path":
+        return _which(name, outside=root)
     sub = "Scripts" if paths.IS_WINDOWS else "bin"
     for d in dirs:
         hit = _find_exe(d / ".venv" / sub, name)
@@ -432,7 +452,13 @@ def _find_node_tool(name: str, dirs: list[Path]) -> str | None:
     return None  # never npx: that downloads
 
 
-def _detect_python(dirs: list[Path], root: Path) -> tuple[Formatter, str] | None:
+def _detect_python(
+    dirs: list[Path], root: Path, prefer_local: bool = True
+) -> tuple[Formatter, str] | None:
+    # An untrusted repository may not run its own copy (see _repo_code_refusal), so there a copy outside the repository
+    # comes first and a refused in-repo one cannot shadow it. The in-repo copy stays the last resort: with nothing else
+    # installed the run reports why nothing was formatted and how to allow it, instead of "no formatter configured".
+    stages = ("any",) if prefer_local else ("path", "any")
     for d in dirs:
         found: list[tuple[str, Path]] = []
         for name in ("ruff.toml", ".ruff.toml"):
@@ -446,10 +472,11 @@ def _detect_python(dirs: list[Path], root: Path) -> tuple[Formatter, str] | None
             if _toml_has_table(text, "tool.black"):
                 found.append(("black", pyproject))
         found.sort(key=lambda c: c[0] != "ruff")  # ruff wins over black when both are configured
-        for tool, cfg in found:
-            exe = _find_python_tool(tool, dirs)
-            if exe:
-                return Formatter(tool, exe), _rel(cfg, root)
+        for where in stages:
+            for tool, cfg in found:
+                exe = _find_python_tool(tool, dirs, where=where, root=root)
+                if exe:
+                    return Formatter(tool, exe), _rel(cfg, root)
     return None
 
 
@@ -486,14 +513,14 @@ def _walk_up_for(dirs: list[Path], root: Path, name: str) -> str | None:
     return None
 
 
-def _detect(path: Path, root: Path) -> tuple[Formatter, str] | None:
-    """(formatter, config file that selected it) or None."""
+def _detect(path: Path, root: Path, prefer_local: bool = True) -> tuple[Formatter, str] | None:
+    """(formatter, config file that selected it) or None. See detect() for prefer_local."""
     ext = path.suffix.lower()
     dirs = _dirs_up(path.parent, root)
     if not dirs:
         return None
     if ext in _PY_EXTS:
-        return _detect_python(dirs, root)
+        return _detect_python(dirs, root, prefer_local)
     if ext in _PRETTIER_EXTS or ext in _BIOME_EXTS:
         if ext in _PRETTIER_EXTS:
             cfg = _prettier_config(dirs, root)
@@ -517,13 +544,34 @@ def _detect(path: Path, root: Path) -> tuple[Formatter, str] | None:
     return None
 
 
-def detect(path: Path, root: Path) -> Formatter | None:
-    """The formatter for `path`, ONLY if the repo explicitly configures one and its binary is installed."""
+def detect(path: Path, root: Path, *, prefer_local: bool = True) -> Formatter | None:
+    """The formatter for `path`, ONLY if the repo explicitly configures one and its binary is installed.
+
+    prefer_local: True (the default) = the project's own copy of a python formatter (.venv) wins over the one on PATH.
+    False = the repository is not trusted, so its own copy would be refused: a copy outside the repository on PATH
+    wins, and the project's own copy is only the last resort (so a run can still say why nothing was formatted).
+    Node tools are only ever the project's own (node_modules/.bin), so this changes nothing for them."""
     try:
-        hit = _detect(Path(path), Path(root))
+        hit = _detect(Path(path), Path(root), prefer_local)
     except Exception:  # noqa: BLE001 - a hook must survive anything
         return None
     return hit[0] if hit else None
+
+
+_REAL_DETECT = detect
+
+
+def _detector(trusted: bool) -> Callable[[Path, Path], Formatter | None]:
+    """detect() under the trust decision, for _process. The module-level `detect` is looked up at call time and gets
+    the new keyword only while it is the real function: a stand-in for it (the tests' two-argument lambdas) is called
+    as it always was."""
+
+    def run(path: Path, root: Path) -> Formatter | None:
+        if detect is _REAL_DETECT:
+            return detect(path, root, prefer_local=trusted)
+        return detect(path, root)
+
+    return run
 
 
 def _rust_edition(path: Path) -> str:
@@ -885,10 +933,7 @@ def _repo_code_refusal(f: Formatter, path: Path, root: Path, trusted: bool) -> s
     gofmt, rustfmt) is data."""
     if trusted:
         return None
-    try:
-        rel = Path(os.path.abspath(f.exe)).relative_to(os.path.abspath(root)).as_posix()
-    except ValueError:
-        rel = None
+    rel = _inside(f.exe, root)
     if rel is not None:
         return f"{f.name} lives inside the repository ({rel}); {_TRUST_HINT}"
     if f.name == "prettier":
@@ -1003,10 +1048,15 @@ def _replace_atomically(path: Path, data: bytes, before: os.stat_result) -> str 
             try:
                 os.replace(tmp, path)
                 break
-            except PermissionError:
-                # Windows: an antivirus scan or an indexer can hold the file for a moment; anything else fails at once
-                if not paths.IS_WINDOWS or attempt == _REPLACE_TRIES - 1:
+            except PermissionError as exc:
+                # Windows: replacing a file fails while anything else has it open (an antivirus scan, an indexer, an
+                # editor, a program that opened it without share-delete), where an in-place write would have worked.
+                # Wait a moment; if the lock stays, say so and leave the file as it is. Never fall back to a truncating
+                # write: that is the half-written file the atomic replace exists to prevent. Elsewhere it is final.
+                if not paths.IS_WINDOWS:
                     raise
+                if attempt == _REPLACE_TRIES - 1:
+                    raise PermissionError(errno.EACCES, "file in use by another process") from exc
                 time.sleep(0.05 * 2**attempt)
         tmp = None
         return None
@@ -1156,6 +1206,8 @@ def format_changed(
     check=True writes nothing and lists in `formatted` the files that would change.
     trusted: the repository is trusted (the user approved its verify recipe, or chose format.repo_tools = always): only then
     may a formatter that lives inside the repository, or prettier configuration that executes code, run. Default False.
+    Until then a ruff or black on PATH (outside the repository) is preferred over the project's own .venv copy, which
+    would be refused; with the repository trusted the project's own pinned copy wins.
     """
     started = _now()
     report = FormatReport()
@@ -1173,7 +1225,7 @@ def format_changed(
             allow=allow,
             clean_gate=clean_gate,
             check=check,
-            detector=lambda p, r: detect(p, r),
+            detector=_detector(trusted),
             trusted=trusted,
         )
     except Exception as exc:  # noqa: BLE001 - a hook must survive anything; the failure is reported, not raised
@@ -1213,7 +1265,7 @@ def format_paths(
             allow=allow,
             clean_gate=clean_gate,
             check=check,
-            detector=lambda p, r: detect(p, r),
+            detector=_detector(trusted),
             trusted=trusted,
         )
     except Exception as exc:  # noqa: BLE001
@@ -1230,12 +1282,13 @@ def describe(root: Path, trusted: bool = False) -> list[dict]:
 
     Each entry: {name, exe, extensions, configured_by}, plus `usable: False` and `reason` when a run would refuse
     the binary. Only the root directory is probed; a nested config can add more at run time. Never raises.
+    `trusted` decides which copy is listed, exactly as it does for a run (see format_changed).
     """
     try:
         root = Path(os.path.abspath(root))
         groups: dict[tuple[str, str, str], list[str]] = {}
         for ext in sorted(_ALL_EXTS):
-            hit = _detect(root / f"x{ext}", root)
+            hit = _detect(root / f"x{ext}", root, trusted)
             if hit:
                 groups.setdefault((hit[0].name, hit[0].exe, hit[1]), []).append(ext)
         refusals: dict[str, str | None] = {}

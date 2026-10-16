@@ -350,15 +350,22 @@ def test_a_failed_write_leaves_the_original_intact_and_no_temp_file(
 
 
 @pytest.mark.parametrize(
-    ("on_windows", "fail_times", "attempts", "formatted"),
+    ("on_windows", "fail_times", "attempts", "formatted", "message"),
     [
-        (True, 2, 3, True),  # a lock that goes away: retried, written
-        (True, 99, 4, False),  # a lock that stays: given up after _REPLACE_TRIES, reported
-        (False, 1, 1, False),  # elsewhere a permission error is final at once
+        (True, 2, 3, True, ""),  # a lock that goes away: retried, written
+        # a lock that stays: given up after _REPLACE_TRIES, and reported as what it is (not a bare "Access is denied")
+        (True, 99, 4, False, "file in use by another process"),
+        (
+            False,
+            1,
+            1,
+            False,
+            "locked by another process",
+        ),  # elsewhere a permission error is final at once
     ],
 )
 def test_a_locked_file_is_retried_briefly_on_windows_only(
-    repo, monkeypatch, on_windows, fail_times, attempts, formatted
+    repo, monkeypatch, on_windows, fail_times, attempts, formatted, message
 ):
     original = b"x = 1  \n"
     f = put(repo / "a.py", original)
@@ -378,11 +385,61 @@ def test_a_locked_file_is_retried_briefly_on_windows_only(
         if formatted:
             assert fmt._replace_atomically(f, b"x = 1\n", os.lstat(f)) is None
         else:
-            with pytest.raises(PermissionError, match="locked by another process"):
+            with pytest.raises(PermissionError, match=message):
                 fmt._replace_atomically(f, b"x = 1\n", os.lstat(f))
     assert len(tries) == attempts
     assert f.read_bytes() == (b"x = 1\n" if formatted else original)
     assert _temp_leftovers(repo) == []
+
+
+def test_a_file_that_stays_locked_is_reported_as_in_use_and_left_intact(repo, monkeypatch):
+    """The atomic replace fails on Windows while anything holds the file open, where the old in-place write succeeded.
+    The report must say so (not "Access is denied"), the file must stay as it was, and there must be no fallback to a
+    truncating write."""
+    original = b"x = 1  \n"
+    f = put(repo / "a.py", original)
+    mtime = os.lstat(f).st_mtime_ns
+
+    def locked(src, dst):
+        raise PermissionError(errno.EACCES, "Access is denied")
+
+    cand = fmt._Cand(f, "a.py", "a.py", tracked=False)
+    report = fmt.FormatReport()
+    with monkeypatch.context() as m:
+        m.setattr(paths, "IS_WINDOWS", True)  # _format_one spawns nothing once _format is stubbed
+        m.setattr(fmt, "_format", lambda f_, p, text, **kw: ("x = 1\n", ""))
+        m.setattr(os, "replace", locked)
+        m.setattr(time, "sleep", lambda s: None)
+        fmt._format_one(
+            Fake("ruff", sys.executable),
+            cand,
+            repo,
+            report,
+            deadline=time.monotonic() + 60,
+            clean_gate=False,
+            check=False,
+        )
+    assert report.errors == [("a.py", "cannot write: file in use by another process")]
+    assert report.formatted == [] and report.skipped == []
+    assert f.read_bytes() == original and os.lstat(f).st_mtime_ns == mtime  # never written to
+    assert _temp_leftovers(repo) == []
+
+
+@pytest.mark.skipif(
+    sys.platform != "win32", reason="Windows refuses to replace a file that is open"
+)
+def test_a_really_open_file_on_windows_is_reported_in_use_and_formatted_once_released(
+    repo, monkeypatch
+):
+    original = b"x = 1  \n"
+    f = put(repo / "a.py", original)
+    monkeypatch.setattr(time, "sleep", lambda s: None)
+    with open(f, "rb"):  # a plain Python handle: opened without FILE_SHARE_DELETE
+        with pytest.raises(PermissionError, match="file in use by another process"):
+            fmt._replace_atomically(f, b"x = 1\n", os.lstat(f))
+        assert f.read_bytes() == original and _temp_leftovers(repo) == []
+    assert fmt._replace_atomically(f, b"x = 1\n", os.lstat(f)) is None
+    assert f.read_bytes() == b"x = 1\n"
 
 
 def test_owner_is_kept_or_the_rewrite_is_refused(repo, monkeypatch):
@@ -760,9 +817,11 @@ def test_a_formatter_binary_committed_to_the_repo_is_refused(repo):
     assert fmt.describe(repo, trusted=True)[0]["usable"] is False
 
 
-def test_an_untrusted_repo_may_not_run_a_formatter_that_lives_inside_it(repo):
+def test_an_untrusted_repo_may_not_run_a_formatter_that_lives_inside_it(repo, monkeypatch):
     """An agent with write access only can create .venv/bin/ruff or node_modules/.bin/prettier: the gate must not run it."""
     win = paths.IS_WINDOWS
+    # nothing on PATH: with a global ruff the run would (rightly) use that instead, see the PATH-first tests below
+    monkeypatch.setattr(fmt, "_which", lambda name, outside=None: None)
     put(repo / "pyproject.toml", "[tool.ruff]\nline-length = 100\n")
     local = repo / ".venv" / ("Scripts" if win else "bin") / ("ruff.exe" if win else "ruff")
     put(local, b"")
@@ -1331,6 +1390,128 @@ def test_project_venv_beats_path_and_path_is_the_fallback(proj, win, tmp_path, m
     assert same(fmt.detect(proj / "a.py", proj).exe, on_path)
     in_venv = venv_tool(proj, "ruff", win)
     assert same(fmt.detect(proj / "a.py", proj).exe, in_venv)
+
+
+def test_untrusted_detection_prefers_path_over_the_projects_own_copy(
+    proj, win, tmp_path, monkeypatch
+):
+    """An untrusted repository may not run its own .venv ruff (the gate refuses it), so that copy must not shadow a good
+    global one: after `uv sync` put a ruff in .venv, formatting used to stop for every repo not yet trusted."""
+    (proj / "pyproject.toml").write_text("[tool.ruff]\n", encoding="utf-8")
+    bindir = tmp_path / "bin"
+    on_path = path_tool(bindir, "ruff", win)
+    monkeypatch.setenv("PATH", str(bindir))
+    in_venv = venv_tool(proj, "ruff", win)
+    # a direct call and a trusted repository keep preferring the project's own (pinned) copy
+    assert same(fmt.detect(proj / "a.py", proj).exe, in_venv)
+    assert same(fmt.detect(proj / "a.py", proj, prefer_local=True).exe, in_venv)
+    assert same(fmt.detect(proj / "a.py", proj, prefer_local=False).exe, on_path)
+
+
+def test_untrusted_detection_keeps_the_projects_copy_as_the_last_resort(proj, win):
+    """With nothing else installed the run must still say why nothing was formatted (and how to allow it), not
+    "no formatter configured"."""
+    (proj / "pyproject.toml").write_text("[tool.ruff]\n", encoding="utf-8")
+    in_venv = venv_tool(proj, "ruff", win)
+    assert same(fmt.detect(proj / "a.py", proj, prefer_local=False).exe, in_venv)
+
+
+def test_untrusted_detection_skips_an_activated_project_venv_on_path(
+    proj, win, tmp_path, monkeypatch
+):
+    """With the project's venv activated its bin directory leads PATH; that is still the project's own copy."""
+    (proj / "pyproject.toml").write_text("[tool.ruff]\n", encoding="utf-8")
+    sub = "Scripts" if win else "bin"
+    activated = path_tool(proj / "env" / sub, "ruff", win)  # not named .venv, so only PATH finds it
+    on_path = path_tool(tmp_path / "bin", "ruff", win)
+    monkeypatch.setenv("PATH", os.pathsep.join([str(activated.parent), str(on_path.parent)]))
+    assert same(fmt.detect(proj / "a.py", proj, prefer_local=True).exe, activated)  # PATH order
+    assert same(fmt.detect(proj / "a.py", proj, prefer_local=False).exe, on_path)
+    monkeypatch.setenv(
+        "PATH", str(activated.parent)
+    )  # nothing global: the refusal is the explanation
+    assert same(fmt.detect(proj / "a.py", proj, prefer_local=False).exe, activated)
+
+
+def test_untrusted_detection_tries_every_configured_tool_on_path_before_the_projects_own(
+    proj, win, tmp_path, monkeypatch
+):
+    (proj / "pyproject.toml").write_text("[tool.black]\n\n[tool.ruff]\n", encoding="utf-8")
+    venv_tool(proj, "ruff", win)
+    black = path_tool(tmp_path / "bin", "black", win)
+    monkeypatch.setenv("PATH", str(black.parent))
+    assert fmt.detect(proj / "a.py", proj, prefer_local=True).name == "ruff"
+    f = fmt.detect(proj / "a.py", proj, prefer_local=False)
+    assert f.name == "black" and same(f.exe, black)
+
+
+@pytest.fixture
+def stripping_formatter(monkeypatch):
+    """Replace the formatter run: it strips trailing whitespace and records which executable was asked to do it."""
+    used = []
+
+    def run(f, path, text, *, cwd, timeout):
+        used.append(f.exe)
+        return "\n".join(line.rstrip() for line in text.split("\n")), ""
+
+    monkeypatch.setattr(fmt, "_format", run)
+    return used
+
+
+def test_a_repo_not_yet_trusted_is_formatted_with_the_global_formatter_not_skipped(
+    repo, tmp_path, monkeypatch, stripping_formatter
+):
+    """End to end, through the real detection (not a stand-in): the stop gate's default state is an untrusted repo."""
+    win = paths.IS_WINDOWS
+    put(repo / "pyproject.toml", "[tool.ruff]\nline-length = 100\n")
+    in_venv = venv_tool(repo, "ruff", win)
+    on_path = path_tool(tmp_path / "globalbin", "ruff", win)
+    monkeypatch.setenv("PATH", os.pathsep.join([str(on_path.parent), os.environ.get("PATH", "")]))
+    a = put(repo / "a.py", "x = 1  \n")
+
+    report = fmt.format_changed(repo, check=True)  # trusted defaults to False
+    assert report.formatted == ["a.py"] and report.skipped == [] and report.errors == []
+    assert len(stripping_formatter) == 1 and same(stripping_formatter[0], on_path)
+    got = fmt.describe(repo)
+    assert len(got) == 1 and same(got[0]["exe"], on_path) and "usable" not in got[0]
+
+    stripping_formatter.clear()
+    report = fmt.format_changed(
+        repo, check=True, trusted=True
+    )  # a trusted repo keeps its pinned copy
+    assert report.formatted == ["a.py"] and report.skipped == []
+    assert len(stripping_formatter) == 1 and same(stripping_formatter[0], in_venv)
+    assert same(fmt.describe(repo, trusted=True)[0]["exe"], in_venv)
+
+    stripping_formatter.clear()  # format_paths decides the same way, and really writes
+    assert fmt.format_paths(repo, [a]).formatted == ["a.py"]
+    assert len(stripping_formatter) == 1 and same(stripping_formatter[0], on_path)
+    assert a.read_bytes() == b"x = 1\n"
+
+
+@pytest.mark.parametrize("trusted", [False, True])
+def test_a_stand_in_for_detect_keeps_its_two_argument_signature(repo, fake, trusted):
+    """The trust decision reaches the real detect() as a keyword; whatever replaces detect() is called as before."""
+    put(repo / "a.py", "x = 1  \n")
+    report = fmt.format_changed(repo, trusted=trusted)
+    assert report.formatted == ["a.py"] and report.errors == []
+    put(repo / "b.py", "y = 1  \n")
+    assert fmt.format_paths(repo, [repo / "b.py"], trusted=trusted).formatted == ["b.py"]
+
+
+def test_a_repo_not_yet_trusted_with_only_its_own_formatter_says_why_nothing_ran(
+    repo, monkeypatch, stripping_formatter
+):
+    put(repo / "pyproject.toml", "[tool.ruff]\nline-length = 100\n")
+    venv_tool(repo, "ruff", paths.IS_WINDOWS)
+    monkeypatch.setattr(
+        fmt, "_which", lambda name, outside=None: None
+    )  # no global ruff on this PATH
+    put(repo / "a.py", "x = 1  \n")
+    report = fmt.format_changed(repo, check=True)
+    assert report.formatted == [] and stripping_formatter == []
+    assert "lives inside the repository" in report.skipped[0][1]
+    assert "verify trust" in report.skipped[0][1]
 
 
 def test_relative_path_entries_are_ignored(proj, win, monkeypatch):
