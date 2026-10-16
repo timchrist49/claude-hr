@@ -751,6 +751,264 @@ def cmd_job(a, cfg) -> int:
 
 
 # ---------------------------------------------------------------------------------------------
+# ---------------------------------------------------------------------------------------------
+# dev workflow: format / verify / audit / scaffold / footprint / trail
+# ---------------------------------------------------------------------------------------------
+def _repo_root() -> Path:
+    return worktree.repo_root(Path.cwd()) or Path.cwd()
+
+
+def cmd_fmt(a, cfg) -> int:
+    """Format (or, with --check, only report) files with a formatter the repo ALREADY configures. No arguments: say which."""
+    from . import fmt
+
+    root = _repo_root()
+    if not a.paths and not a.changed:
+        found = fmt.describe(root)
+        if not found:
+            out(
+                "no formatter is configured in this repository (claude-hr only uses one the repo already sets up: "
+                "ruff/black, prettier/biome, gofmt, rustfmt)"
+            )
+            return 0
+        for d in found:
+            out(
+                f"{d['name']:<9} {' '.join(d.get('extensions', []))}   "
+                f"(configured by {d.get('configured_by', '?')}; {d.get('exe', '')})"
+            )
+        return 0
+    timeout = float(cfg.get("format.timeout_s", 30))
+    if a.paths:
+        files = [Path(x).resolve() for x in a.paths]
+    else:
+        files = fmt.changed_files(
+            root,
+            max_files=500,
+            max_kb=int(cfg.get("format.max_file_kb", 512)),
+            skip_globs=tuple(cfg.get("format.skip_globs", []) or ()),
+        )
+    dirty: list[Path] = []
+    errors: list[tuple[Path, str]] = []
+    clean = 0
+    for f in files:
+        spec = fmt.detect(f, root)
+        if spec is None:
+            continue
+        try:
+            text = f.read_bytes().decode("utf-8")
+        except (OSError, UnicodeDecodeError):
+            errors.append((f, "unreadable"))
+            continue
+        new = fmt.format_text(spec, f, text, cwd=root, timeout=timeout)
+        if new is None:
+            errors.append((f, f"{spec.name} failed"))
+            continue
+        nl = "\r\n" if "\r\n" in text else "\n"  # a formatter must not flip the file's line endings
+        new = new.replace("\r\n", "\n").replace("\n", nl)
+        if new == text:
+            clean += 1
+            continue
+        dirty.append(f)
+        if not a.check:
+            f.write_bytes(new.encode("utf-8"))
+    for f in dirty:
+        out(f"{'would reformat' if a.check else 'reformatted'}: {f}")
+    for f, why in errors:
+        out(f"error: {f}: {why}")
+    out(
+        f"{len(dirty)} {'need formatting' if a.check else 'reformatted'}, {clean} already formatted, {len(errors)} errors"
+    )
+    if errors:
+        return 2
+    return 1 if (dirty and a.check) else 0
+
+
+def _trust_prompt(root: Path, recipe, assume_yes: bool) -> bool:
+    out(f"The end-of-turn gate will run these commands unattended in {root}:")
+    for tier in ("fast", "full"):
+        for c in getattr(recipe, tier):
+            out(f"  [{tier}] {c.name}: {' '.join(c.argv)}   (timeout {c.timeout_s}s, cwd {c.cwd})")
+    if assume_yes:
+        return True
+    if not sys.stdin.isatty():
+        out(
+            "refusing to trust without a human: run this in a terminal, or pass --yes if you have reviewed the file yourself"
+        )
+        return False
+    return input("Trust this file? type 'yes': ").strip().lower() == "yes"
+
+
+def cmd_verify(a, cfg) -> int:
+    """The repo's verify recipe (.claude/hr-verify.toml): propose it, trust it, run it."""
+    from . import verify
+
+    root = _repo_root()
+    if a.action == "init":
+        recipe = verify.discover(root)
+        text = verify.render_toml(recipe)
+        target = verify.config_path(root)
+        if not a.write:
+            out(text)
+            out(
+                f"# dry run: `claude-hr-ctl verify init --write` saves this to {target}, then review it and run `verify trust`"
+            )
+            return 0
+        if target.exists() and not a.force:
+            out(
+                f"{target} already exists (use --force to overwrite); review it, then run `claude-hr-ctl verify trust`"
+            )
+            return 1
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(text, encoding="utf-8", newline="\n")
+        out(
+            f"wrote {target}\nReview it (these commands run at the end of each Claude turn), then: claude-hr-ctl verify trust"
+        )
+        return 0
+    try:
+        recipe = verify.load(root)
+    except ValueError as exc:
+        out(f"{verify.config_path(root)}: {exc}")
+        return 2
+    if a.action == "trust":
+        if recipe is None:
+            out(
+                f"no {verify.config_path(root)}; create one with `claude-hr-ctl verify init --write`"
+            )
+            return 1
+        if not _trust_prompt(root, recipe, a.yes):
+            return 1
+        out(
+            f"trusted ({verify.trust(root, paths.state_dir())[:12]}...): the end-of-turn gate may now run these commands"
+        )
+        return 0
+    if a.action == "untrust":
+        verify.untrust(root, paths.state_dir())
+        out("trust removed: the end-of-turn gate will not run this repository's commands")
+        return 0
+    if a.action == "status":
+        cp = verify.config_path(root)
+        if recipe is None:
+            out(f"no recipe at {cp}  ->  `claude-hr-ctl verify init --write`")
+            return 0
+        trusted = verify.is_trusted(root, paths.state_dir())
+        out(
+            f"{cp}: {'TRUSTED' if trusted else 'NOT trusted (new or changed since you trusted it)'}"
+        )
+        for tier in ("fast", "full"):
+            for c in getattr(recipe, tier):
+                out(f"  [{tier}] {c.name}: {' '.join(c.argv)}")
+        if not trusted:
+            out("the end-of-turn gate does nothing until you run `claude-hr-ctl verify trust`")
+        return 0
+    # run: explicit and interactive, so it works without trust (you are asking for exactly this)
+    if recipe is None:
+        recipe = verify.discover(root)
+        out("(no .claude/hr-verify.toml: running the commands that would be proposed)")
+    checks = list(recipe.fast) + (list(recipe.full) if a.tier == "full" else [])
+    if not checks:
+        out("nothing to run: no checks were found for this repository")
+        return 1
+    res = verify.run(root, checks, stop_on_fail=False)
+    ok = True
+    for r in res.results:
+        out(f"[{'ok ' if r.rc == 0 else 'FAIL'}] {r.name} ({r.seconds:.1f}s, exit {r.rc})")
+        if r.rc != 0:
+            ok = False
+            out("\n".join("      " + ln for ln in (r.tail or "").splitlines()))
+    notes = verify.test_weakening(root) if cfg.flag("verify.test_guard", True) else []
+    for n in notes:
+        out(f"[warn] possible test weakening: {n}")
+    return 0 if ok else 1
+
+
+def cmd_audit(a, cfg) -> int:
+    """Read-only repository audit: agent-config attack surface, workflow lint, secrets. Zero tokens, runs nothing from the repo."""
+    from . import audit
+
+    root = _repo_root()
+    findings = audit.scan_repo(root)
+    tools = (
+        audit.run_tools(root, timeout_s=int(cfg.get("audit.timeout_s", 60)))
+        if (a.tools and cfg.flag("audit.tools", True))
+        else []
+    )
+    out(audit.render(findings, tools, as_json=a.json))
+    return 1 if (a.strict and any(f.severity == "high" for f in findings)) else 0
+
+
+def cmd_init_repo(a, cfg) -> int:
+    """Scaffold issue templates, PR template, CODEOWNERS, Dependabot, docs/plans, REVIEW.md, .editorconfig. Dry run by default."""
+    from . import initrepo
+
+    root = _repo_root()
+    actions = initrepo.plan(root, only=a.only or None)
+    if not actions:
+        out("nothing to scaffold for the selected groups")
+        return 0
+    for act in actions:
+        out(f"{'exists  ' if act.exists else 'new     '} {act.path}   [{act.group}]")
+    new = [x for x in actions if not x.exists]
+    if not a.apply:
+        out(
+            f"\ndry run: {len(new)} new file(s). `claude-hr-ctl init-repo --apply` writes them (existing files are never overwritten); review with git diff, then commit."
+        )
+        return 0
+    written = initrepo.apply(root, actions)
+    out(
+        f"\nwrote {len(written)} file(s); nothing was committed or pushed. Review with `git status` / `git diff`."
+    )
+    return 0
+
+
+def cmd_footprint(a, cfg) -> int:
+    """What the installed plugins cost in always-on context, including what `claude plugin details` does not count."""
+    from . import footprint
+
+    claude = procutil.find_claude(str(cfg.get("claude.binary", "") or ""))
+    if not claude:
+        out("Claude Code not found")
+        return 1
+    r = procutil.run([str(claude), "plugin", "list", "--json"], timeout=60)
+    try:
+        listing = json.loads(r.stdout or "[]")
+    except ValueError:
+        out("could not read `claude plugin list --json`")
+        return 1
+    fps = footprint.scan_installed(listing if isinstance(listing, list) else [])
+    out(footprint.render(fps, int(cfg.get("footprint.budget_standard_tokens", 1500))))
+    if a.probe:
+        out("\nprobe: one tiny real request (this spends roughly 25-40k cached input tokens) ...")
+        res = footprint.probe(str(claude))
+        if res.get("ok"):
+            out(
+                f"first-message input: {res.get('input_tokens', 0) + res.get('cache_creation_tokens', 0) + res.get('cache_read_tokens', 0):,} tokens "
+                f"(new {res.get('input_tokens', 0):,}, cache write {res.get('cache_creation_tokens', 0):,}, cache read {res.get('cache_read_tokens', 0):,}); "
+                f"cost ${res.get('total_cost_usd', 0):.4f}"
+            )
+        else:
+            out("the probe did not return usable usage data")
+            return 1
+    return 0
+
+
+def cmd_trail(a, cfg) -> int:
+    """The metadata-only audit trail of the end-of-turn gate (what ran, when, pass/fail; never code or output)."""
+    from . import auditlog
+
+    if a.prune:
+        n = auditlog.prune(int(cfg.get("gates.trail_days", 90)))
+        out(f"removed {n} old month file(s) from {auditlog.audit_dir()}")
+        return 0
+    rows = auditlog.tail(a.tail)
+    if not rows:
+        out(f"no audit records yet ({auditlog.audit_dir()})")
+        return 0
+    for r in rows:
+        extra = " ".join(f"{k}={v}" for k, v in r.items() if k not in ("ts", "event"))
+        out(f"{r.get('ts', '?')} {r.get('event', '?'):<6} {extra}")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="claude-hr-ctl", description="Manage the claude-hr distribution."
@@ -761,7 +1019,9 @@ def build_parser() -> argparse.ArgumentParser:
     s = sub.add_parser("setup", help="install/repair everything (idempotent)")
     s.add_argument("--only", nargs="+", choices=ALL_STEPS)
     s.add_argument("--skip", nargs="+", choices=ALL_STEPS)
-    s.add_argument("--profile", choices=["minimal", "standard", "full", "lean-output"])
+    s.add_argument(
+        "--profile", choices=["minimal", "standard", "process", "audit", "full", "lean-output"]
+    )
     s.add_argument("--dry-run", action="store_true")
     s.add_argument(
         "--force", action="store_true", help="overwrite settings keys you changed yourself"
@@ -877,6 +1137,76 @@ def build_parser() -> argparse.ArgumentParser:
     s = sub.add_parser("daemon", help="Claude background service routing")
     s.add_argument("action", choices=["status", "restart"])
     s.set_defaults(fn=cmd_daemon)
+
+    s = sub.add_parser(
+        "fmt", help="format with the repo's own configured formatter (--check to only report)"
+    )
+    s.add_argument(
+        "paths", nargs="*", help="files to format; none = list the formatters this repo configures"
+    )
+    s.add_argument("--changed", action="store_true", help="the files changed in the working tree")
+    s.add_argument(
+        "--check", action="store_true", help="do not write; exit 1 if anything needs formatting"
+    )
+    s.set_defaults(fn=cmd_fmt)
+
+    s = sub.add_parser(
+        "verify",
+        help="the repo's test/lint recipe (.claude/hr-verify.toml): init, trust, run, status",
+    )
+    s.add_argument("action", choices=["init", "run", "trust", "untrust", "status"])
+    s.add_argument(
+        "--write", action="store_true", help="init: save the proposal to .claude/hr-verify.toml"
+    )
+    s.add_argument("--force", action="store_true", help="init --write: overwrite an existing file")
+    s.add_argument("--tier", choices=["fast", "full"], default="fast", help="run: which checks")
+    s.add_argument(
+        "--yes",
+        action="store_true",
+        help="trust: skip the confirmation (only after reviewing the file)",
+    )
+    s.set_defaults(fn=cmd_verify)
+
+    s = sub.add_parser(
+        "audit", help="read-only repo audit: agent-config attack surface, workflow lint, secrets"
+    )
+    s.add_argument("--json", action="store_true")
+    s.add_argument(
+        "--strict", action="store_true", help="exit 1 if there is a high-severity finding"
+    )
+    s.add_argument(
+        "--tools",
+        action="store_true",
+        help="also run gitleaks / pip-audit / npm audit / osv-scanner if installed",
+    )
+    s.set_defaults(fn=cmd_audit)
+
+    s = sub.add_parser(
+        "init-repo",
+        help="scaffold issue/PR templates, CODEOWNERS, Dependabot, docs/plans (dry run by default)",
+    )
+    s.add_argument("--apply", action="store_true", help="write the files that do not exist yet")
+    s.add_argument(
+        "--only",
+        nargs="+",
+        metavar="GROUP",
+        help="github docs editor dependabot codeowners review ci",
+    )
+    s.set_defaults(fn=cmd_init_repo)
+
+    s = sub.add_parser(
+        "footprint",
+        help="always-on token cost of the installed plugins, incl. hidden hook/MCP costs",
+    )
+    s.add_argument(
+        "--probe", action="store_true", help="also measure one real first message (spends tokens)"
+    )
+    s.set_defaults(fn=cmd_footprint)
+
+    s = sub.add_parser("trail", help="metadata-only audit trail of the end-of-turn gate")
+    s.add_argument("--tail", type=int, default=20)
+    s.add_argument("--prune", action="store_true")
+    s.set_defaults(fn=cmd_trail)
 
     s = sub.add_parser("job", help=argparse.SUPPRESS)
     s.add_argument("name", choices=list(schedule.JOBS))

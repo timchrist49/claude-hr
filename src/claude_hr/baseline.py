@@ -44,6 +44,9 @@ TAMPER_ASK = [
     "Write(**/.claude/settings.json)",
     "Edit(**/.claude/settings.local.json)",
     "Write(**/.claude/settings.local.json)",
+    # trusting a verify recipe is what lets commands run unattended: only the user does that
+    "Bash(claude-hr-ctl verify trust*)",
+    "Bash(claude-hr ctl verify trust*)",
 ]
 # Read-only GitHub CLI calls used by the hr-gh skill. Pre-approving reads only; anything that writes still prompts.
 GH_READONLY_ALLOW = [

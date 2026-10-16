@@ -186,6 +186,9 @@ def test_baseline_lean_defaults_for_the_dev_workflow(sandbox):
     assert "CLAUDE_HR_GIT_GUARD" not in doc["env"]
     ask = doc["permissions"]["ask"]
     assert "Edit(**/.claude/hr-verify.toml)" in ask and "Write(**/.claude/settings.json)" in ask
+    assert (
+        "Bash(claude-hr-ctl verify trust*)" in ask
+    )  # only the user decides which commands run unattended
     allow = doc["permissions"]["allow"]
     assert "Bash(gh pr view *)" in allow and not [
         a for a in allow if "create" in a or "merge" in a or "edit" in a
