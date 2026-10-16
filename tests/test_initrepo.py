@@ -862,8 +862,21 @@ def test_python_with_nothing_to_run_installs_only_and_says_so(tmp_path):
         ({"pytest.ini": "[pytest]\n"}, True),
         ({"pyproject.toml": "[tool.pytest.ini_options]\naddopts = '-q'\n"}, True),
         ({"setup.cfg": "[tool:pytest]\naddopts = -q\n"}, True),
+        ({"tests/foo_test.py": "def test_a():\n    pass\n"}, True),
+        ({"tests/a/b/c/test_deep.py": "def test_a():\n    pass\n"}, True),
         ({"tests/README.md": "no python here\n"}, False),
-        ({"tests/__init__.py": ""}, True),  # still a package that pytest would collect from
+        # a package, a conftest or a helper module collects nothing: `pytest` exits 5 and the first push is red
+        ({"tests/__init__.py": ""}, False),
+        ({"tests/conftest.py": "import pytest\n"}, False),
+        ({"tests/__init__.py": "", "tests/conftest.py": "", "tests/helpers/util.py": ""}, False),
+        (
+            {"tests/testing_notes.py": "", "tests/mytest.py": ""},
+            False,
+        ),  # not pytest's file patterns
+        (
+            {"tests/test_a.txt": "", "tests/test_dir.py/x.txt": ""},
+            False,
+        ),  # a directory is no test file
         ({"src/a.py": "x = 1\n"}, False),
     ],
 )
@@ -919,12 +932,17 @@ def test_python_install_command_matches_how_the_project_is_packaged(tmp_path, fi
     [
         ({"package-lock.json": "{}"}, "npm ci", ["npm test", "npm run lint"]),
         ({}, "npm install", ["npm test", "npm run lint"]),
+        # corepack is installed first: Node 25 and later (which `lts/*` becomes) no longer bundle it
         (
             {"pnpm-lock.yaml": ""},
-            "corepack enable && pnpm install --frozen-lockfile",
+            "npm install -g corepack && corepack enable && pnpm install --frozen-lockfile",
             ["pnpm test", "pnpm run lint"],
         ),
-        ({"yarn.lock": ""}, "corepack enable && yarn install", ["yarn test", "yarn run lint"]),
+        (
+            {"yarn.lock": ""},
+            "npm install -g corepack && corepack enable && yarn install",
+            ["yarn test", "yarn run lint"],
+        ),
     ],
 )
 def test_ci_for_node_uses_the_repos_package_manager(tmp_path, files, install, runs):
@@ -972,21 +990,21 @@ def uses_of(steps):
             {},
             {"packageManager": "pnpm@9.0.0"},
             ["actions/checkout@v4", "actions/setup-node@v4"],
-            "corepack enable && pnpm install --no-frozen-lockfile",
+            "npm install -g corepack && corepack enable && pnpm install --no-frozen-lockfile",
             ["pnpm test", "pnpm run lint"],
         ),
         (
             {"pnpm-lock.yaml": ""},
             {"packageManager": "pnpm@9.0.0"},
             ["actions/checkout@v4", "actions/setup-node@v4"],
-            "corepack enable && pnpm install --frozen-lockfile",
+            "npm install -g corepack && corepack enable && pnpm install --frozen-lockfile",
             ["pnpm test", "pnpm run lint"],
         ),
         (
             {},
             {"packageManager": "yarn@4.0.0"},
             ["actions/checkout@v4", "actions/setup-node@v4"],
-            "corepack enable && yarn install",
+            "npm install -g corepack && corepack enable && yarn install",
             ["yarn test", "yarn run lint"],
         ),
         # a lock file beats the packageManager field, exactly as in the verify recipe discovery
@@ -1739,11 +1757,11 @@ def test_init_repo_on_a_subdirectory_warns_and_leaves_github_files_out(tmp_path,
     assert run_init_repo(sub) == 0
     text = capsys.readouterr().out
     assert "warning:" in text and "is a subdirectory of the git repository at" in text
-    assert "GitHub reads .github/" in text and "only from the top level" in text
+    assert "GitHub reads .github/" in text and "belong to the top level" in text
     assert (
         "claude-hr-ctl init-repo " in text and top.name in text.split("warning:")[1].split("\n")[0]
     )
-    assert "github, dependabot, codeowners, ci are not scaffolded here" in text
+    assert "github, editor, dependabot, codeowners, review, ci are not scaffolded here" in text
     assert ".github/" not in text.split("warning:")[1].split("\n", 1)[1], (
         "no .github file is planned"
     )
@@ -1751,7 +1769,26 @@ def test_init_repo_on_a_subdirectory_warns_and_leaves_github_files_out(tmp_path,
     assert run_init_repo(sub, apply=True) == 0
     capsys.readouterr()
     assert not (sub / ".github").exists() and not (top / ".github").exists()
-    assert (sub / "docs" / "plans" / "README.md").is_file() and (sub / ".editorconfig").is_file()
+    assert (sub / "docs" / "plans" / "README.md").is_file()
+    for top_level_only in (".editorconfig", ".gitattributes", "REVIEW.md"):
+        assert not (sub / top_level_only).exists(), top_level_only
+
+
+def test_init_repo_on_a_subdirectory_never_shadows_the_top_levels_editor_files(tmp_path, capsys):
+    """A nested .editorconfig (`root = true`) stops the editor's search for the repository's own, and a nested
+    .gitattributes overrides its rules for the whole subtree (a CRLF repo would flip every file there)."""
+    top, sub = monorepo(tmp_path)
+    write(top, ".editorconfig", "root = true\n[*]\nindent_style = tab\n")
+    write(top, ".gitattributes", "* text eol=crlf\n")
+    assert run_init_repo(sub, apply=True) == 0
+    text = capsys.readouterr().out
+    assert "editor" in text.split("warning:")[1].split("are not scaffolded here")[0]
+    assert not (sub / ".editorconfig").exists() and not (sub / ".gitattributes").exists()
+    assert (top / ".editorconfig").read_text(encoding="utf-8").endswith("indent_style = tab\n")
+    assert (
+        run_init_repo(sub, apply=True, only="editor") == 2
+    )  # asking for just those: nothing left to do
+    assert "nothing left to scaffold" in capsys.readouterr().out
 
 
 def test_init_repo_at_the_top_level_still_scaffolds_github_files_without_a_warning(
@@ -1775,13 +1812,246 @@ def test_init_repo_only_github_groups_on_a_subdirectory_is_refused(tmp_path, cap
 
 def test_init_repo_only_groups_that_work_anywhere_is_not_warned_about(tmp_path, capsys):
     _, sub = monorepo(tmp_path)
-    assert run_init_repo(sub, only="docs,editor") == 0
+    assert run_init_repo(sub, only="docs") == 0
     assert "warning:" not in capsys.readouterr().out
 
 
-def test_init_repo_outside_a_repository_behaves_as_before(tmp_path, capsys):
+def tree(root):
+    return sorted(p.relative_to(root).as_posix() for p in Path(root).rglob("*"))
+
+
+def test_init_repo_refuses_a_folder_that_is_not_in_a_git_work_tree(tmp_path, capsys):
+    """Scaffolding ~ or a Documents folder would litter it with .github/, .editorconfig and .gitattributes that belong
+    to no repository. A person starting a new project runs `git init` first."""
     plain = tmp_path / "plain"
     plain.mkdir()
-    assert run_init_repo(plain) == 0
-    text = capsys.readouterr().out
-    assert "warning:" not in text and ".github/ISSUE_TEMPLATE/bug.yml" in text
+    (plain / "notes.txt").write_text("mine", encoding="utf-8")
+    for apply in (False, True):
+        assert run_init_repo(plain, apply=apply) == 2
+        text = capsys.readouterr().out
+        assert "not inside a git work tree" in text and "git init" in text
+        assert "would create" not in text and "created" not in text
+    assert tree(plain) == ["notes.txt"]
+    git(plain, "init", "-q")
+    assert run_init_repo(plain, apply=True) == 0  # and once it is a repository it works
+    assert (plain / ".editorconfig").is_file()
+
+
+def test_init_repo_refuses_a_bare_repository_and_a_git_directory(tmp_path, capsys):
+    bare = tmp_path / "bare.git"
+    bare.mkdir()
+    git(bare, "init", "--bare", "-q")
+    work = make_repo(tmp_path / "work")
+    before = (tree(bare), tree(work / ".git"))
+    for target in (bare, work / ".git", work / ".git" / "hooks", bare / "refs"):
+        for apply in (False, True):
+            assert run_init_repo(target, apply=apply, only="docs,editor,review") == 2, (
+                target,
+                apply,
+            )
+            assert "a git directory" in capsys.readouterr().out
+    assert (tree(bare), tree(work / ".git")) == before, (
+        "nothing was written next to HEAD and objects/"
+    )
+    assert not (work / "docs").exists()
+
+
+def test_init_repo_without_git_installed_still_finds_the_repository_and_its_subdirectories(
+    tmp_path, capsys, monkeypatch
+):
+    """git is how the top level is normally found; when it cannot run, the `.git` marker on disk answers instead, so a
+    broken git neither blocks a real repository nor lets a subdirectory be scaffolded as if it were the top."""
+    top, sub = monorepo(tmp_path)
+    plain = tmp_path / "plain"
+    plain.mkdir()
+    monkeypatch.setenv("PATH", str(tmp_path / "no-bin"))  # no git
+    assert initrepo.locate(top) == ("top", None)
+    kind, found = initrepo.locate(sub)
+    assert kind == "subdir" and os.path.samefile(found, top)
+    assert initrepo.locate(plain) == ("none", None)
+    assert run_init_repo(top, only="docs") == 0
+    assert run_init_repo(plain, only="docs") == 2
+    assert (
+        run_init_repo(sub, only="ci") == 2 and "nothing left to scaffold" in capsys.readouterr().out
+    )
+
+
+def test_init_repo_refuses_a_missing_directory(tmp_path, capsys):
+    assert run_init_repo(tmp_path / "typo", apply=True) == 2
+    assert "is not a directory" in capsys.readouterr().out
+    assert not (tmp_path / "typo").exists()
+
+
+# ---- a repo's own CI and dependency bot win ------------------------------------------------------------------------------
+
+PY_REPO = {"pyproject.toml": PYPROJECT, **PY_TOOLS}
+
+
+def ci_planned(root, only=None, **kw):
+    actions, notes = initrepo.plan_with_notes(root, only=only, **kw)
+    return ".github/workflows/ci.yml" in {a.path for a in actions}, notes
+
+
+@pytest.mark.parametrize(
+    "name, text",
+    [
+        (
+            "test.yml",
+            "name: test\non: [push, pull_request]\njobs:\n  t:\n    steps:\n      - run: pytest\n",
+        ),
+        (
+            "tests.yaml",
+            "name: t\non:\n  push:\n    branches: [main]\njobs:\n  t:\n    steps:\n      - run: npm test\n",
+        ),
+        (
+            "build.yml",
+            "name: b\non:\n  pull_request:\njobs:\n  b:\n    steps:\n      - run: go test ./...\n",
+        ),
+        (
+            "list.yml",
+            "name: b\non:\n  - push\njobs:\n  b:\n    steps:\n      - run: python -m pytest -q\n",
+        ),
+        ("quoted.yml", "name: b\n'on': push\njobs:\n  b:\n    steps:\n      - run: cargo test\n"),
+        (
+            "flow.yml",
+            "name: b\non: {push: {branches: [main]}}\njobs:\n  b:\n    steps:\n      - run: pnpm run test\n",
+        ),
+    ],
+)
+def test_ci_is_not_written_next_to_a_workflow_that_already_runs_the_tests(tmp_path, name, text):
+    """Every push and pull request would run the suite twice, in a skeleton that knows nothing of the repo's services,
+    secrets or matrix (so it can be red where the repo's own workflow is green)."""
+    root = make_repo(tmp_path / "r", {**PY_REPO, f".github/workflows/{name}": text})
+    planned, notes = ci_planned(root)
+    assert not planned
+    assert any(n.startswith("ci:") and name in n and "already runs tests" in n for n in notes)
+    assert "--only ci" in next(n for n in notes if "already runs tests" in n)
+    # naming the group is asking for it
+    assert ci_planned(root, only="ci")[0] and ci_planned(root, only="ci,dependabot")[0]
+    # and an applied run writes nothing at that path
+    initrepo.apply(root, initrepo.plan(root))
+    assert not (root / ".github" / "workflows" / "ci.yml").exists()
+
+
+@pytest.mark.parametrize(
+    "name, text",
+    [
+        (
+            "lint.yml",
+            "name: lint\non: [push, pull_request]\njobs:\n  l:\n    steps:\n      - run: ruff check .\n",
+        ),
+        (
+            "release.yml",
+            "name: r\non:\n  release:\n    types: [published]\njobs:\n  r:\n    steps:\n      - run: pytest\n",
+        ),
+        (
+            "nightly.yml",
+            "name: n\non:\n  schedule:\n    - cron: '0 3 * * *'\njobs:\n  n:\n    steps:\n      - run: pytest\n",
+        ),
+        (
+            "manual.yml",
+            "name: m\non: workflow_dispatch\njobs:\n  m:\n    steps:\n      - run: pytest\n",
+        ),
+        (
+            "commented.yml",
+            "name: c\n# on: push\non: workflow_dispatch\njobs:\n  c:\n    steps:\n      - run: pytest\n",
+        ),
+        ("notests.yml", "name: d\non: push\njobs:\n  d:\n    steps:\n      - run: echo deploy\n"),
+        (
+            "target.yml",
+            "name: d\non: pull_request_target\njobs:\n  d:\n    steps:\n      - run: pytest\n",
+        ),
+        ("broken.yml", "\x00\x01 not yaml at all"),
+        ("readme.txt", "on: push\njobs:\n  - run: pytest\n"),
+    ],
+)
+def test_ci_is_still_written_when_the_existing_workflows_do_not_run_the_tests(tmp_path, name, text):
+    root = make_repo(tmp_path / "r", {**PY_REPO, f".github/workflows/{name}": text})
+    planned, notes = ci_planned(root)
+    assert planned, notes
+    assert not any("already runs tests" in n for n in notes)
+
+
+def test_an_existing_ci_yml_is_reported_as_kept_not_skipped(tmp_path):
+    root = make_repo(
+        tmp_path / "r",
+        {
+            **PY_REPO,
+            ".github/workflows/ci.yml": "name: ci\non: push\njobs: {}\n",
+            ".github/workflows/test.yml": "on: push\njobs:\n  t:\n    steps:\n      - run: pytest\n",
+        },
+    )
+    actions, notes = initrepo.plan_with_notes(root)
+    ci = by_path(actions)[".github/workflows/ci.yml"]
+    assert ci.exists and not any("already runs tests" in n for n in notes)
+
+
+@pytest.mark.parametrize(
+    "files",
+    [
+        {"renovate.json": "{}"},
+        {"renovate.json5": "{}"},
+        {".renovaterc": "{}"},
+        {".renovaterc.json": "{}"},
+        {".github/renovate.json": "{}"},
+        {"package.json": json.dumps({"name": "x", "renovate": {"extends": ["config:base"]}})},
+    ],
+)
+def test_dependabot_is_not_added_to_a_repo_that_uses_renovate(tmp_path, files):
+    root = make_repo(tmp_path / "r", {"package.json": json.dumps({"name": "x"}), **files})
+    actions, notes = initrepo.plan_with_notes(root, only="dependabot")
+    assert actions == []
+    assert any(n.startswith("dependabot:") and "Renovate" in n for n in notes)
+
+
+def test_dependabot_is_still_added_without_renovate(tmp_path):
+    root = make_repo(tmp_path / "r", {"package.json": json.dumps({"name": "x", "version": "1"})})
+    actions, _ = initrepo.plan_with_notes(root, only="dependabot")
+    assert [a.path for a in actions] == [".github/dependabot.yml"]
+
+
+def test_discovered_pytest_is_left_out_where_nothing_can_be_collected(tmp_path):
+    """verify.discover counts tests/__init__.py as a test suite; as a CI step, `pytest` then exits 5 on the first push."""
+    discovered = [["python", "-m", "pytest", "-q"], ["ruff", "check", "."]]
+    empty = make_repo(tmp_path / "e", {**PYPROJECT_ONLY, "tests/__init__.py": "", "ruff.toml": ""})
+    _, notes = initrepo.plan_with_notes(empty, only="ci", commands=discovered, discovered=True)
+    assert any("left out pytest" in n for n in notes)
+    text = content_of(
+        empty, ".github/workflows/ci.yml", only="ci", commands=discovered, discovered=True
+    )
+    assert run_lines(parse_yaml(text)["jobs"]["verify"]["steps"]) == [
+        "python -m pip install -e . ruff",
+        "ruff check .",
+    ]
+    # a person's own list is taken as given, and a repo with a real test keeps the command
+    kept = content_of(empty, ".github/workflows/ci.yml", only="ci", commands=discovered)
+    assert "python -m pytest -q" in run_lines(parse_yaml(kept)["jobs"]["verify"]["steps"])
+    real = make_repo(tmp_path / "r", {**PYPROJECT_ONLY, "tests/test_a.py": "def test_a(): pass\n"})
+    text = content_of(
+        real, ".github/workflows/ci.yml", only="ci", commands=discovered, discovered=True
+    )
+    assert "python -m pytest -q" in run_lines(parse_yaml(text)["jobs"]["verify"]["steps"])
+
+
+PYPROJECT_ONLY = {"pyproject.toml": PYPROJECT}
+
+
+def test_corepack_is_installed_before_it_is_enabled_and_npm_repos_never_mention_it(tmp_path):
+    """Node 25 and later no longer ship corepack, and `lts/*` moves to such a release: `corepack enable` alone would
+    be `command not found` on the first CI run."""
+    for files, pm in (({"pnpm-lock.yaml": ""}, "pnpm"), ({"yarn.lock": ""}, "yarn")):
+        root = make_repo(
+            tmp_path / pm, {"package.json": json.dumps({"scripts": {"test": "jest"}}), **files}
+        )
+        install = run_lines(ci_steps(root)[1])[0]
+        assert (
+            install.index("npm install -g corepack")
+            < install.index("corepack enable")
+            < install.index(pm + " install")
+        )
+    for files in ({}, {"package-lock.json": "{}"}):
+        root = make_repo(
+            tmp_path / ("npm" + str(len(files))),
+            {"package.json": json.dumps({"scripts": {"test": "jest"}}), **files},
+        )
+        assert "corepack" not in content_of(root, ".github/workflows/ci.yml", only="ci")

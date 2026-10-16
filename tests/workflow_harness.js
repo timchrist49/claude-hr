@@ -11,16 +11,24 @@ const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor;
 const logs = [];
 const calls = [];
 const prompts = [];
+const verifyCalls = {};
 const agent = async (prompt, opts = {}) => {
   const label = String(opts.label || '');
   calls.push(label);
-  prompts.push({ label, prompt, agentType: opts.agentType || null, isolation: opts.isolation || null });
+  prompts.push({
+    label, prompt, agentType: opts.agentType || null, isolation: opts.isolation || null,
+    model: opts.model || null, effort: opts.effort || null,
+  });
   if (label === 'scope') {
+    if (scenario === 'scope-null') return null;
     if (scenario === 'empty') return { base: 'origin/main', files: [], summary: '', empty: true };
     return { base: 'origin/main', files: ['a.py', 'b.py'], summary: 'adds a feature', empty: false };
   }
   if (label.startsWith('find:')) {
     const dim = label.slice(5);
+    if (scenario === 'finders-null') return null;
+    if (scenario === 'finder-security-throws' && dim === 'security') throw new Error('rate limited');
+    if (scenario === 'finder-security-null' && dim === 'security') return null;
     if (dim === 'correctness') {
       return { findings: [
         { file: 'a.py', line: 10, title: 'real bug', detail: 'd', severity: 'high', evidence: 'e' },
@@ -35,6 +43,12 @@ const agent = async (prompt, opts = {}) => {
   }
   if (label.startsWith('verify:')) {
     if (scenario === 'skeptics-fail') return null;
+    // only the first of the two skeptics answers (a partly verified finding)
+    if (scenario === 'skeptic-half') {
+      const finding = prompt.split(' Claim:')[0]; // the two skeptics of one finding differ only in their lens
+      verifyCalls[finding] = (verifyCalls[finding] || 0) + 1;
+      if (verifyCalls[finding] > 1) return null;
+    }
     return { refuted: /fake bug/.test(prompt), reason: 'r' };
   }
   throw new Error('unexpected agent call: ' + label);

@@ -170,6 +170,7 @@ def plan_response(groups, **kw):
         "reason": "disjoint areas",
         "baseCommit": "abc1234",
         "branch": "main",
+        "detached": False,
         "dirtyTracked": [],
         "existingBranches": [],
         "checkCommands": ["pytest -q"],
@@ -270,15 +271,18 @@ def test_workflow_text_does_not_tell_the_model_to_start_manual_only_skills():
                 assert re.search(r"(?i)\buser\b", line), f"{script.name}: {line.strip()!r}"
 
 
-def test_script_is_plain_deterministic_javascript_without_model_overrides():
-    text = WF.read_text(encoding="utf-8")
+@pytest.mark.parametrize("script", sorted(WF.parent.glob("*.js")), ids=lambda p: p.name)
+def test_script_is_plain_deterministic_javascript_without_model_overrides(script):
+    """Every shipped workflow: hr-review-changes used to pass `effort: 'low'` to its scope agent, which picks the base
+    and the files every finder then reviews, while only this file was checked."""
+    text = script.read_text(encoding="utf-8")
     assert "\r" not in text and "\t" not in text
     assert not re.search(r"[ ]+$", text, re.M), "trailing whitespace"
     assert text.endswith("\n") and not text.endswith("\n\n")
     for banned in ("Date.now", "Math.random", "new Date(", "require("):
         assert banned not in text, banned
     assert not re.search(r"(?m)^import\s", text), "workflows have no module imports"
-    assert not re.search(r"\b(model|effort)\s*:", text), (
+    assert not re.search(r"\b(model|effort|thinking)\s*:", text), (
         "the user's model and effort stay untouched"
     )
     assert "shell=True" not in text
@@ -405,10 +409,25 @@ def test_check_commands_must_be_one_short_line_so_the_printed_list_is_the_whole_
     assert logged(out, "2 plan check command(s) were left out")
 
 
-@pytest.mark.parametrize("branch", ["HEAD", "", "  ", "(HEAD detached at abc1234)"])
+@pytest.mark.parametrize(
+    "branch, flag",
+    [
+        ("HEAD", True),
+        ("", True),
+        ("  ", True),
+        ("(HEAD detached at abc1234)", True),
+        # the planner's boolean (git symbolic-ref -q HEAD exits non-zero) is the authority ...
+        ("feature/x", True),
+        # ... and the spellings no branch can have still count when the boolean is wrong
+        ("HEAD", False),
+        ("(HEAD detached at abc1234)", False),
+        ("HEAD detached at abc1234", False),
+        ("", False),
+    ],
+)
 @needs_node
-def test_a_detached_head_stops_a_real_run_before_any_agent_beyond_the_planner(run_wf, branch):
-    plan = plan_response(THREE, branch=branch)
+def test_a_detached_head_stops_a_real_run_before_any_agent_beyond_the_planner(run_wf, branch, flag):
+    plan = plan_response(THREE, branch=branch, detached=flag)
     real = run_wf(happy(plan=plan))
     assert real["result"]["status"] == "detached-head" and real["labels"] == ["plan"]
     assert (
@@ -421,6 +440,29 @@ def test_a_detached_head_stops_a_real_run_before_any_agent_beyond_the_planner(ru
     assert logged(dry, "would stop")
     ok = run_wf(happy(plan=plan_response(THREE, branch="feature/x")))
     assert ok["result"]["status"] == "done"
+
+
+@pytest.mark.parametrize(
+    "branch",
+    ["fix/detached-head-crash", "feature/undetached", "detached", "Detached-HEAD", "release/(1.0)"],
+)
+@needs_node
+def test_a_branch_whose_name_contains_detached_is_a_real_branch(run_wf, branch):
+    """The name used to be tested for the substring `detached`: a repo working on git or worktree tooling was told its
+    checkout was detached and refused, after only the planner ran."""
+    plan = plan_response(THREE, branch=branch, detached=False)
+    real = run_wf(happy(plan=plan))
+    assert real["result"]["status"] == "done" and "integrate" in real["labels"]
+    dry = run_wf(happy(plan=plan), {"plan": PLAN, "dryRun": True})
+    assert dry["result"]["status"] == "dry-run" and not logged(dry, "would stop")
+    assert "detached HEAD" not in dry["result"]["markdown"]
+
+
+@needs_node
+def test_the_planner_is_asked_for_git_symbolic_ref_semantics(run_wf):
+    out = run_wf(happy(), {"plan": PLAN, "dryRun": True})
+    prompt = out["calls"][0]["prompt"]
+    assert "git symbolic-ref -q HEAD exits non-zero" in prompt and "detached (true when" in prompt
 
 
 @pytest.mark.parametrize(
@@ -679,6 +721,7 @@ def test_schema_shapes_the_script_asks_for(run_wf):
         "reason",
         "baseCommit",
         "branch",
+        "detached",
         "dirtyTracked",
         "existingBranches",
         "checkCommands",
@@ -860,6 +903,90 @@ def test_a_dead_integrator_skips_the_review_and_tells_the_user_to_inspect_the_br
     ):
         assert needle in md, needle
     assert "not merged, not-reported" not in md and "Tick the merged steps" not in md
+
+
+@needs_node
+def test_an_integrator_that_throws_still_ends_in_a_report_listing_what_was_left_behind(run_wf):
+    """agent() throws once the user's token target is spent (the implementers can spend it): the script used to reject with
+    no result at all, although the hr/ branches were committed and the user had nothing to find them by."""
+    out = run_wf(happy(integrate={"$throw": "token budget exhausted: agent() refused (integrate)"}))
+    res = out["result"]
+    assert res["status"] == "failed" and res["merged"] == [] and res["needsInspection"] is True
+    assert {i["outcome"] for i in res["integration"]} == {"unknown"}
+    assert not calls_named(out, "review:") and "checks" not in out["labels"]
+    md = res["markdown"]
+    assert md.startswith("## Inspect your branch first")
+    assert "token budget exhausted" in md and "failed (" in md
+    head = md.split("## Steps")[0]
+    for g in ("g1", "g2", "g3"):
+        assert branch_of(g) in head, "every branch the run left behind is listed"
+    assert "git worktree list" in head and "git status" in head and "MERGE_HEAD" in head
+    assert "Tick the merged steps" not in md
+    assert logged(out, "The integration agent failed: token budget exhausted")
+    assert [g["id"] for g in res["implemented"]] == ["g1", "g2", "g3"]
+
+
+@needs_node
+def test_a_planner_that_throws_ends_in_a_failed_result_with_nothing_changed(run_wf):
+    out = run_wf(happy(plan={"$throw": "token budget exhausted"}))
+    res = out["result"]
+    assert res["status"] == "failed" and "No files were changed" in res["markdown"]
+    assert out["labels"] == ["plan"] and logged(out, "The planning agent failed: token budget")
+
+
+@pytest.mark.parametrize(
+    "spell",
+    [
+        lambda b: f"refs/heads/{b}",
+        lambda b: f"{b} ",
+        lambda b: f"  {b}",
+        lambda b: f"`{b}`",
+        lambda b: f'"{b}"',
+        lambda b: f"'refs/heads/{b}'",
+    ],
+    ids=["refs-heads", "trailing-space", "leading-space", "backticks", "quotes", "quoted-refs"],
+)
+@needs_node
+def test_branch_names_the_integrator_spells_differently_still_match(run_wf, spell):
+    """A differently spelled but identical branch name made every merge 'unknown', so the checks and the review were
+    skipped although everything had merged."""
+    r = happy()
+    r["integrate"] = {
+        **integrate_ok(["g1", "g2", "g3"]),
+        "results": [
+            {"branch": spell(branch_of(g)), "outcome": "merged", "detail": "clean"}
+            for g in ("g1", "g2", "g3")
+        ],
+    }
+    res = run_wf(r)["result"]
+    assert res["status"] == "done" and res["needsInspection"] is False
+    assert res["merged"] == [branch_of(g) for g in ("g1", "g2", "g3")]
+
+
+@needs_node
+def test_a_branch_reported_both_merged_and_conflicted_is_unknown(run_wf):
+    r = happy()
+    r["integrate"] = {
+        **integrate_ok(["g1", "g2", "g3"]),
+        "results": [
+            {"branch": branch_of("g1"), "outcome": "merged", "detail": "clean"},
+            {"branch": f"refs/heads/{branch_of('g1')}", "outcome": "conflict", "detail": "later"},
+            {"branch": branch_of("g2"), "outcome": "merged", "detail": "clean"},
+            {"branch": branch_of("g3"), "outcome": "merged", "detail": "clean"},
+        ],
+    }
+    res = run_wf(r)["result"]
+    states = {i["id"]: i["outcome"] for i in res["integration"]}
+    assert states == {"g1": "unknown", "g2": "merged", "g3": "merged"}
+    assert res["needsInspection"] is True and "conflicting outcomes" in res["markdown"]
+
+
+@needs_node
+def test_an_implementer_that_spells_its_branch_differently_is_still_matched(run_wf):
+    r = happy()
+    r["impl:g1"] = impl_ok("g1", branch=f"refs/heads/{branch_of('g1')}")
+    out = run_wf(r)
+    assert out["result"]["status"] == "done" and branch_of("g1") in out["result"]["merged"]
 
 
 @needs_node
@@ -1083,7 +1210,55 @@ def test_a_dead_reviewer_or_checks_agent_is_listed_as_not_checked(run_wf):
     notes = out["result"]["notChecked"]
     assert any("security review: the reviewer returned nothing" in n for n in notes)
     assert any("full checks: the agent returned nothing" in n for n in notes)
-    assert out["result"]["checks"] is None and out["result"]["status"] == "done"
+    # nothing verified the merged result: that is not 'done'
+    assert out["result"]["checks"] is None and out["result"]["status"] == "checks-unverified"
+
+
+@pytest.mark.parametrize(
+    "checks",
+    [
+        {"commands": [], "passed": True, "notRun": []},
+        {"commands": [], "passed": True, "notRun": ["mypy: not installed"]},
+        {"commands": [], "passed": False, "notRun": []},
+    ],
+)
+@needs_node
+def test_an_empty_check_list_is_not_a_pass(run_wf, checks):
+    """`{commands: [], passed: true}` used to give status 'done' and 'Full checks: passed' with no command listed."""
+    out = run_wf(happy(checks=checks))
+    res = out["result"]
+    md = res["markdown"]
+    assert "Full checks: passed" not in md
+    if checks["passed"]:
+        assert res["status"] == "checks-unverified"
+        assert "Full checks: NOT VERIFIED (no command was reported as run)" in md
+        assert any("no command was reported as run" in n for n in res["notChecked"])
+        assert logged(out, "the full checks were NOT verified")
+    else:
+        assert res["status"] == "checks-failed" and "Full checks: FAILED" in md
+    assert res["needsInspection"] is False, "the merges themselves are fine"
+
+
+@needs_node
+def test_a_pass_that_lists_a_failing_command_is_counted_as_failed(run_wf):
+    checks = {
+        "commands": [
+            {"command": "pytest -q", "exitCode": 0, "tail": "ok"},
+            {"command": "ruff check .", "exitCode": 1, "tail": "E501"},
+        ],
+        "passed": True,
+        "notRun": [],
+    }
+    res = run_wf(happy(checks=checks))["result"]
+    assert res["status"] == "checks-failed" and "Full checks: FAILED" in res["markdown"]
+    assert any("counted as failed" in n for n in res["notChecked"])
+
+
+@needs_node
+def test_real_passing_checks_are_still_done(run_wf):
+    out = run_wf(happy())
+    assert out["result"]["status"] == "done" and "Full checks: passed" in out["result"]["markdown"]
+    assert not any("NOT verified" in m for m in out["logs"])
 
 
 @needs_node
@@ -1171,6 +1346,8 @@ def test_skill_still_works_when_the_helper_is_missing(name):
 @pytest.mark.parametrize("name", SKILL_NAMES)
 def test_skill_allowed_tools_are_narrow_and_read_only(name):
     _, fields, _ = split_skill(name)
+    # a block list (`allowed-tools:` then `- ...` lines) reads as an empty value here: refuse it instead of passing
+    assert fields.get("allowed-tools", "x").strip(), f"{name}: write allowed-tools on one line"
     tokens = re.findall(r"Bash\([^)]*\)|\S+", fields.get("allowed-tools", ""))
     for tok in tokens:
         assert re.fullmatch(r"Bash\((claude-hr-ctl|gh) [a-z -]+ ?\*\)", tok), (

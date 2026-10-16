@@ -97,9 +97,127 @@ def test_args_select_dimensions_votes_and_cap():
 @needs_node
 def test_findings_are_kept_but_flagged_when_every_skeptic_fails():
     out = run("skeptics-fail", {"dimensions": ["correctness"]})
-    assert out["result"]["confirmed"], "an unverifiable finding must not vanish silently"
-    assert all(f["answered"] == 0 for f in out["result"]["confirmed"])
+    res = out["result"]
+    assert res["confirmed"], "an unverifiable finding must not vanish silently"
+    assert all(f["answered"] == 0 for f in res["confirmed"])
     assert any("could not be verified" in m for m in out["logs"])
+    # the text a caller relays says so too: a finding nobody checked is a claim, never "survived verification"
+    md = res["markdown"]
+    lines = [x for x in md.splitlines() if x.startswith("- [")]
+    assert len(lines) == 3 and all("[unverified: no skeptic answered]" in x for x in lines)
+    assert "3 of 3 finding(s) below are unverified" in md
+    assert res["unverified"] == 3
+    assert any(
+        "0 finding(s) survived verification, 3 more could not be verified" in m for m in out["logs"]
+    )
+
+
+@needs_node
+def test_a_finding_checked_by_only_some_skeptics_says_so_and_a_checked_one_is_unmarked():
+    out = run("skeptic-half", {"dimensions": ["correctness"]})
+    md = out["result"]["markdown"]
+    assert "unverified" not in md.replace("[partly verified", "")
+    assert "[partly verified: 1 of 2 skeptics answered]" in md
+    clean = run("normal", {"dimensions": ["correctness"]})["result"]["markdown"]
+    assert (
+        "unverified" not in clean and "partly verified" not in clean and "Not checked" not in clean
+    )
+
+
+@pytest.mark.parametrize(
+    "dimensions",
+    [
+        ["Security", "nope"],
+        ["securty"],
+        ["performance", "style"],
+        "security,nope",
+        "nope",
+        [5],
+        5,
+        {"security": True},
+        False,
+    ],
+)
+@needs_node
+def test_an_unknown_dimension_is_an_error_not_a_clean_review(dimensions):
+    """`dimensions: ["securty"]` used to review nothing and return "No findings survived verification." after one
+    wasted scope agent."""
+    out = run(args={"dimensions": dimensions})
+    res = out["result"]
+    assert res["status"] == "invalid-args" and res["confirmed"] == []
+    assert res["unknown"] and res["valid"] == [
+        "correctness",
+        "security",
+        "robustness",
+        "tests",
+        "simplicity",
+    ]
+    assert "Unknown dimension(s)" in res["markdown"] and "Nothing was reviewed" in res["markdown"]
+    assert "survived" not in res["markdown"]
+    assert out["calls"] == [], "no agent may start for arguments that cannot work"
+
+
+@pytest.mark.parametrize(
+    "dimensions, expected",
+    [
+        (["Security", "tests "], ["security", "tests"]),
+        ("security, TESTS", ["security", "tests"]),
+        ("security tests", ["security", "tests"]),
+        (["tests", "tests", "security"], ["security", "tests"]),
+        ([], ["correctness", "security", "robustness", "tests", "simplicity"]),
+        ("", ["correctness", "security", "robustness", "tests", "simplicity"]),
+        (None, ["correctness", "security", "robustness", "tests", "simplicity"]),
+    ],
+)
+@needs_node
+def test_dimensions_accept_a_list_or_a_string_in_any_case(dimensions, expected):
+    out = run(args={"dimensions": dimensions})
+    assert out["result"]["dimensions"] == expected
+    assert sorted(c[5:] for c in out["calls"] if c.startswith("find:")) == sorted(expected)
+
+
+@needs_node
+def test_a_dead_scope_agent_is_not_reported_as_nothing_to_review():
+    out = run("scope-null")
+    res = out["result"]
+    assert res["status"] == "failed" and "returned nothing" in res["markdown"]
+    assert res["markdown"] != "Nothing to review." and out["calls"] == ["scope"]
+    assert run("empty")["result"]["status"] == "nothing-to-review"
+
+
+@pytest.mark.parametrize("scenario", ["finder-security-null", "finder-security-throws"])
+@needs_node
+def test_a_dead_finder_is_listed_as_not_reviewed_instead_of_reading_as_clean(scenario):
+    out = run(scenario)
+    res = out["result"]
+    assert res["status"] == "reviewed"
+    assert any("The security review: its finder returned nothing" in n for n in res["notChecked"])
+    assert (
+        "Not checked:" in res["markdown"] and "security" in res["markdown"].split("Not checked:")[1]
+    )
+    assert "real bug" in res["markdown"], "the other dimensions are still reported"
+
+
+@needs_node
+def test_when_no_finder_answers_the_result_is_a_failure_not_a_clean_review():
+    res = run("finders-null")["result"]
+    assert res["status"] == "failed" and res["confirmed"] == []
+    assert (
+        "Nothing was reviewed" in res["markdown"] and "No findings survived" not in res["markdown"]
+    )
+    assert len(res["notChecked"]) == 5
+
+
+@needs_node
+def test_the_review_workflow_sets_no_model_or_effort_on_any_agent():
+    """claude-hr never sets model or effort: the scope agent used to run at effort 'low' and chose the files every
+    finder reviews."""
+    for scenario in ("normal", "skeptics-fail"):
+        out = run(scenario)
+        assert out["prompts"], scenario
+        for p in out["prompts"]:
+            assert p["model"] is None and p["effort"] is None, (scenario, p["label"])
+    assert not re.search(r"\b(model|effort)\s*:", WF.read_text(encoding="utf-8"))
 
 
 def _repo(tmp_path):

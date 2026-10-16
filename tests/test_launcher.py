@@ -1,3 +1,5 @@
+from pathlib import Path
+
 import pytest
 
 from claude_hr import launcher
@@ -177,3 +179,224 @@ def test_classify_with_real_cli_shape():
 def test_hidden_subcommands_are_still_passthrough():
     shape = launcher._parse_help(HELP)  # `daemon` is not listed in this help, like the real CLI
     assert launcher.classify(["daemon", "status"], shape) == "passthrough"
+
+
+# ---- programs the launcher spawns are never searched in the current directory ---------------------------------------
+def _exe(directory, name):
+    """An executable file `name` (with .exe on Windows) in `directory`; it is never actually run."""
+    import os
+    import stat
+
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / (name + (".exe" if os.name == "nt" else ""))
+    path.write_bytes(b"")
+    path.chmod(path.stat().st_mode | stat.S_IXUSR)
+    return path
+
+
+@pytest.fixture
+def hostile_cwd(tmp_path, monkeypatch):
+    """cwd is a freshly cloned repository; PATH has a relative entry, an empty one and one good absolute directory."""
+    import os
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    good = tmp_path / "bin"
+    good.mkdir()
+    monkeypatch.chdir(repo)
+    monkeypatch.setenv("PATH", os.pathsep.join([".", "", str(good)]))
+    # a normal terminal: Windows then searches the current directory first, which is exactly the hole
+    monkeypatch.delenv("NoDefaultCurrentDirectoryInExePath", raising=False)
+    return repo, good
+
+
+def _fake_claude(monkeypatch, tmp_path):
+    claude = _exe(tmp_path / "claude-home", "claude")
+    monkeypatch.setattr(launcher.procutil, "find_claude", lambda *_a, **_k: claude)
+    monkeypatch.setattr(
+        launcher, "_cli_shape", lambda _real: None
+    )  # never run the fake binary for `--help`
+    return claude
+
+
+def test_op_run_launch_never_picks_op_from_the_current_directory(
+    hostile_cwd, tmp_path, monkeypatch, capsys
+):
+    """Regression: credentials.op_env_file made the launcher run a bare `op` (shutil.which + CreateProcess both look in
+    the cwd first on Windows), so an `op.exe` committed to a cloned repo ran before Claude's trust prompt."""
+    repo, good = hostile_cwd
+    planted = _exe(repo, "op")
+    claude = _fake_claude(monkeypatch, tmp_path)
+    monkeypatch.setenv("CLAUDE_HR_HEADROOM__ENABLED", "false")
+    monkeypatch.setenv("CLAUDE_HR_CREDENTIALS__OP_ENV_FILE", "x.env")
+
+    def planned_command():
+        assert launcher.main(["--hr-dry-run", "hello"]) == 0
+        lines = capsys.readouterr().err.splitlines()
+        return next(x.split("command: ", 1)[1] for x in lines if "command: " in x)
+
+    line = planned_command()
+    assert (
+        "op run" not in line and planted.name not in line
+    )  # no op anywhere: claude starts as before
+    assert line == f"{claude} hello"
+
+    real_op = _exe(
+        good, "op"
+    )  # a real 1Password CLI on an absolute PATH entry is used, by its absolute path
+    assert planned_command() == f"{real_op} run --no-masking --env-file x.env -- {claude} hello"
+
+
+def _launch_and_record(monkeypatch, args, headroom=False):
+    """Run launcher.main up to the spawn, record the argv that would have been started, and fail the spawn."""
+    spawned: list[list[str]] = []
+
+    def refuse_posix(path, argv, env=None):
+        spawned.append(list(argv))
+        raise OSError("recorded, not started")
+
+    class RefusePopen:
+        def __init__(self, argv, *a, **k):
+            spawned.append(list(argv))
+            raise OSError("recorded, not started")
+
+    import subprocess
+
+    monkeypatch.setattr(launcher.os, "execve", refuse_posix)
+    monkeypatch.setattr(subprocess, "Popen", RefusePopen)
+    monkeypatch.setenv("CLAUDE_HR_HEADROOM__ENABLED", "true" if headroom else "false")
+    rc = launcher.main(["--hr-no-limits", *args])
+    return rc, spawned
+
+
+def test_the_spawn_uses_the_resolved_op_not_a_planted_one(hostile_cwd, tmp_path, monkeypatch):
+    repo, good = hostile_cwd
+    planted = _exe(repo, "op")
+    claude = _fake_claude(monkeypatch, tmp_path)
+    monkeypatch.setenv("CLAUDE_HR_CREDENTIALS__OP_ENV_FILE", "x.env")
+
+    rc, spawned = _launch_and_record(monkeypatch, ["hello"])  # no real op anywhere on PATH
+    assert rc == 126 and spawned == [
+        [str(claude), "hello"]
+    ]  # fail open: no wrapper, and never the planted file
+
+    real_op = _exe(good, "op")
+    rc, spawned = _launch_and_record(monkeypatch, ["hello"])
+    assert spawned[0][0] == str(real_op) and spawned[0][0] != str(planted)
+
+
+def test_a_bare_configured_claude_name_is_not_taken_from_the_current_directory(
+    hostile_cwd, tmp_path, monkeypatch, capsys
+):
+    """claude.binary = "claude" next to a committed ./claude file: pathlib drops the "./", so the old code exec'd it."""
+    repo, good = hostile_cwd
+    _exe(repo, "claude")
+    monkeypatch.setattr(launcher.procutil, "find_claude", lambda *_a, **_k: Path("claude"))
+    monkeypatch.setattr(launcher, "_cli_shape", lambda _real: None)
+    monkeypatch.setenv("CLAUDE_HR_HEADROOM__ENABLED", "false")
+    assert (
+        launcher.main(["--hr-no-limits", "hello"]) == 127
+    )  # not on any absolute PATH entry: not found
+    assert "not found" in capsys.readouterr().err
+    real = _exe(good, "claude")
+    rc, spawned = _launch_and_record(monkeypatch, ["hello"])
+    assert spawned == [[str(real), "hello"]]
+
+    # the two fast paths (a nested launch from inside a session, and a passthrough command) resolve the same way
+    import subprocess
+
+    seen: list[list[str]] = []
+
+    def fake_call(argv, *a, **k):
+        seen.append(list(argv))
+        return 7
+
+    def fake_execv(path, argv):
+        seen.append(list(argv))
+        raise SystemExit(7)
+
+    monkeypatch.setenv(
+        "CLAUDE_HR_NEST", "0"
+    )  # main() writes it for a nested launch: let monkeypatch undo that
+    monkeypatch.setattr(subprocess, "call", fake_call)
+    monkeypatch.setattr(launcher.os, "execv", fake_execv)
+    for env_session, argv in (("1", ["hello"]), ("", ["mcp", "list"])):
+        if env_session:
+            monkeypatch.setenv("CLAUDE_HR_SESSION", env_session)
+        else:
+            monkeypatch.delenv("CLAUDE_HR_SESSION", raising=False)
+        seen.clear()
+        try:
+            rc = launcher.main(argv)
+        except SystemExit as exc:
+            rc = exc.code
+        assert rc == 7 and seen == [[str(real), *argv]], argv
+
+
+@pytest.mark.skipif(__import__("os").name == "nt", reason="the limiter prefix is POSIX only")
+def test_the_limiter_prefix_is_resolved_and_dropped_when_missing(
+    hostile_cwd, tmp_path, monkeypatch
+):
+    repo, good = hostile_cwd
+    planted = _exe(repo, "systemd-run")
+    claude = _fake_claude(monkeypatch, tmp_path)
+    monkeypatch.setattr(
+        launcher.paths, "IS_WINDOWS", False
+    )  # already the case here; explicit for the reader
+    from claude_hr import resources
+
+    monkeypatch.setattr(
+        resources,
+        "wrap_command_posix",
+        lambda _cfg, cmd: ["systemd-run", "--user", "--scope", *cmd],
+    )
+    spawned: list[list[str]] = []
+
+    def record(path, argv, env=None):
+        spawned.append(list(argv))
+        raise OSError("recorded, not started")
+
+    monkeypatch.setattr(launcher.os, "execve", record)
+    monkeypatch.setenv("CLAUDE_HR_HEADROOM__ENABLED", "false")
+    assert launcher.main(["--hr-force", "hello"]) == 126
+    assert spawned == [
+        [str(claude), "hello"]
+    ]  # the planted systemd-run is ignored; claude runs unlimited
+
+    real = _exe(good, "systemd-run")
+    spawned.clear()
+    assert launcher.main(["--hr-force", "hello"]) == 126
+    assert spawned == [[str(real), "--user", "--scope", str(claude), "hello"]]
+    assert str(planted) not in spawned[0]
+
+
+def test_headroom_wrap_is_never_a_headroom_from_the_current_directory(
+    hostile_cwd, tmp_path, monkeypatch, capsys
+):
+    """`--hr-wrap` starts `headroom wrap claude`: the binary found on a relative PATH entry comes back as a bare name."""
+    repo, good = hostile_cwd
+    planted = _exe(repo, "headroom")
+    _fake_claude(monkeypatch, tmp_path)
+    monkeypatch.delenv("CLAUDE_HR_HEADROOM_BIN", raising=False)
+    rc, spawned = _launch_and_record(monkeypatch, ["--hr-wrap", "hello"], headroom=True)
+    assert rc == 126 and spawned == [], "fail open to an error message, never to the planted file"
+    assert "was not found on PATH" in capsys.readouterr().err
+    real = _exe(good, "headroom")
+    monkeypatch.setenv(
+        "CLAUDE_HR_HEADROOM_BIN", str(real)
+    )  # an explicit, absolute choice is honoured
+    rc, spawned = _launch_and_record(monkeypatch, ["--hr-wrap", "hello"], headroom=True)
+    assert spawned and spawned[0][:2] == [str(real), "wrap"] and str(planted) not in spawned[0]
+
+
+def test_resolved_command_is_the_single_choke_point(hostile_cwd):
+    repo, good = hostile_cwd
+    _exe(repo, "tool")
+    assert launcher._resolved_command(["tool", "--x"]) is None
+    real = _exe(good, "tool")
+    assert launcher._resolved_command(["tool", "--x"]) == [str(real), "--x"]
+    absolute = str(real)
+    assert launcher._resolved_command([absolute, "y"]) == [
+        absolute,
+        "y",
+    ]  # an explicit path is the caller's choice

@@ -6,6 +6,10 @@ a repo's own choices always win and a second run changes nothing. Nothing here t
 repository is untrusted input: git is found through PATH only (never the current directory), and package.json,
 pyproject.toml and setup.cfg are read only when they are regular files of at most 1 MB.
 
+The command built on this module (`claude-hr-ctl init-repo`) works on the top level of a git work tree only: in a
+subdirectory it leaves out the files that belong to the top level (ROOT_ONLY_GROUPS), and outside a work tree (a plain
+folder, a bare repository, a `.git` directory) it refuses; see locate().
+
 Templates live in data/repo-template/ under non-dot names (wheels and some tools treat dot-directories specially);
 _FILES maps each template to the path it is written to.
 """
@@ -25,8 +29,11 @@ from pathlib import Path
 from . import paths, procutil
 
 GROUPS = ("github", "docs", "editor", "dependabot", "codeowners", "review", "ci")
-# GitHub reads .github/ (issue forms, PR template, CODEOWNERS, Dependabot, workflows) only from the top level of the repository
-ROOT_ONLY_GROUPS = ("github", "dependabot", "codeowners", "ci")
+# Files that belong to the top level of the repository. GitHub reads .github/ (issue forms, PR template, CODEOWNERS,
+# Dependabot, workflows) and reviewers read REVIEW.md only there, so a copy in a subdirectory is inert; a nested
+# .editorconfig (`root = true`) or .gitattributes is worse, it silently overrides the repository's own rules for that
+# whole subtree. In a subdirectory these groups are left out, and outside a work tree nothing is scaffolded at all.
+ROOT_ONLY_GROUPS = ("github", "dependabot", "codeowners", "editor", "review", "ci")
 
 # group ->(destination in the repo, template under data/repo-template/); dependabot, codeowners and ci are built below
 _FILES: dict[str, tuple[tuple[str, str], ...]] = {
@@ -76,6 +83,28 @@ _NOT_PROVISIONED = frozenset({"just"})
 _PIP_TOOLS = frozenset({"pytest", "ruff", "mypy", "pyright", "black", "flake8", "isort"})
 _REQUIREMENT_NAME = re.compile(r"^[A-Za-z0-9._-]*requirements[A-Za-z0-9._-]*\.txt$")
 _MAX_COMMANDS = 12
+_COREPACK_ENABLE = "npm install -g corepack && corepack enable"
+_RENOVATE_FILES = (
+    "renovate.json",
+    "renovate.json5",
+    ".renovaterc",
+    ".renovaterc.json",
+    ".github/renovate.json",
+    ".github/renovate.json5",
+)
+_JOBS_KEY = re.compile(r"^jobs[ \t]*:", re.MULTILINE)
+# `on: push`, `on: [push, pull_request]`, `on: {push: ...}`, `on:\n  push:`, `on:\n  - pull_request`
+_PUSH_TRIGGER = re.compile(
+    r"""^["']?on["']?[ \t]*:.*\b(?:push|pull_request)\b"""
+    r"|^[ \t]+(?:push|pull_request)[ \t]*:"
+    r"|^[ \t]*-[ \t]*(?:push|pull_request)[ \t]*$",
+    re.MULTILINE,
+)
+_TEST_COMMAND = re.compile(
+    r"\b(?:pytest|unittest|tox|nox|jest|vitest|mocha|rspec|phpunit|ctest"
+    r"|go[ \t]+test|cargo[ \t]+(?:test|nextest)|dotnet[ \t]+test|make[ \t]+(?:test|check)"
+    r"|(?:npm|pnpm|yarn|bun)[ \t]+(?:run[ \t]+)?test)\b"
+)
 # package.json / pyproject.toml / setup.cfg come from the repository being scaffolded, so they are read like untrusted input
 _MAX_MANIFEST_BYTES = 1_000_000
 # inherited when run from inside a git hook; they would point git at a different repository than `cwd`
@@ -103,6 +132,36 @@ class ApplyResult:
 def _git(root: Path, *args: str):
     env = {k: v for k, v in os.environ.items() if k not in _GIT_ENV_DROP}
     return procutil.run(["git", *args], timeout=15, env=env, cwd=root)
+
+
+def _is_test_file(name: str) -> bool:
+    return name.endswith(".py") and (name.startswith("test_") or name.endswith("_test.py"))
+
+
+def _has_test_files(directory: Path) -> bool:
+    """A file pytest would collect (test_*.py, *_test.py) in `directory` or in a subdirectory up to three levels down.
+    Bounded (depth and entries), because the directory comes from the repository being scaffolded."""
+    budget = 2000
+    pending = [(str(directory), 0)]
+    while pending:
+        current, depth = pending.pop()
+        try:
+            with os.scandir(current) as it:
+                for entry in it:
+                    budget -= 1
+                    if budget < 0:
+                        return False
+                    if _is_test_file(entry.name) and entry.is_file():
+                        return True
+                    if (
+                        depth < 3
+                        and not entry.name.startswith((".", "__"))
+                        and entry.is_dir(follow_symlinks=False)
+                    ):
+                        pending.append((entry.path, depth + 1))
+        except OSError:
+            continue
+    return False
 
 
 _URL_REMOTE = re.compile(
@@ -220,15 +279,14 @@ class _Repo:
 
     @functools.cached_property
     def pytest_ready(self) -> bool:
-        """pytest has something to run: a tests directory with Python files, or its own configuration (`pytest` exits 5, a
-        failure, when it collects nothing)."""
-        from . import verify
-
+        """pytest has something to run: at least one test file (test_*.py or *_test.py, pytest's own collection pattern)
+        in a tests directory, or its own configuration. `pytest` exits 5, a failure, when it collects nothing, and an
+        `__init__.py`, a `conftest.py` or a helper module collects nothing."""
         return (
             "pytest" in self.python_tool
             or self.has("pytest.ini")
             or "[tool:pytest]" in self.setup_cfg
-            or any(verify._has_py_files(self.root / d) for d in ("tests", "test"))
+            or any(_has_test_files(self.root / d) for d in ("tests", "test"))
         )
 
     @functools.cached_property
@@ -319,6 +377,39 @@ class _Repo:
                 return any(e.name.lower().endswith((".yml", ".yaml")) for e in it)
         except OSError:
             return False
+
+    @functools.cached_property
+    def test_workflow(self) -> str | None:
+        """File name of a workflow the repo already has (other than ci.yml itself) that runs on push or pull_request and
+        starts a test command: a second workflow running the same suite would double every CI run, and this skeleton
+        knows nothing of the repo's services, secrets or matrix. Deliberately simple and conservative: only a plain
+        `on: push|pull_request` header followed by an obvious test command counts."""
+        directory = self.root / ".github" / "workflows"
+        try:
+            with os.scandir(directory) as it:
+                names = sorted(e.name for e in it if e.name.lower().endswith((".yml", ".yaml")))
+        except OSError:
+            return None
+        for name in names[:50]:
+            if name.lower() in {"ci.yml", "ci.yaml"}:
+                continue  # the file this skeleton would write: _action reports it as already there
+            data = self._read_manifest(f".github/workflows/{name}")
+            if data is None:
+                continue
+            text = "\n".join(
+                line
+                for line in data.decode("utf-8", "replace").splitlines()
+                if not line.lstrip().startswith("#")
+            )
+            jobs = _JOBS_KEY.search(text)
+            if jobs and _PUSH_TRIGGER.search(text[: jobs.start()]) and _TEST_COMMAND.search(text):
+                return name
+        return None
+
+    @functools.cached_property
+    def uses_renovate(self) -> bool:
+        """The repo already has a dependency bot configured (Renovate): a second one would open duplicate pull requests."""
+        return any(self.has(p) for p in _RENOVATE_FILES) or "renovate" in self.package_json
 
     def ecosystems(self, *, actions: bool) -> list[str]:
         out: list[str] = []
@@ -499,11 +590,14 @@ def _toolchain(repo: _Repo, lang: str, commands: list[list[str]]) -> tuple[list[
     tools = {argv[0] for argv in commands}
     if lang == "node":
         pm = repo.node_pm
-        if pm == "pnpm":  # corepack ships with Node and reads the packageManager field
+        # corepack provides pnpm and yarn at the version the packageManager field names. It is NOT guaranteed to ship
+        # with Node: Node 25 and later no longer bundle it, and `lts/*` (steps-node.yml) moves to such a release, so it
+        # is installed first rather than assumed (the npm that comes with every Node does the install).
+        if pm == "pnpm":
             frozen = "--frozen-lockfile" if repo.has("pnpm-lock.yaml") else "--no-frozen-lockfile"
-            return [], f"corepack enable && pnpm install {frozen}"
+            return [], f"{_COREPACK_ENABLE} && pnpm install {frozen}"
         if pm == "yarn":
-            return [], "corepack enable && yarn install"
+            return [], f"{_COREPACK_ENABLE} && yarn install"
         if pm == "bun":
             locked = repo.has("bun.lock") or repo.has("bun.lockb")
             return ["bun"], "bun install --frozen-lockfile" if locked else "bun install"
@@ -543,6 +637,12 @@ def _static(group: str, repo: _Repo) -> list[tuple[str, str]]:
 
 
 def _dependabot(repo: _Repo, wanted: frozenset[str], notes: list[str]) -> list[tuple[str, str]]:
+    if repo.uses_renovate:
+        notes.append(
+            "dependabot: a Renovate configuration is present, so dependabot.yml was skipped "
+            "(two dependency bots open duplicate pull requests)"
+        )
+        return []
     # a ci.yml created in this same run uses actions, so Dependabot must watch them from day one
     actions = repo.has_workflows or ("ci" in wanted and bool(repo.languages))
     ecosystems = repo.ecosystems(actions=actions)
@@ -589,12 +689,36 @@ def _codeowners(repo: _Repo, notes: list[str]) -> list[tuple[str, str]]:
     return [(primary, _render(_template("github/CODEOWNERS"), owner=owner, repo=name))]
 
 
-def _ci(repo: _Repo, commands: list[list[str]], notes: list[str]) -> list[tuple[str, str]]:
+def _ci(
+    repo: _Repo,
+    commands: list[list[str]],
+    notes: list[str],
+    *,
+    forced: bool = False,
+    discovered: bool = False,
+) -> list[tuple[str, str]]:
     langs = repo.languages
     if not langs:
         notes.append("ci: no Python, Node, Go or Rust project found, workflow skipped")
         return []
+    existing = repo.test_workflow
+    own_ci = ".github/workflows/ci.yml"  # when it is there already, _action reports "exists (kept)" instead
+    if existing and not forced and not any(repo.has(p) for p in (own_ci, *_ALTERNATES[own_ci])):
+        notes.append(
+            f"ci: .github/workflows/{existing} already runs tests on push or pull_request, so no second "
+            "workflow was written (it would run the suite twice); ask for the skeleton with `--only ci`"
+        )
+        return []
     chosen = commands or [c for lang in langs for c in _default_commands(repo, lang, notes)]
+    if discovered and not repo.pytest_ready:
+        # automatic discovery (verify.discover) counts an `__init__.py` or a conftest.py as a test suite
+        kept = [c for c in chosen if "pytest" not in c[:5]]
+        if len(kept) < len(chosen):
+            notes.append(
+                "ci: left out pytest: no test file (test_*.py or *_test.py) under tests/ or test/ and no "
+                "pytest configuration, so it would exit 5 (nothing collected) and turn the first push red"
+            )
+        chosen = kept
     run_commands = [c for c in chosen if c[0] not in _NOT_PROVISIONED]
     if len(run_commands) < len(chosen):
         left_out = ", ".join(f"`{shlex.join(c)}`" for c in chosen if c[0] in _NOT_PROVISIONED)
@@ -645,18 +769,57 @@ def parse_groups(only: str | Iterable[str] | None) -> list[str]:
     return [g for g in GROUPS if g in names]
 
 
+def _same_path(a: str | Path, b: str | Path) -> bool:
+    return os.path.normcase(os.path.realpath(a)) == os.path.normcase(os.path.realpath(b))
+
+
+def _in_git_dir(root: Path) -> bool:
+    """`root` is a repository's own git directory (`.git` itself or anything below it) or a bare repository: nothing
+    created there is part of a work tree."""
+    real = Path(os.path.realpath(root))
+    if any(part.lower() == ".git" for part in real.parts):
+        return True
+    return any(
+        os.path.isfile(p / "HEAD") and os.path.isdir(p / "objects") and os.path.isdir(p / "refs")
+        for p in (real, *real.parents)
+    )
+
+
+def _dot_git_top(root: Path) -> Path | None:
+    """The nearest directory at or above `root` that has a `.git` entry (a directory, or the file of a linked worktree
+    or submodule): the answer when git itself cannot be run."""
+    real = Path(os.path.realpath(root))
+    return next((p for p in (real, *real.parents) if os.path.lexists(p / ".git")), None)
+
+
+def locate(root: Path) -> tuple[str, Path | None]:
+    """How `root` relates to a git work tree, as (kind, top level):
+
+    ("top", None)       `root` is the top level of a work tree
+    ("subdir", top)     `root` is inside the work tree whose top level is `top`
+    ("gitdir", None)    `root` is a git directory (a bare repository, `.git` or something below it), not a work tree
+    ("none", None)      no git repository contains `root`
+
+    git answers when it can; when it cannot be run (not installed, a timeout, `safe.directory`), the `.git` marker is
+    looked up on disk, so the answer does not depend on git being usable.
+    """
+    root = Path(root)
+    r = _git(root, "rev-parse", "--show-toplevel")
+    top = Path(r.stdout.strip()) if r.returncode == 0 and r.stdout.strip() else None
+    if top is None:
+        if _in_git_dir(root):
+            return "gitdir", None
+        top = _dot_git_top(root)
+        if top is None:
+            return "none", None
+    return ("top", None) if _same_path(top, root) else ("subdir", top)
+
+
 def git_top_level(root: Path) -> Path | None:
     """The top level of the git repository that contains `root` when `root` is a SUBDIRECTORY of it; None when `root` is the
-    top level itself, is not in a repository, or git is unavailable (nothing can be said, so nothing is warned about)."""
-    r = _git(Path(root), "rev-parse", "--show-toplevel")
-    top = r.stdout.strip() if r.returncode == 0 else ""
-    if not top:
-        return None
-
-    def same(a: str | Path, b: str | Path) -> bool:
-        return os.path.normcase(os.path.realpath(a)) == os.path.normcase(os.path.realpath(b))
-
-    return None if same(top, root) else Path(top)
+    top level itself or is not in a work tree."""
+    kind, top = locate(root)
+    return top if kind == "subdir" else None
 
 
 def _action(root: Path, group: str, path: str, content: str) -> Action:
@@ -668,11 +831,19 @@ def plan_with_notes(
     root: Path,
     only: str | Iterable[str] | None = None,
     commands: Sequence[Sequence[str]] | None = None,
+    *,
+    discovered: bool = False,
 ) -> tuple[list[Action], list[str]]:
-    """The actions plus human-readable notes about anything skipped or worth a look. Reads the repo, never writes."""
+    """The actions plus human-readable notes about anything skipped or worth a look. Reads the repo, never writes.
+
+    `discovered` says `commands` came from automatic discovery (verify.discover) rather than from a person: a pytest
+    command it proposes for a tests directory that holds no test file is then left out, like the per-language default.
+    """
     root = Path(root)
     groups = parse_groups(only)
     wanted = frozenset(groups)
+    # naming a subset of the groups is asking for them: the "the repo already has CI" heuristic then stands aside
+    forced = wanted != frozenset(GROUPS)
     repo = _Repo(root)
     notes: list[str] = []
     cleaned, dropped = _clean_commands(commands)
@@ -688,7 +859,7 @@ def plan_with_notes(
             elif group == "codeowners":
                 pairs = _codeowners(repo, notes)
             elif group == "ci":
-                pairs = _ci(repo, cleaned, notes)
+                pairs = _ci(repo, cleaned, notes, forced=forced, discovered=discovered)
             elif group == "github":
                 pairs = _github(repo, notes)
             else:
@@ -707,13 +878,16 @@ def plan(
     root: Path,
     only: str | Iterable[str] | None = None,
     commands: Sequence[Sequence[str]] | None = None,
+    *,
+    discovered: bool = False,
 ) -> list[Action]:
     """What init-repo would create, in a fixed order (group order, then template order).
 
     `only` limits the groups (a list, or a comma-separated string); `commands` are argv lists (for example the fast
-    checks from the verify recipe) that the ci group runs instead of the per-language defaults.
+    checks from the verify recipe) that the ci group runs instead of the per-language defaults (`discovered`: see
+    plan_with_notes).
     """
-    return plan_with_notes(root, only, commands)[0]
+    return plan_with_notes(root, only, commands, discovered=discovered)[0]
 
 
 def _relative_parts(path: str) -> tuple[str, ...] | None:
