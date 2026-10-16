@@ -813,7 +813,9 @@ def _not_a_person() -> str | None:
     return None
 
 
-def _show_recipe(root: Path, recipe) -> None:
+def _show_recipe(
+    root: Path, recipe, gate_timeout_s: float | None = None, gate_tier: str = "fast"
+) -> None:
     """Every check of both tiers, in full, exactly as the gate would run it.
 
     This is what a person reads before approving the file, so nothing is left out and nothing is printed raw: name,
@@ -821,19 +823,30 @@ def _show_recipe(root: Path, recipe) -> None:
     shown as \\x1b / \\u202e, it cannot erase or reorder the line). A [[full]] check is only labelled a repeat when
     it is IDENTICAL to a [[fast]] check (name, argv, timeout and cwd); one that merely shares a name with a fast
     check is shown like any other, so a difference cannot hide behind a familiar name.
+
+    `gate_timeout_s` (verify.gate_timeout_s) is what ALL the checks of one end-of-turn run get together. A check of the
+    tier the gate runs whose own timeout_s is above it is shown with the limit that really applies there, and what
+    happens at that limit: the gate stops it, tells the user and does not block (`verify run` honours timeout_s).
     """
     from . import verify
 
     fast = list(recipe.fast)
+    gate_tier = "full" if gate_tier == "full" and recipe.full else "fast"
     for tier in ("fast", "full"):
         for n, c in enumerate(getattr(recipe, tier), 1):
             same = (
                 next((i for i, f in enumerate(fast, 1) if f == c), None) if tier == "full" else None
             )
             repeat = f"   (identical to [fast {same}])" if same else ""
+            limit = f"timeout {c.timeout_s}s"
+            if gate_timeout_s is not None and tier == gate_tier and c.timeout_s > gate_timeout_s:
+                limit = (
+                    f"timeout {c.timeout_s}s, but the end-of-turn gate stops it after {gate_timeout_s:g}s "
+                    "(its time budget, verify.gate_timeout_s, shared by all checks) and then does not block"
+                )
             out(
                 f"  [{tier} {n}] {verify.safe_text(c.name)}: {verify.command_line(c)}"
-                f"   (timeout {c.timeout_s}s, cwd {verify.safe_text(c.cwd)}){repeat}"
+                f"   ({limit}, cwd {verify.safe_text(c.cwd)}){repeat}"
             )
     for note in getattr(recipe, "notes", None) or []:
         out(f"  note: {verify.safe_text(str(note)[:300])}")
@@ -909,10 +922,17 @@ def cmd_fmt(a, cfg) -> int:
 
 def cmd_verify(a, cfg) -> int:
     """The repo's verify recipe (.claude/hr-verify.toml): propose it, trust it, run it."""
-    from . import verify
+    from . import stop_gate, verify
 
     root = _repo_root()
     cp = verify.config_path(root)
+    try:
+        gate_budget = float(cfg.get("verify.gate_timeout_s", verify.DEFAULT_GATE_TIMEOUT_S))
+    except (TypeError, ValueError):
+        gate_budget = float(verify.DEFAULT_GATE_TIMEOUT_S)
+    # what the checks of one end-of-turn run can really get: the setting, and never more than the hook has left
+    gate_budget = min(gate_budget, stop_gate.HOOK_BUDGET_S - verify.POST_RUN_RESERVE_S)
+    gate_tier = str(cfg.get("verify.tier", "fast"))
     if a.action == "init":
         recipe = verify.discover(root)
         text = verify.render_toml(recipe)
@@ -923,11 +943,16 @@ def cmd_verify(a, cfg) -> int:
                 "`claude-hr-ctl verify trust` in a terminal"
             )
             return 0
-        if cp.exists() and not a.force:
+        try:
+            # never through a link: the repository may commit .claude/hr-verify.toml (or .claude) as a symlink to a
+            # file of yours (see verify.write_config)
+            verify.write_config(root, text, force=bool(a.force))
+        except verify.ConfigExists:
             out(f"{cp} already exists (use --force to overwrite); review it, then trust it")
             return 1
-        cp.parent.mkdir(parents=True, exist_ok=True)
-        cp.write_text(text, encoding="utf-8", newline="\n")
+        except (ValueError, OSError) as exc:
+            out(f"cannot write {cp}: {verify.safe_text(str(exc))}")
+            return 1
         out(
             f"wrote {cp}\nReview it (these commands run at the end of each Claude turn), then, in a terminal "
             "outside Claude Code: claude-hr-ctl verify trust"
@@ -961,7 +986,7 @@ def cmd_verify(a, cfg) -> int:
             "modified": "CHANGED since it was trusted: the gate does nothing until it is reviewed and trusted again",
         }.get(state, state)
         out(f"{cp}: {meaning}")
-        _show_recipe(root, recipe)
+        _show_recipe(root, recipe, gate_budget, gate_tier)
         return 0
     if a.action == "trust":
         if recipe is None:
@@ -976,7 +1001,7 @@ def cmd_verify(a, cfg) -> int:
             )
             return 1
         out(f"The end-of-turn gate will run these commands without asking, in {root}:")
-        _show_recipe(root, recipe)
+        _show_recipe(root, recipe, gate_budget, gate_tier)
         try:
             from . import audit
 
@@ -1012,14 +1037,21 @@ def cmd_verify(a, cfg) -> int:
             )
             return 1
         out(f"These commands come from {root} and have not been trusted:")
-        _show_recipe(root, recipe)
+        _show_recipe(root, recipe)  # `verify run` honours every timeout_s: no gate budget to show
         if not _confirm("\nRun them once now?"):
             return 1
     checks = list(recipe.full if (a.tier == "full" and recipe.full) else recipe.fast)
     if not checks:
         out("nothing to run: no checks were found for this repository")
         return 1
-    res = verify.run(root, checks, total_timeout_s=float(sum(c.timeout_s for c in checks)))
+    # the same environment the gate gives the checks (verify.env_allow)
+    allowed_env = cfg.get("verify.env_allow", []) or []
+    res = verify.run(
+        root,
+        checks,
+        total_timeout_s=float(sum(c.timeout_s for c in checks)),
+        env_allow=allowed_env,
+    )
     for r in res.results:
         flag = "ok  " if r.ok else "FAIL"
         out(f"[{flag}] {r.name} ({r.seconds:.1f}s, exit {r.rc})")

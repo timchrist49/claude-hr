@@ -156,9 +156,10 @@ repo_tools = "trusted"       # trusted: a formatter that lives inside the repo (
 # The end-of-turn test gate runs ONLY the commands in a repo's .claude/hr-verify.toml that you trusted (claude-hr-ctl verify trust).
 gate = true                  # false: never run the gate (the commands stay available through `claude-hr-ctl verify run`)
 gate_max_blocks = 2          # at most this many times per unchanged working tree (Claude Code's own cap is 8)
-gate_timeout_s = 120         # per turn, for all checks together (a recipe check's own timeout_s is cut to what is left); see the 150 s hook budget under [gates]
+gate_timeout_s = 120         # per turn, for all checks together (a recipe check's own timeout_s is cut to what is left, and a check cut short by this budget is reported to you and never blocks); see the 150 s hook budget under [gates]
 tier = "fast"                # which tier of the recipe the gate runs: fast | full
 test_guard = true            # mention possibly weakened tests (removed asserts, new skip markers) in a failing gate's message; advisory
+env_allow = []               # names of environment variables that checks keep although the credential deny-list would drop them (DATABASE_URL, AWS_PROFILE, DJANGO_SECRET_KEY ...); case-insensitive, e.g. ["DATABASE_URL", "AWS_PROFILE"]. Applies to the gate and `verify run` in EVERY trusted repository and passes the value to that repository's commands: list only what a suite really needs
 
 [audit]
 tools = true                 # `claude-hr-ctl audit --tools` also runs gitleaks / pip-audit / npm audit / osv-scanner when they are installed

@@ -29,10 +29,13 @@ class Fakes:
             action="pass", reason="", results=[NS(name="ruff"), NS(name="pytest")]
         )
         self.fmt_raises = None
+        self.cannot_tell = (
+            False  # the fingerprint is "" (git failed, the status listing was cut off, no time)
+        )
 
     def fingerprint(self, root, **kw):
         self.fingerprint_calls.append(kw)
-        return f"fp-{self.tree}"
+        return "" if self.cannot_tell else f"fp-{self.tree}"
 
     def trust_state(self, root, state_dir):
         return self.trust
@@ -366,6 +369,104 @@ def test_a_budget_skip_that_started_no_check_is_retried_a_cut_short_run_is_remem
 def test_an_ordinary_turn_leaves_no_note_in_the_trail(fakes, repo):
     stop_gate.handle(payload(repo))
     assert "note" not in auditlog.tail(1)[0]
+
+
+def test_a_run_cut_short_by_the_time_budget_tells_the_user_once(fakes, repo):
+    """Not a block, and nothing for the model: a one-line systemMessage so the user knows the gate has no verdict."""
+    fakes.gate_result = NS(
+        action="skip",
+        reason="time budget (3s) ran out inside slow; inconclusive, not blocking",
+        results=[NS(name="fast"), NS(name="slow")],
+        note="time budget",
+        check="slow",
+    )
+    first = stop_gate.handle(payload(repo))
+    assert first == {
+        "systemMessage": "claude-hr: slow did not finish inside the time budget; not blocking"
+    }
+    assert stop_gate.handle(payload(repo)) is None, "remembered: an idle Stop says nothing"
+    assert len(fakes.gate_calls) == 1
+    fakes.tree = "B"  # a changed tree gets a fresh run and a fresh message
+    assert "slow did not finish" in stop_gate.handle(payload(repo))["systemMessage"]
+    # without the check's name the last result is it; the name is one clean line
+    fakes.tree = "C"
+    fakes.gate_result = NS(
+        action="skip",
+        reason="x",
+        results=[NS(name="a"), NS(name="lint\x1b[2K\nsecond line " + "x" * 200)],
+        note="time budget",
+    )
+    message = stop_gate.handle(payload(repo))["systemMessage"]
+    assert "\x1b" not in message and "\n" not in message and len(message) < 200
+    assert message.startswith("claude-hr: lint") and message.endswith("time budget; not blocking")
+
+
+def test_no_message_when_the_budget_left_no_time_to_start_anything(fakes, repo):
+    fakes.gate_result = NS(
+        action="skip", reason="time budget: 3s left", results=[], note="time budget"
+    )
+    assert stop_gate.handle(payload(repo)) is None
+
+
+def test_a_check_that_cannot_start_is_remembered_so_the_first_checks_do_not_rerun(fakes, repo):
+    """`tests` passed, `types` has no tool on PATH: every idle Stop used to run `tests` again, silently."""
+    fakes.gate_result = NS(
+        action="error",
+        reason="claude-hr verify: cannot run types: not found: nope (searched PATH)",
+        results=[NS(name="tests"), NS(name="types")],
+        note="cannot start",
+    )
+    assert stop_gate.handle(payload(repo)) is None
+    assert stop_gate.handle(payload(repo)) is None
+    assert len(fakes.gate_calls) == 1
+    row = auditlog.tail(1)[0]
+    assert row["verify"] == "error" and row["note"] == "cannot start"
+    assert row["checks"] == ["tests", "types"] and row["reason"].startswith(
+        "claude-hr verify: cannot run types"
+    )
+    fakes.tree = "B"  # any change to the tree tries again (the tool may have been installed)
+    stop_gate.handle(payload(repo))
+    assert len(fakes.gate_calls) == 2
+
+
+def test_a_second_gate_run_in_progress_is_retried_not_remembered(fakes, repo):
+    fakes.gate_result = NS(
+        action="skip",
+        reason="another gate run is in progress for this repository",
+        results=[],
+        note="another gate run in progress",
+    )
+    assert stop_gate.handle(payload(repo)) is None
+    assert stop_gate.handle(payload(repo)) is None
+    assert len(fakes.gate_calls) == 2, "the tree was not looked at"
+    assert auditlog.tail(1)[0]["note"] == "another gate run in progress"
+
+
+def test_a_tree_that_cannot_be_fingerprinted_is_never_taken_for_an_idle_one(fakes, repo):
+    """git failed, the status listing was cut off at its cap, or time ran out: 'cannot tell' was remembered as a
+    signature, so after the first Stop the formatter and the gate silently never ran again."""
+    fakes.cannot_tell = True
+    for _ in range(3):
+        assert stop_gate.handle(payload(repo)) is None
+    assert len(fakes.fmt_calls) == 3 and len(fakes.gate_calls) == 3
+    assert stop_gate._State.load().data == {}, "nothing was remembered"
+    fakes.cannot_tell = False  # git answers again: the tree is looked at, remembered, and then idle
+    stop_gate.handle(payload(repo))
+    stop_gate.handle(payload(repo))
+    assert len(fakes.gate_calls) == 4
+    assert stop_gate._signature(sys.modules["claude_hr.verify"], repo) != ""
+    fakes.cannot_tell = True
+    assert stop_gate._signature(sys.modules["claude_hr.verify"], repo) == ""
+
+
+def test_the_env_allow_setting_reaches_the_gate(fakes, repo, monkeypatch):
+    stop_gate.handle(payload(repo))
+    assert fakes.gate_calls[0]["env_allow"] == []
+    fakes.tree = "B"
+    with monkeypatch.context() as m:
+        m.setenv("CLAUDE_HR_VERIFY__ENV_ALLOW", '["DATABASE_URL", "AWS_PROFILE"]')
+        stop_gate.handle(payload(repo))
+    assert fakes.gate_calls[1]["env_allow"] == ["DATABASE_URL", "AWS_PROFILE"]
 
 
 def test_two_sessions_saving_together_do_not_overwrite_each_other(sandbox):

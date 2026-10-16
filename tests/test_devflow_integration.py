@@ -539,9 +539,202 @@ def test_the_hook_finishes_inside_its_budget_even_when_the_suite_would_not(repo,
     )
     write_recipe_text(repo, recipe, trusted=True)
     t0 = time.monotonic()
-    assert stop(repo) is None  # inconclusive is never a block
+    out = stop(repo)
+    assert out == {  # inconclusive is never a block, but the USER is told, in one line
+        "systemMessage": "claude-hr: slow-suite did not finish inside the time budget; not blocking"
+    }
     assert time.monotonic() - t0 < 14, "the check was given what was left of the budget, not 120 s"
     row = auditlog.tail(1)[0]
     assert (
         row["verify"] == "skip" and row["note"] == "time budget" and row["checks"] == ["slow-suite"]
     )
+    t0 = time.monotonic()
+    assert stop(repo) is None and time.monotonic() - t0 < 5, "said once: the idle Stop is silent"
+
+
+def test_a_hang_in_a_check_with_the_default_timeout_blocks_instead_of_passing_silently(
+    repo, monkeypatch
+):
+    """timeout_s equal to the whole gate budget (the stock 120 and 120): the check got a hair less than its limit and
+    the hang was filed as 'inconclusive'."""
+    monkeypatch.setenv("CLAUDE_HR_VERIFY__GATE_TIMEOUT_S", "3")
+    recipe = (
+        f'[[fast]]\nname = "hangs"\nargv = [{json.dumps(sys.executable)}, "-c", '
+        '"import time; time.sleep(120)"]\ntimeout_s = 3\n'
+    )
+    write_recipe_text(repo, recipe, trusted=True)
+    out = stop(repo)
+    assert (
+        out["decision"] == "block"
+        and "hangs failed (exit 124, timed out after 3s)" in out["reason"]
+    )
+
+
+# ---- a check that cannot be started, a tree that cannot be fingerprinted ------------------------------------------
+
+TOOL_MISSING = """
+[[fast]]
+name = "tests"
+argv = [{py}, "-c", "open('ran.txt','a').write('x')"]
+
+[[fast]]
+name = "types"
+argv = ["definitely-not-a-real-tool-xyz", "."]
+"""
+
+
+def test_a_missing_tool_does_not_rerun_the_checks_before_it_on_every_idle_stop(repo):
+    write_recipe_text(repo, TOOL_MISSING.format(py=json.dumps(sys.executable)), trusted=True)
+    (repo / "app.py").write_text("x = 2\n", encoding="utf-8", newline="\n")
+    assert [stop(repo) for _ in range(3)] == [None, None, None]
+    assert (repo / "ran.txt").read_text() == "x", "`tests` ran once, not once per Stop"
+    row = [r for r in auditlog.tail(10) if r["event"] == "gate"][0]
+    assert row["verify"] == "error" and row["note"] == "cannot start"
+    assert row["checks"] == ["tests", "types"] and "cannot run types" in row["reason"]
+    (repo / "app.py").write_text("x = 3\n", encoding="utf-8", newline="\n")  # a change: try again
+    assert stop(repo) is None and (repo / "ran.txt").read_text() == "xx"
+
+
+def test_a_missing_first_tool_does_not_switch_off_the_checks_behind_it(repo):
+    recipe = (
+        '[[fast]]\nname = "lint"\nargv = ["definitely-not-a-real-tool-xyz"]\n\n'
+        f'[[fast]]\nname = "tests"\nargv = [{json.dumps(sys.executable)}, "-c", '
+        "\"import sys; print('1 failed'); sys.exit(1)\"]\n"
+    )
+    write_recipe_text(repo, recipe, trusted=True)
+    out = stop(repo)
+    assert out["decision"] == "block" and "tests failed (exit 1)" in out["reason"]
+
+
+def test_a_tree_git_cannot_describe_is_looked_at_again_on_every_stop(repo, monkeypatch):
+    """A cut-off `git status` listing gave an empty fingerprint and that was remembered as 'nothing changed': the
+    formatter and the gate then never ran again in that repository."""
+    write_recipe(repo)  # trusted; the check fails until ok.txt exists
+    with monkeypatch.context() as m:
+        m.setattr(verify, "fingerprint", lambda root, **kw: "")
+        assert [stop(repo) for _ in range(3)] == [None, None, None]
+        rows = [r for r in auditlog.tail(10) if r["event"] == "gate"]
+        assert len(rows) == 3 and all("cannot fingerprint" in r["reason"] for r in rows)
+    assert not (repo / "ran.txt").exists()
+    out = stop(repo)  # git answers again: the gate runs now
+    assert out["decision"] == "block" and (repo / "ran.txt").exists()
+
+
+def test_the_env_allow_setting_gives_the_gate_and_verify_run_the_same_environment(
+    repo, capsys, agent_shell, monkeypatch
+):
+    monkeypatch.setenv("DATABASE_URL", "postgres://app:pw@db/app")
+    code = "import os, sys; sys.exit(0 if os.environ.get('DATABASE_URL') else 1)"
+    recipe = f'[[fast]]\nname = "needs-db"\nargv = [{json.dumps(sys.executable)}, "-c", {json.dumps(code)}]\n'
+    write_recipe_text(repo, recipe, trusted=True)
+    assert "[FAIL] needs-db" in run(capsys, "verify", "run")[1]
+    assert (
+        stop(repo)["decision"] == "block"
+    )  # scrubbed: it fails in the gate as it does under `verify run`
+    monkeypatch.setenv("CLAUDE_HR_VERIFY__ENV_ALLOW", '["DATABASE_URL"]')
+    assert "[ok  ] needs-db" in run(capsys, "verify", "run")[1]
+    assert stop(repo) is None
+
+
+# ---- what a person reads before trusting: the limit that really applies --------------------------------------------
+
+SLOW_TIMEOUTS = """
+[[fast]]
+name = "quick"
+argv = ["pytest", "-q"]
+timeout_s = 60
+
+[[fast]]
+name = "slow"
+argv = ["pytest", "-q", "-m", "slow"]
+timeout_s = 600
+
+[[full]]
+name = "build"
+argv = ["make", "build"]
+timeout_s = 900
+"""
+
+
+def check_lines(text):
+    return {ln.split(":")[0].strip(): ln for ln in recipe_lines(text)}
+
+
+def test_the_trust_prompt_and_status_show_the_limit_the_gate_really_applies(
+    repo, capsys, at_the_keyboard
+):
+    write_recipe_text(repo, SLOW_TIMEOUTS)
+    for argv in (("verify", "status"), ("verify", "trust")):
+        lines = check_lines(run(capsys, *argv)[1])
+        assert (
+            "timeout 60s," in lines["[fast 1] quick"]
+            and "gate stops" not in lines["[fast 1] quick"]
+        )
+        slow = lines["[fast 2] slow"]
+        assert "timeout 600s, but the end-of-turn gate stops it after 120s" in slow, slow
+        assert "verify.gate_timeout_s" in slow and "does not block" in slow
+        assert "gate stops" not in lines["[full 1] build"], "the gate runs the fast tier"
+
+
+def test_the_limit_shown_follows_the_configured_budget_and_tier(repo, capsys, monkeypatch):
+    write_recipe_text(repo, SLOW_TIMEOUTS)
+    with monkeypatch.context() as m:
+        m.setenv("CLAUDE_HR_VERIFY__GATE_TIMEOUT_S", "130")
+        lines = check_lines(run(capsys, "verify", "status")[1])
+    assert "stops it after 130s" in lines["[fast 2] slow"]
+    assert "gate stops" not in lines["[fast 1] quick"]
+    with monkeypatch.context() as m:
+        # more than the hook has left (150 s less the 10 s kept for what follows the checks) cannot be had
+        m.setenv("CLAUDE_HR_VERIFY__GATE_TIMEOUT_S", "900")
+        lines = check_lines(run(capsys, "verify", "status")[1])
+    assert "stops it after 140s" in lines["[fast 2] slow"]
+    with monkeypatch.context() as m:
+        m.setenv("CLAUDE_HR_VERIFY__GATE_TIMEOUT_S", "130")
+        m.setenv("CLAUDE_HR_VERIFY__TIER", "full")
+        lines = check_lines(run(capsys, "verify", "status")[1])
+    assert "gate stops" not in lines["[fast 2] slow"], (
+        "with tier = full the gate runs the full list"
+    )
+    assert "stops it after 130s" in lines["[full 1] build"]
+
+
+# ---- `verify init --write` never writes through a link the repository committed ------------------------------------
+
+
+def link(target_of_link, points_to, directory=False):
+    try:
+        os.symlink(points_to, target_of_link, target_is_directory=directory)
+    except (OSError, NotImplementedError):
+        pytest.skip("symlinks are not available here")
+
+
+@pytest.mark.parametrize("force", [False, True])
+def test_verify_init_write_does_not_follow_a_committed_symlink(repo, capsys, tmp_path, force):
+    victim = tmp_path / "bashrc"
+    victim.write_text("export PATH=/mine\n", encoding="utf-8")
+    (repo / ".claude").mkdir()
+    link(verify.config_path(repo), victim)
+    (repo / "pyproject.toml").write_text("[project]\nname='x'\nversion='0'\n", encoding="utf-8")
+    rc, text = run(capsys, "verify", "init", "--write", *(["--force"] if force else []))
+    assert rc == 1 and "symbolic link" in text and "cannot write" in text
+    assert victim.read_text(encoding="utf-8") == "export PATH=/mine\n"
+
+
+def test_verify_init_write_does_not_create_a_file_through_a_dangling_symlink(
+    repo, capsys, tmp_path
+):
+    target = tmp_path / "created-by-init.txt"
+    (repo / ".claude").mkdir()
+    link(verify.config_path(repo), target)
+    rc, text = run(capsys, "verify", "init", "--write")
+    assert rc == 1 and "symbolic link" in text and not target.exists()
+    # `verify status` calls the dangling link 'no recipe': the advice it gives must not be a way in
+    assert run(capsys, "verify", "status")[0] == 0
+
+
+def test_verify_init_write_does_not_write_into_a_linked_claude_directory(repo, capsys, tmp_path):
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    link(repo / ".claude", elsewhere, directory=True)
+    rc, text = run(capsys, "verify", "init", "--write")
+    assert rc == 1 and "cannot write" in text and list(elsewhere.iterdir()) == []
