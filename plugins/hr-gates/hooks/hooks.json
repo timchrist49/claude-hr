@@ -1,0 +1,17 @@
+{
+  "description": "claude-hr end-of-turn gates. One process per turn (exec form, no shell, works the same on Windows, Linux and macOS): format the files Claude changed with the repo's own formatter, run the repo's trusted fast checks, write a metadata-only audit record. Every failure path exits 0; nothing is added to the context unless a trusted check fails.",
+  "hooks": {
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "claude-hr-hook",
+            "args": ["stop"],
+            "timeout": 170
+          }
+        ]
+      }
+    ]
+  }
+}

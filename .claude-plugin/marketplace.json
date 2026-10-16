@@ -2,15 +2,34 @@
   "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
   "name": "claude-hr",
   "description": "claude-hr distribution: curated, minimal-footprint plugins for software and security work.",
-  "owner": { "name": "timchrist49" },
+  "owner": {
+    "name": "timchrist49"
+  },
   "plugins": [
     {
       "name": "hr-core",
       "source": "./plugins/hr-core",
-      "description": "Three read-only subagents (explorer, log-triage, security-reviewer), three skills, and a Bash secret-leak guard.",
-      "version": "0.1.3",
+      "description": "Three read-only subagents (explorer, log-triage, security-reviewer), seven skills (six manual-only), and a Bash secret-leak and git-safety guard.",
+      "version": "0.2.0",
       "category": "productivity",
-      "keywords": ["claude-hr", "security", "tokens"]
+      "keywords": [
+        "claude-hr",
+        "security",
+        "tokens"
+      ]
+    },
+    {
+      "name": "hr-gates",
+      "source": "./plugins/hr-gates",
+      "description": "One end-of-turn hook: format changed files with the repo's own formatter, run the repo's trusted fast checks, metadata-only audit trail. Zero context cost.",
+      "version": "0.2.0",
+      "category": "productivity",
+      "keywords": [
+        "claude-hr",
+        "format",
+        "verify",
+        "gates"
+      ]
     },
     {
       "name": "ponytail",

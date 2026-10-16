@@ -35,6 +35,29 @@ SECRET_READ_DENY = [
 # PreToolUse hook is the second layer. These two are cheap and catch the common leak vectors.
 SECRET_BASH_DENY = ["Bash(printenv *)", "Bash(env)"]
 
+# The unattended verify gate runs the commands listed in .claude/hr-verify.toml (trusted by hash), and project settings can
+# carry hooks: editing either is a change the user should see, so Claude asks first. Zero tokens, no process spawn.
+TAMPER_ASK = [
+    "Edit(**/.claude/hr-verify.toml)",
+    "Write(**/.claude/hr-verify.toml)",
+    "Edit(**/.claude/settings.json)",
+    "Write(**/.claude/settings.json)",
+    "Edit(**/.claude/settings.local.json)",
+    "Write(**/.claude/settings.local.json)",
+]
+# Read-only GitHub CLI calls used by the hr-gh skill. Pre-approving reads only; anything that writes still prompts.
+GH_READONLY_ALLOW = [
+    "Bash(gh issue view *)",
+    "Bash(gh issue list *)",
+    "Bash(gh pr view *)",
+    "Bash(gh pr list *)",
+    "Bash(gh pr diff *)",
+    "Bash(gh pr checks *)",
+    "Bash(gh run list *)",
+    "Bash(gh run view *)",
+    "Bash(gh repo view *)",
+]
+
 ATOMIC_PATHS = {("statusLine",)}
 
 
@@ -57,6 +80,11 @@ def build(
     if process_wrapper:
         # Caps the agent-view background service and its sessions (Linux; ignored on Windows).
         env["CLAUDE_CODE_PROCESS_WRAPPER"] = process_wrapper
+    if str(cfg.get("security.stop_review", "off")) == "off":
+        # security-guidance's end-of-turn model review (Opus, once per file-changing turn) is the one hidden recurring
+        # spend in the standard profile. Its regex layer and its commit/push review stay on; audit before merging with
+        # /security-review or `claude-hr-ctl audit`. "plugin-default" leaves the plugin untouched.
+        env["ENABLE_STOP_REVIEW"] = "0"
     sub = str(cfg.get("tokens.subagent_model", "") or "")
     if sub:
         env["CLAUDE_CODE_SUBAGENT_MODEL"] = sub
@@ -67,6 +95,10 @@ def build(
 
     if bool(cfg.get("credentials.block_secret_reads", True)):
         doc["permissions"] = {"deny": SECRET_READ_DENY + SECRET_BASH_DENY}
+    if bool(cfg.get("gates.protect_config", True)):
+        doc.setdefault("permissions", {})["ask"] = list(TAMPER_ASK)
+    if bool(cfg.get("github.readonly_allow", True)):
+        doc.setdefault("permissions", {})["allow"] = list(GH_READONLY_ALLOW)
 
     channel = str(c.get("channel", "") or "")
     if channel and bool(c.get("manage_updates", True)):
@@ -82,5 +114,8 @@ def build(
     if str(cfg.get("security.profile", "standard")) == "strict":
         doc.setdefault("permissions", {})["disableBypassPermissionsMode"] = "disable"
         doc["env"]["CLAUDE_CODE_SUBPROCESS_ENV_SCRUB"] = "1"
+        doc["env"]["CLAUDE_HR_GIT_GUARD"] = (
+            "deny"  # risky git commands are refused instead of confirmed
+        )
 
     return doc, set(ATOMIC_PATHS)

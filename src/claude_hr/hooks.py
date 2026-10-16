@@ -53,6 +53,10 @@ RULES: list[tuple[re.Pattern, str]] = [
         "prints a secret-looking variable",
     ),
     (re.compile(r"(?is)\bgh\s+auth\s+token\b"), "prints the GitHub token"),
+    (
+        re.compile(r"(?is)\bgh\s+auth\s+status\b[^\n;&|]*(?:\s-t\b|--show-token\b)"),
+        "prints the GitHub token",
+    ),
     (re.compile(r"(?is)\bop\s+(?:read|item\s+get)\b(?![^\n]*\|)"), "prints a 1Password secret"),
     (
         re.compile(r"(?is)\bsecurity\s+find-(?:generic|internet)-password\b[^\n]*\s-w\b"),
@@ -61,15 +65,65 @@ RULES: list[tuple[re.Pattern, str]] = [
 ]
 
 
+# Git operations that are hard to undo or that skip safety checks. The user is ASKED (permissionDecision "ask"), not
+# blocked: these are legitimate when intended. Under security.profile = strict the baseline sets CLAUDE_HR_GIT_GUARD=deny.
+# A regex is not a security boundary (`git -C . push`, `sh -c ...` get past it): server-side branch protection is.
+# `git` must be in command position (start of a command segment, optionally after VAR=x / sudo / time), so that
+# `echo git reset --hard` or a commit message that mentions it is not mistaken for the command itself.
+_GIT = r"(?:^|[;&|(])\s*(?:\w+=\S+\s+)*(?:(?:sudo|command|time|nohup)\s+)*git\b[^\n;&|]*?"
+_PROTECTED = r"(?:main|master|trunk|release[\w./-]*|production|prod)"
+GIT_RISKS: list[tuple[re.Pattern, str]] = [
+    (
+        re.compile(rf"(?ism){_GIT}\s--no-verify\b"),
+        "skips the repository's git hooks (--no-verify)",
+    ),
+    (
+        re.compile(
+            rf"(?ism){_GIT}\bpush\b[^\n;&|]*(?:\s--force\b|\s-f\b|\s\+[\w./-]+)[^\n;&|]*\b{_PROTECTED}\b|"
+            rf"{_GIT}\bpush\b[^\n;&|]*\b{_PROTECTED}\b[^\n;&|]*(?:\s--force\b|\s-f\b)|"
+            rf"{_GIT}\bpush\b[^\n;&|]*\s\+(?:[\w./-]+:)?{_PROTECTED}\b"
+        ),
+        "force-pushes a protected branch",
+    ),
+    (
+        re.compile(rf"(?ism){_GIT}\breset\b[^\n;&|]*\s--hard\b"),
+        "discards uncommitted work (git reset --hard)",
+    ),
+    (
+        re.compile(rf"(?ism){_GIT}\bclean\b[^\n;&|]*\s-[a-z]*f"),
+        "deletes untracked files (git clean -f)",
+    ),
+    (
+        re.compile(rf"(?ism){_GIT}\b(?:checkout\s+(?:--\s+)?\.|restore\s+(?:--\S+\s+)*\.)(?:\s|$)"),
+        "discards all uncommitted changes in the working tree",
+    ),
+]
+
+
+def git_risk(command: str) -> str | None:
+    """Why `command` deserves a confirmation (see GIT_RISKS), or None."""
+    for pattern, why in GIT_RISKS:
+        if pattern.search(command):
+            return why
+    return None
+
+
 def main(argv: list[str] | None = None) -> int:
-    """`claude-hr-hook <bash-guard|statusline>`: a tiny entry point so hooks do not import the whole control CLI (~250 ms)."""
+    """`claude-hr-hook <bash-guard|stop|statusline>`: a tiny entry point so hooks do not import the whole control CLI (~250 ms)."""
     argv = sys.argv[1:] if argv is None else argv
     name = argv[0] if argv else ""
     if name == "bash-guard":
         return bash_guard()
+    if name == "stop":
+        try:
+            from . import stop_gate
+
+            return stop_gate.run()
+        except Exception:
+            return 0  # a gate must never break the session
     if name == "statusline":
         return statusline()
-    sys.stderr.write("usage: claude-hr-hook bash-guard | statusline\n")
+    sys.stderr.write("usage: claude-hr-hook bash-guard | stop | statusline\n")
     return 2
 
 
@@ -92,6 +146,22 @@ def bash_guard() -> int:
                 "run it themselves.\n"
             )
             return 2
+    mode = os.environ.get("CLAUDE_HR_GIT_GUARD", "ask").strip().lower()
+    if mode != "off":
+        why = git_risk(command)
+        if why:
+            decision = "deny" if mode == "deny" else "ask"
+            sys.stdout.write(
+                json.dumps(
+                    {
+                        "hookSpecificOutput": {
+                            "hookEventName": "PreToolUse",
+                            "permissionDecision": decision,
+                            "permissionDecisionReason": f"claude-hr: this command {why}.",
+                        }
+                    }
+                )
+            )
     return 0
 
 

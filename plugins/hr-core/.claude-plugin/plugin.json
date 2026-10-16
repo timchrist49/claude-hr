@@ -1,9 +1,19 @@
 {
   "name": "hr-core",
   "displayName": "claude-hr Core",
-  "version": "0.1.3",
-  "description": "Lean team defaults for claude-hr: three read-only subagents, three skills, and a secret-leak guard hook.",
-  "author": { "name": "timchrist49" },
+  "version": "0.2.0",
+  "description": "Lean defaults for claude-hr: three read-only subagents, seven skills (six manual-only: plan, done, gh, audit, status, worktrees), and a secret-leak and git-safety guard hook.",
+  "author": {
+    "name": "timchrist49"
+  },
   "license": "MIT",
-  "keywords": ["claude-hr", "security", "tokens", "worktrees", "claude-md"]
+  "keywords": [
+    "claude-hr",
+    "security",
+    "tokens",
+    "worktrees",
+    "claude-md",
+    "plan",
+    "verify"
+  ]
 }

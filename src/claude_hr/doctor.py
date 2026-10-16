@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import platform
+import shutil
 import sys
 from pathlib import Path
 
@@ -13,6 +14,51 @@ from .claude_setup import ClaudeSetup
 from .config import Config
 from .headroom import Headroom
 from .jsonio import JsonFileError, read_json
+
+
+def _is_own_proxy(base: str, port: int) -> bool:
+    """True if `base` points at claude-hr's own Headroom proxy (loopback host and the configured port)."""
+    from urllib.parse import urlparse
+
+    try:
+        u = urlparse(base)
+        return (u.hostname or "") in ("127.0.0.1", "localhost", "::1") and (u.port or 80) == int(
+            port
+        )
+    except ValueError:
+        return False
+
+
+def _desktop_markers(own_port: int) -> list[str]:
+    """Signs of Headroom Desktop (a paid tray app that routes Claude Code through its own proxy on :6767)."""
+    found: list[str] = []
+    try:
+        if (paths.claude_home() / "hooks" / "headroom-rtk-rewrite.sh").exists():
+            found.append("hook ~/.claude/hooks/headroom-rtk-rewrite.sh")
+        for name in (".bashrc", ".zshrc", ".profile", ".bash_profile"):
+            f = paths.home() / name
+            if (
+                f.is_file()
+                and f.stat().st_size < 1_000_000
+                and "# >>> headroom:" in f.read_text(encoding="utf-8", errors="replace")
+            ):
+                found.append(f"~/{name} block")
+                break
+        if own_port != 6767 and procutil.port_listening("127.0.0.1", 6767):
+            found.append("something is listening on 127.0.0.1:6767")
+    except OSError:
+        pass
+    return found
+
+
+def _security_guidance(log: Path) -> dict | None:
+    try:
+        from .footprint import security_guidance_health
+    except (
+        ImportError
+    ):  # the footprint module ships in the same release; tolerate a partial install
+        return None
+    return security_guidance_health(log)
 
 
 def run(cfg: Config, cwd: Path, deep: bool = False) -> list[Check]:
@@ -67,20 +113,67 @@ def run(cfg: Config, cwd: Path, deep: bool = False) -> list[Check]:
         base = env.get("ANTHROPIC_BASE_URL")
         if base:
             alive = procutil.http_json(base.rstrip("/") + "/health", timeout=0.6)[0] == 200
-            out.append(
-                Check(
-                    "global ANTHROPIC_BASE_URL",
-                    OK if alive else FAIL,
-                    f"settings.json routes ALL claude sessions to {base} ({'reachable' if alive else 'DOWN - claude cannot reach the API'})",
-                    "remove env.ANTHROPIC_BASE_URL from ~/.claude/settings.json (claude-hr routes per launch instead)"
-                    if not alive
-                    else "",
+            mine = _is_own_proxy(base, hr.port)
+            if mine or not alive:
+                out.append(
+                    Check(
+                        "global ANTHROPIC_BASE_URL",
+                        OK if alive else FAIL,
+                        f"settings.json routes ALL claude sessions to {base} ({'reachable' if alive else 'DOWN - claude cannot reach the API'})",
+                        "remove env.ANTHROPIC_BASE_URL from ~/.claude/settings.json (claude-hr routes per launch instead)",
+                    )
                 )
-            )
+            else:
+                # A reachable proxy that is NOT claude-hr's: a settings.json env value replaces the one claude-hr sets for
+                # each launch, so sessions go through that proxy and claude-hr's routing, limits and savings do not apply.
+                out.append(
+                    Check(
+                        "foreign proxy",
+                        WARN,
+                        f"settings.json routes ALL claude sessions to {base}, which is not claude-hr's proxy (port {hr.port}); "
+                        "it overrides claude-hr's per-launch routing",
+                        "remove env.ANTHROPIC_BASE_URL from ~/.claude/settings.json, or uninstall the tool that wrote it",
+                    )
+                )
         if os.environ.get("CLAUDE_HR_DIRECT") == "1":
             out.append(
                 Check("routing override", WARN, "CLAUDE_HR_DIRECT=1 is set: Headroom is bypassed")
             )
+
+    desktop = _desktop_markers(hr.port)
+    if desktop:
+        out.append(
+            Check(
+                "headroom desktop",
+                WARN,
+                "Headroom Desktop appears to be installed ("
+                + "; ".join(desktop)
+                + "). It manages its own proxy and edits "
+                "~/.claude/settings.json: it and claude-hr should not both route Claude",
+                "use one of them: quit Headroom Desktop and remove its entries, or keep it and `claude-hr-ctl uninstall`",
+            )
+        )
+    if not shutil.which("claude-hr-hook"):
+        out.append(
+            Check(
+                "hook binary",
+                WARN,
+                "claude-hr-hook is not on PATH in this shell: the hr-gates end-of-turn hook cannot start "
+                "(Claude shows a non-blocking hook notice each turn)",
+                "uv tool update-shell, then open a new terminal",
+            )
+        )
+    sg = _security_guidance(paths.claude_home() / "security" / "log.txt")
+    if sg and sg.get("skipped") and not sg.get("reviews"):
+        out.append(
+            Check(
+                "security-guidance",
+                WARN,
+                f"its model reviews were skipped {sg['skipped']} time(s) and none ran (no API credentials found: a known "
+                "issue for /login users). Its regex layer still works",
+                "run /security-review or `claude-hr-ctl audit` before merging; or set ANTHROPIC_API_KEY for the plugin",
+            )
+        )
 
     # ---- tools ----------------------------------------------------------------------------
     out.append(

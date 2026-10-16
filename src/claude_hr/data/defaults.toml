@@ -119,4 +119,41 @@ block_secret_reads = true    # permissions.deny for .env / ssh / cloud credentia
 op_env_file = ""             # 1Password: launch as `op run --env-file=<file> -- claude ...`
 
 [security]
-profile = "standard"         # strict: also disableBypassPermissionsMode + CLAUDE_CODE_SUBPROCESS_ENV_SCRUB
+profile = "standard"         # strict: also disableBypassPermissionsMode + CLAUDE_CODE_SUBPROCESS_ENV_SCRUB + risky git commands are refused (not just confirmed)
+stop_review = "off"          # off: ENABLE_STOP_REVIEW=0, i.e. security-guidance's per-turn Opus review is skipped (its regex layer and commit/push review stay on);
+                             #   plugin-default: leave the plugin as shipped. Audit with /security-review or `claude-hr-ctl audit` instead (cheaper, on demand).
+
+[gates]
+# The end-of-turn hook of plugin hr-gates (`claude-hr-hook stop`): format changed files, run the repo's trusted fast checks, audit trail.
+enabled = true               # false: the hook exits immediately (also CLAUDE_HR_GATES=off in the environment)
+protect_config = true        # settings baseline asks before Claude edits .claude/hr-verify.toml or .claude/settings*.json
+trail = true                 # metadata-only audit trail in ~/.claude-hr/audit (what ran, when, pass/fail; never code or output)
+trail_days = 90              # `claude-hr-ctl trail --prune` and the weekly maintain job drop older month files
+
+[format]
+# Consistency without imposing a tool: only a formatter the repo ALREADY configures is used (ruff/black, prettier/biome, gofmt, rustfmt).
+enabled = true
+timeout_s = 30               # total time budget per turn
+max_files = 40
+max_file_kb = 512
+skip_globs = []              # extra fnmatch patterns (posix-style relative paths) never to format
+allow = []                   # restrict to these formatter names; empty = any detected
+clean_gate = true            # only rewrite a tracked file whose HEAD version is already formatted (no whole-file drift diffs)
+
+[verify]
+# The end-of-turn test gate runs ONLY the commands in a repo's .claude/hr-verify.toml that you trusted (claude-hr-ctl verify trust).
+gate = true                  # false: never run the gate (the commands stay available through `claude-hr-ctl verify run`)
+gate_max_blocks = 2          # at most this many times per unchanged working tree (Claude Code's own cap is 8)
+gate_timeout_s = 120         # per turn
+tier = "fast"                # which tier of the recipe the gate runs: fast | full
+test_guard = true            # mention possibly weakened tests (removed asserts, new skip markers) in a failing gate's message; advisory
+
+[audit]
+tools = true                 # `claude-hr-ctl audit --tools` also runs gitleaks / pip-audit / npm audit / osv-scanner when they are installed
+timeout_s = 60
+
+[github]
+readonly_allow = true        # settings baseline pre-approves read-only gh calls (issue/pr view+list, pr diff/checks, run list/view)
+
+[footprint]
+budget_standard_tokens = 1500  # `claude-hr-ctl footprint` and doctor warn when the standard profile's estimated always-on tokens exceed this

@@ -175,3 +175,56 @@ def test_dry_run_changes_nothing(setup, sandbox):
     setup.sync_claude_md()
     assert not paths.claude_settings().exists()
     assert not paths.claude_user_md().exists()
+
+
+def test_baseline_lean_defaults_for_the_dev_workflow(sandbox):
+    from claude_hr import baseline
+
+    doc, _ = baseline.build(config.load())
+    # the one hidden recurring spend of the standard profile is off; the plugin's other layers are untouched
+    assert doc["env"]["ENABLE_STOP_REVIEW"] == "0"
+    assert "CLAUDE_HR_GIT_GUARD" not in doc["env"]
+    ask = doc["permissions"]["ask"]
+    assert "Edit(**/.claude/hr-verify.toml)" in ask and "Write(**/.claude/settings.json)" in ask
+    allow = doc["permissions"]["allow"]
+    assert "Bash(gh pr view *)" in allow and not [
+        a for a in allow if "create" in a or "merge" in a or "edit" in a
+    ]
+    assert "Bash(git push *)" not in allow  # nothing that writes is pre-approved
+
+
+def test_baseline_stop_review_can_be_restored_and_gates_protection_dropped(sandbox, monkeypatch):
+    from claude_hr import baseline
+
+    monkeypatch.setenv("CLAUDE_HR_SECURITY__STOP_REVIEW", "plugin-default")
+    monkeypatch.setenv("CLAUDE_HR_GATES__PROTECT_CONFIG", "false")
+    monkeypatch.setenv("CLAUDE_HR_GITHUB__READONLY_ALLOW", "false")
+    doc, _ = baseline.build(config.load())
+    assert "ENABLE_STOP_REVIEW" not in doc["env"]
+    assert "ask" not in doc["permissions"] and "allow" not in doc["permissions"]
+
+
+def test_strict_profile_refuses_risky_git_instead_of_asking(sandbox, monkeypatch):
+    from claude_hr import baseline
+
+    monkeypatch.setenv("CLAUDE_HR_SECURITY__PROFILE", "strict")
+    doc, _ = baseline.build(config.load())
+    assert doc["env"]["CLAUDE_HR_GIT_GUARD"] == "deny"
+
+
+def test_profiles_are_lean_and_resolve(setup):
+    plan = setup.plugin_plan()
+    standard = setup.profile_plugins(plan, "standard")
+    # the always-on cost of standard stays small: no process-heavy or overlapping plugins by default
+    for heavy in ("superpowers", "feature-dev", "code-simplifier", "claude-security"):
+        assert not [s for s in standard if s.startswith(heavy + "@")], heavy
+    assert "hr-gates@claude-hr" in standard and "hr-core@claude-hr" in standard
+    process = setup.profile_plugins(plan, "process")
+    assert {"superpowers@claude-plugins-official", "feature-dev@claude-plugins-official"} <= set(
+        process
+    )
+    assert "claude-security@claude-plugins-official" in setup.profile_plugins(plan, "audit")
+    full = set(setup.profile_plugins(plan, "full"))
+    assert set(process) < full and "skill-creator@claude-plugins-official" in full
+    assert "ponytail@claude-hr" not in full  # third-party behaviour layer stays a deliberate choice
+    assert "code-simplifier@claude-plugins-official" in plan["redundant"]

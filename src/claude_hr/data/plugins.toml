@@ -15,26 +15,40 @@ requires = "headroom.install_plugins"
 
 # ---- profiles -------------------------------------------------------------------------------
 [profiles.minimal]
-description = "Token-lean: only claude-hr's own plugin (3 subagents, 3 skills, 1 guard hook)."
+description = "Token-lean: only claude-hr's own plugin (3 read-only subagents, 7 skills of which 6 are manual-only, 1 guard hook)."
 plugins = ["hr-core@claude-hr"]
 
 [profiles.standard]
-description = "Recommended team default."
+description = "Recommended default: lean. Adds the end-of-turn gates (format + verify), security-guidance, CLAUDE.md upkeep, library docs and the savings band."
 extends = "minimal"
 plugins = [
+  "hr-gates@claude-hr",                             # one Stop hook: format changed files, run the repo's trusted fast checks, audit trail (no context cost)
   "claude-md-management@claude-plugins-official",   # audit/improve CLAUDE.md (manual use)
-  "feature-dev@claude-plugins-official",            # guided feature workflow + 3 agents
-  "security-guidance@claude-plugins-official",      # edit-time and commit-time security review
-  "code-simplifier@claude-plugins-official",
+  "security-guidance@claude-plugins-official",      # edit-time regex warnings + commit-time review (per-turn Opus review off by default, see security.stop_review)
   "context7@claude-plugins-official",               # current library docs (MCP, deferred by tool search)
-  "superpowers@claude-plugins-official",            # process skills: TDD, debugging, plans, worktrees
   "headroom-snip@headroom-marketplace",             # live token-savings band + status line
 ]
 
-[profiles.full]
-description = "Standard + maintainer tooling."
+[profiles.process]
+description = "Standard + Superpowers' process skills (TDD, plans, review) and feature-dev. Costs roughly 1.5-2k extra always-on tokens (its SessionStart hook injects a whole skill) and overlaps hr-plan / hr-done / bundled /code-review: only if you want that flow."
 extends = "standard"
 plugins = [
+  "superpowers@claude-plugins-official",            # process skills: TDD, debugging, plans, worktrees
+  "feature-dev@claude-plugins-official",            # guided feature workflow + 3 agents
+]
+
+[profiles.audit]
+description = "Standard + the official claude-security plugin for deep, on-demand security scans before a release (heavy by design: run it deliberately)."
+extends = "standard"
+plugins = [
+  "claude-security@claude-plugins-official",
+]
+
+[profiles.full]
+description = "Everything above except Ponytail, plus maintainer tooling."
+extends = "process"
+plugins = [
+  "claude-security@claude-plugins-official",
   "skill-creator@claude-plugins-official",
 ]
 
@@ -54,3 +68,4 @@ plugins = [
 # Known to overlap with something Claude Code already bundles; flagged by `plugins audit`.
 [redundant]
 "code-review@claude-plugins-official" = "Claude Code bundles /code-review; two copies compete for the same prompts."
+"code-simplifier@claude-plugins-official" = "Claude Code bundles /simplify (4 parallel agents); the plugin adds listing tokens for the same job."
