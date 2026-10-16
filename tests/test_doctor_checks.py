@@ -207,6 +207,14 @@ def _apply_baseline(cfg=None):
     cfg = cfg or config.load()
     step = claude_setup.ClaudeSetup(cfg, Headroom(cfg), None).apply_settings()
     assert step.ok, step.lines
+    # every release's `setup` also leaves this marker; it is what makes the machine "set up" (uninstall removes it)
+    (paths.state_dir() / "install.json").write_text(json.dumps({"version": "0.1.3"}), "utf-8")
+
+
+def managed():
+    """Just the 'managed settings' check (a whole doctor run takes seconds)."""
+    cfg = config.load()
+    return doctor._managed_settings_check(cfg, Headroom(cfg), None)
 
 
 def test_a_baseline_applied_by_another_release_is_flagged_with_the_fix(sandbox, fake_claude):
@@ -227,7 +235,8 @@ def test_a_baseline_applied_by_another_release_is_flagged_with_the_fix(sandbox, 
         checks()["managed settings"].status == "ok"
     )  # a value the user chose (kept) is never counted as pending
     (paths.state_dir() / "applied-version.json").write_text(
-        json.dumps({"version": "0.1.3"}), encoding="utf-8"
+        json.dumps({"settings": "0.1.3", "config_dir": str(paths.claude_settings())}),
+        encoding="utf-8",
     )
     got = checks()["managed settings"]
     assert got.status == "warn" and "0.1.3" in got.detail
@@ -246,6 +255,66 @@ def test_a_baseline_that_setup_would_still_change_is_flagged(sandbox, fake_claud
     got = checks()["managed settings"]
     assert got.status == "warn" and "not applied yet" in got.detail
     assert got.fix == "claude-hr-ctl setup --only settings"
+
+
+def test_the_check_reads_the_settings_entry_of_the_per_step_record(sandbox, fake_claude):
+    """`setup --only plugins` records only the plugins step: the settings baseline is still unapplied for this release."""
+    from claude_hr import claude_setup
+
+    _apply_baseline()
+    claude_setup.record_applied_version("plugins", "claude-md")
+    got = managed()
+    assert got.status == "warn" and "before 0.2.0" in got.detail and "plugins" in got.fix
+    claude_setup.record_applied_version("settings")
+    assert managed().status == "ok"
+
+
+@pytest.mark.parametrize(
+    "var, then, retired",
+    [
+        # a change that REMOVES a managed key: nothing is "set", yet `setup --only settings` would change the file
+        ("CLAUDE_HR_SECURITY__STOP_REVIEW", "plugin-default", "env.ENABLE_STOP_REVIEW"),
+        ("CLAUDE_HR_GATES__PROTECT_CONFIG", "false", "permissions.deny"),  # + the ask rules
+        ("CLAUDE_HR_CREDENTIALS__BLOCK_SECRET_READS", "false", "permissions.deny"),
+    ],
+)
+def test_a_config_change_that_retires_a_managed_key_is_flagged(
+    sandbox, fake_claude, monkeypatch, var, then, retired
+):
+    from claude_hr import claude_setup
+    from claude_hr.headroom import Headroom
+
+    _apply_baseline()
+    claude_setup.record_applied_version("settings")
+    assert managed().status == "ok"
+    monkeypatch.setenv(var, then)
+    got = managed()
+    assert got.status == "warn" and "to retire" in got.detail and retired in got.detail, got
+    assert got.fix == "claude-hr-ctl setup --only settings"
+    cfg = config.load()  # ... and the fix doctor names does clear it
+    step = claude_setup.ClaudeSetup(cfg, Headroom(cfg), None).apply_settings()
+    assert step.ok
+    assert managed().status == "ok"
+
+
+def test_a_baseline_applied_to_another_claude_config_dir_is_flagged(
+    sandbox, fake_claude, monkeypatch, tmp_path
+):
+    """`setup` ran in a shell with CLAUDE_CONFIG_DIR=<custom>; doctor runs in one without it. The scheduled update job is in
+    the second situation: it leaves that profile alone, and doctor says to run setup from the right shell."""
+    from claude_hr import claude_setup
+
+    custom = tmp_path / "custom"
+    custom.mkdir()
+    default = paths.claude_home()
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(custom))
+    _apply_baseline()
+    claude_setup.record_applied_version("settings", "claude-md")
+    assert managed().status == "ok"
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(default))
+    got = managed()
+    assert got.status == "warn" and str(custom) in got.detail and "daily update job" in got.detail
+    assert "claude-hr-ctl setup" in got.fix and "plugins" in got.fix
 
 
 def test_doctor_does_not_touch_the_settings_it_inspects(sandbox, fake_claude):
@@ -286,6 +355,8 @@ def test_plugins_check_does_not_ask_for_a_plugin_that_sync_will_not_install(
     monkeypatch.setenv("CLAUDE_HR_HEADROOM__INSTALL_PLUGINS", "true")
     got = checks()["plugins"]
     assert got.status == "warn" and "headroom-snip" in got.fix and "5/6" in got.detail
+    # the unattended update never installs plugins: a missing one is doctor's to report, `plugins sync` is the fix
+    assert got.fix.startswith("claude-hr-ctl plugins sync")
 
 
 def test_footprint_budget_is_checked_from_the_plugin_list_doctor_already_fetched(

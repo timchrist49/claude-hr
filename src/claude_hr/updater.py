@@ -18,10 +18,17 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 
 from . import paths, procutil, resources
-from .claude_setup import ClaudeSetup, Step, baseline_is_stale, record_applied_version
+from .claude_setup import (
+    ClaudeSetup,
+    Step,
+    applied_version,
+    record_applied_version,
+    unattended_reapply,
+)
 from .config import Config
 from .headroom import Headroom
 from .jsonio import read_json, write_json
+from .schedule import ps_quote
 
 CLAUDE_RELEASES = "https://downloads.claude.ai/claude-code-releases"
 
@@ -85,14 +92,8 @@ def _log(entry: dict) -> None:
         pass
 
 
-_PS_QUOTES = "'\u2018\u2019\u201a\u201b"  # PowerShell treats all four typographic single quotes like an ASCII one
-
-
-def _ps_quote(value: str) -> str:
-    """A PowerShell single-quoted string literal. PowerShell also accepts U+2018/2019/201A/201B as quote characters, so every
-    one of them is doubled: a typographic apostrophe in a path or environment value must not end the string early."""
-    return "'" + "".join(c * 2 if c in _PS_QUOTES else c for c in value) + "'"
-
+# one implementation (schedule.py) for every PowerShell literal this package generates
+_ps_quote = ps_quote
 
 HELPER_TASK_FOLDER = "\\claude-hr\\"
 HELPER_TASK_NAME = "selfupdate"
@@ -461,44 +462,50 @@ class Updater:
             res.action, res.detail = "failed", "; ".join(step.lines)[-160:]
         return res
 
-    # ---- baseline (what the new claude-hr release wants in settings.json, CLAUDE.md and the plugin set) ---------------------
+    # ---- baseline (what the new claude-hr release wants in settings.json and the CLAUDE.md block) ------------------------
     def reapply_baseline(self) -> Result | None:
-        """After claude-hr itself was upgraded, make the machine match the new release: run the idempotent `setup` steps
-        `settings`, `claude-md` and `plugins` (exactly what `claude-hr-ctl setup --only settings claude-md plugins` does:
-        no Headroom install, no scheduler change). The unattended self-update only replaces the code, so without this a new
-        release's settings baseline (permission rules, env defaults) and plugins would wait for a person to run `setup`.
+        """After claude-hr itself was upgraded, make the machine match the new release: re-run the idempotent `setup` steps
+        `settings` and `claude-md` (the ownership-tracked, reversible merges; no Headroom install, no scheduler change). The
+        unattended self-update only replaces the code, so without this a new release's permission rules and env defaults
+        would wait for a person to run `setup`.
 
-        Keyed on state/applied-version.json (written by `setup`): nothing happens when it names the running version, on a dry
-        run, or on a machine `setup` never ran on. The version is recorded only when every step succeeded, so a failure
-        (offline, unparsable settings.json) is retried by the next run. Never raises."""
+        NEVER plugins or marketplaces: nothing in an unattended run installs code or passes `-y` (SECURITY.md). A plugin the
+        new release adds (hr-gates after an upgrade from 0.1.x) is reported by doctor with the fix `plugins sync`.
+
+        Keyed on the per-step record `setup` writes (state/applied-version.json): only a step `setup` applied, for an older
+        release, is re-applied (a skipped step stays skipped; after `uninstall` there is no record), and only when this run
+        resolves the same Claude config directory the record names (a scheduled job lacks the shell's CLAUDE_CONFIG_DIR).
+        A step's version is recorded when that step succeeded, so a failure (unparsable settings.json) is retried by the next
+        run. Nothing happens on a dry run. Never raises."""
         if self.dry:
             return None
         from . import __version__
 
         res = Result("baseline")
         try:
-            stale, applied = baseline_is_stale()
-            if not stale:
+            steps, why = unattended_reapply()
+            if why:
+                return Result("baseline", target=__version__, action="deferred", detail=why)
+            if not steps:
                 return None
-            res.current, res.target = applied or "before 0.2.0", __version__
+            res.current, res.target = applied_version(steps[0]) or "?", __version__
             setup = ClaudeSetup(self.cfg, self.hr, self.claude)
-            steps = [
-                setup.apply_settings(),
-                setup.sync_claude_md(),
-                setup.sync_plugins()
-                if self.claude
-                else Step("plugins", ok=False, lines=["claude not found"]),
-            ]
-            parts = []
-            for st in steps:
-                part = (
-                    f"{st.name} {'ok' if st.ok else 'FAILED'}{' (changed)' if st.changed else ''}"
-                )
+            appliers = {"settings": setup.apply_settings, "claude-md": setup.sync_claude_md}
+            parts, done = [], []
+            for name in steps:
+                try:
+                    st = appliers[name]()
+                except Exception as exc:  # noqa: BLE001 - one broken step must not cost the other its record
+                    st = Step(name, ok=False, lines=[f"{type(exc).__name__}: {exc}"])
+                part = f"{name} {'ok' if st.ok else 'FAILED'}{' (changed)' if st.changed else ''}"
                 if not st.ok and st.lines:
                     part += f": {st.lines[0][:120]}"
                 parts.append(part)
-            if all(st.ok for st in steps):
-                record_applied_version()
+                if st.ok:
+                    done.append(name)
+            if done:
+                record_applied_version(*done)
+            if len(done) == len(steps):
                 res.action = "updated"
             else:
                 res.action = "failed"

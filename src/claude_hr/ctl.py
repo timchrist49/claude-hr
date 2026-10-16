@@ -154,14 +154,14 @@ def cmd_setup(a, cfg) -> int:
             st_file,
             {"version": __version__, "ts": time.time(), "profile": cfg.get("plugins.profile")},
         )
-        # Remember which release this baseline came from, so doctor and the daily update job can tell when a newer release
-        # (installed unattended) has not been applied yet. Only when the settings step ran and every baseline step that ran
-        # succeeded: a half-applied baseline must stay visible.
-        if "settings" in baseline_ok and all(
-            baseline_ok[n] for n in claude_setup.BASELINE_STEPS if n in baseline_ok
-        ):
+        # Remember, per step, which release each part of the baseline came from (and which Claude config directory it went
+        # to), so doctor and the daily update job can tell when a newer release (installed unattended) has not been applied
+        # yet. Only the steps that ran in THIS invocation and succeeded: `--only plugins` must not mark the settings as
+        # applied, a failed step stays visible, and a skipped one stays skipped (the job re-applies recorded steps only).
+        applied = [n for n in claude_setup.BASELINE_STEPS if baseline_ok.get(n)]
+        if applied:
             try:
-                claude_setup.record_applied_version()
+                claude_setup.record_applied_version(*applied)
             except OSError as exc:
                 out(f"[ERR] could not record the applied version: {exc}")
                 failed += 1
@@ -204,6 +204,9 @@ def cmd_uninstall(a, cfg) -> int:
     for st in (reverted, setup.remove_claude_md(), setup.unregister_mcp()):
         _print_step(st)
         step_failed = step_failed or not st.ok
+    if not a.dry_run:
+        # whatever else happens below: the machine is no longer "set up", so no later update run re-applies the baseline
+        claude_setup.clear_setup_markers()
     if claude and not a.dry_run:
         for pid in ("hr-core@claude-hr", "hr-gates@claude-hr"):
             procutil.run(

@@ -163,6 +163,117 @@ def test_statusline_formats_without_proxy(monkeypatch, capsys, sandbox):
     assert capsys.readouterr().out.strip() == "Opus 5.5 | ctx 41% | $0.83"
 
 
+def _statusline(monkeypatch, capsys, payload) -> tuple[int, str]:
+    text = payload if isinstance(payload, str) else json.dumps(payload)
+    monkeypatch.setattr("sys.stdin", io.StringIO(text))
+    monkeypatch.delenv("ANTHROPIC_BASE_URL", raising=False)
+    rc = hooks.statusline()
+    out = capsys.readouterr().out
+    assert out.endswith("\n") and out.count("\n") == 1  # always exactly one line
+    return rc, out.strip()
+
+
+@pytest.mark.parametrize(
+    "payload, line",
+    [
+        # a wrongly typed field only loses its own segment: the rest of the line survives
+        ({"model": 5, "context_window": {"used_percentage": 41}}, "ctx 41%"),
+        ({"model": "sonnet", "cost": {"total_cost_usd": 0.5}}, "$0.50"),
+        ({"model": ["x"], "context_window": 5, "cost": {"total_cost_usd": "1.25"}}, "$1.25"),
+        (
+            {
+                "model": {"display_name": "Opus"},
+                "context_window": {"used_percentage": "abc"},
+                "cost": {"total_cost_usd": 0.5},
+            },
+            "Opus | $0.50",
+        ),
+        ({"context_window": {"used_percentage": [1]}, "cost": {"total_cost_usd": "x"}}, ""),
+        ({"model": {"display_name": 7}, "context_window": {"used_percentage": True}}, ""),
+        (
+            {"cost": {"total_cost_usd": {"a": 1}}, "context_window": {"used_percentage": "41"}},
+            "ctx 41%",
+        ),
+        ({"model": None, "context_window": None, "cost": None}, ""),
+        ({"context_window": {"used_percentage": 1e999}, "cost": {"total_cost_usd": 10**400}}, ""),
+        ('{"cost": {"total_cost_usd": NaN}, "model": {"display_name": "Opus"}}', "Opus"),
+        ("null", ""),
+        ("[1, 2]", ""),
+        ('"just a string"', ""),
+        ("{ not json", ""),
+        ("", ""),
+    ],
+)
+def test_statusline_never_raises_on_a_wrongly_typed_payload(
+    monkeypatch, capsys, sandbox, payload, line
+):
+    assert _statusline(monkeypatch, capsys, payload) == (0, line)
+
+
+def test_statusline_survives_a_headroom_cache_of_the_wrong_shape(monkeypatch, capsys, sandbox):
+    port = 8787
+    monkeypatch.setenv("ANTHROPIC_BASE_URL", f"http://127.0.0.1:{port}")
+    monkeypatch.setattr(
+        hooks, "_headroom_summary", lambda p: {"saved": "lots", "pct": "x", "five_hour": [3]}
+    )
+    monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps({"model": {"display_name": "Opus"}})))
+    assert hooks.statusline() == 0
+    assert capsys.readouterr().out.strip() == "Opus"
+    monkeypatch.setattr(hooks, "_headroom_summary", lambda p: ["not", "a", "dict"])
+    monkeypatch.setattr("sys.stdin", io.StringIO("{}"))
+    assert hooks.statusline() == 0
+    monkeypatch.setattr(
+        hooks, "_headroom_summary", lambda p: {"saved": 183000, "pct": 40.0, "five_hour": "3"}
+    )
+    monkeypatch.setattr("sys.stdin", io.StringIO("{}"))
+    capsys.readouterr()
+    assert hooks.statusline() == 0
+    assert capsys.readouterr().out.strip() == "✂ 183k saved 40% | 5h 3%"
+
+
+def test_statusline_survives_an_unusable_stdout_and_config(monkeypatch, sandbox):
+    class Closed:
+        def write(self, _):
+            raise ValueError("I/O operation on closed file")
+
+    monkeypatch.setattr("sys.stdin", io.StringIO("{}"))
+    monkeypatch.setattr("sys.stdout", Closed())
+    assert hooks.statusline() == 0  # nothing to tell Claude Code, and no traceback either
+    monkeypatch.setattr("sys.stdout", None)  # pythonw.exe has no stdout at all
+    monkeypatch.setattr("sys.stdin", io.StringIO("{}"))
+    assert hooks.statusline() == 0
+
+
+def test_statusline_entry_exits_zero_with_a_clean_stderr_on_bad_fields():
+    """The finding's own reproduction: `{"model": 5}` died with an AttributeError traceback and exit status 1."""
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    env = {
+        **__import__("os").environ,
+        "PYTHONPATH": str(Path(__file__).resolve().parents[1] / "src"),
+    }
+    env.pop("ANTHROPIC_BASE_URL", None)
+    for payload in (
+        {"model": 5},
+        {"context_window": {"used_percentage": "abc"}},
+        {"cost": {"total_cost_usd": "x"}},
+    ):
+        r = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                "from claude_hr import hooks; raise SystemExit(hooks.main(['statusline']))",
+            ],
+            input=json.dumps(payload).encode(),
+            env=env,
+            capture_output=True,
+            timeout=60,
+        )
+        assert r.returncode == 0 and r.stderr == b"" and r.stdout.strip() == b"", (payload, r)
+
+
 def test_hook_entry_point_dispatch(monkeypatch):
     monkeypatch.setattr(
         "sys.stdin", io.StringIO(json.dumps({"tool_input": {"command": "cat .env"}}))

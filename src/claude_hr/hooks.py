@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import sys
@@ -236,37 +237,70 @@ def _headroom_summary(port: int) -> dict | None:
     return out
 
 
-def statusline() -> int:
+def _num(value) -> float | None:
+    """A JSON number (or a numeric string) as a finite float; None for anything else (a wrongly typed field is just absent)."""
+    if isinstance(value, bool):
+        return None
     try:
-        sys.stdout.reconfigure(encoding="utf-8")  # type: ignore[attr-defined]
-    except Exception:
-        pass
-    try:
-        data = read_stdin_json()
-    except Exception:
-        data = {}
-    parts: list[str] = []
-    model = (data.get("model") or {}).get("display_name")
-    if model:
-        parts.append(str(model))
-    ctx = (data.get("context_window") or {}).get("used_percentage")
-    if ctx is not None:
-        parts.append(f"ctx {float(ctx):.0f}%")
-    cost = (data.get("cost") or {}).get("total_cost_usd")
-    if cost:
-        parts.append(f"${float(cost):.2f}")
-    try:
-        from . import config
+        n = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return n if math.isfinite(n) else None
 
-        port = int(config.load().get("headroom.port", 8787))
-        if os.environ.get("ANTHROPIC_BASE_URL", "").endswith(f":{port}"):
-            hs = _headroom_summary(port)
-            if hs and hs.get("saved"):
-                pct = f" {float(hs['pct']):.0f}%" if hs.get("pct") else ""
-                parts.append(f"✂ {_fmt_tokens(hs['saved'])} saved{pct}")
-            if hs and hs.get("five_hour") is not None:
-                parts.append(f"5h {float(hs['five_hour']):.0f}%")
+
+def _field(data, *keys):
+    """data[k1][k2]... where any level that is not an object (null, a string, a number, a list) reads as absent."""
+    for key in keys:
+        if not isinstance(data, dict):
+            return None
+        data = data.get(key)
+    return data
+
+
+def _statusline_parts(data, parts: list[str]) -> None:
+    """Append the segments of the status line to `parts` one at a time, so a failure only loses the segments after it."""
+    model = _field(data, "model", "display_name")
+    if isinstance(model, str) and model.strip():
+        parts.append(model.strip())
+    ctx = _num(_field(data, "context_window", "used_percentage"))
+    if ctx is not None:
+        parts.append(f"ctx {ctx:.0f}%")
+    cost = _num(_field(data, "cost", "total_cost_usd"))
+    if cost:
+        parts.append(f"${cost:.2f}")
+    from . import config
+
+    port = int(config.load().get("headroom.port", 8787))
+    if os.environ.get("ANTHROPIC_BASE_URL", "").endswith(f":{port}"):
+        hs = _headroom_summary(port)
+        saved = _num(_field(hs, "saved"))
+        if saved:
+            pct = _num(_field(hs, "pct"))
+            share = f" {pct:.0f}%" if pct else ""
+            parts.append(f"✂ {_fmt_tokens(saved)} saved{share}")
+        five_hour = _num(_field(hs, "five_hour"))
+        if five_hour is not None:
+            parts.append(f"5h {five_hour:.0f}%")
+
+
+def statusline() -> int:
+    """Print one status line, always, and exit 0: this runs on every refresh of the prompt, so a payload field of the wrong
+    type, a broken stdin, an unreadable config or a closed stdout may cost segments but never a traceback or a failing exit."""
+    parts: list[str] = []
+    try:
+        try:
+            sys.stdout.reconfigure(encoding="utf-8")  # type: ignore[attr-defined]
+        except Exception:
+            pass
+        try:
+            data = read_stdin_json()
+        except Exception:
+            data = {}
+        try:
+            _statusline_parts(data, parts)
+        except Exception:
+            pass  # whatever was built before the failure is still printed
+        sys.stdout.write(" | ".join(parts) + "\n")
     except Exception:
         pass
-    sys.stdout.write(" | ".join(parts) + "\n")
     return 0

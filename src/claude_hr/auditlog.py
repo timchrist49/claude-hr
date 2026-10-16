@@ -6,6 +6,7 @@ durations, check names, exit codes and a hash-based repo id. Best effort: record
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import os
@@ -17,13 +18,23 @@ from . import paths
 
 MAX_STR = 120  # no free text: names and short reasons only
 MAX_LINE = 3500  # one record is one write: small enough that nothing splits it
-# how long an append waits for another process's append before it goes ahead unlocked
-LOCK_WAIT_S = 1.0
+# How long an append waits for another process's append before it goes ahead unlocked. A record is one small write, so a
+# holder is done in well under a millisecond: this only matters for a holder that is stuck, and the Stop hook must not wait on it.
+LOCK_WAIT_S = 0.1
+# errno values that mean "somebody else holds it, try again": msvcrt.locking (LK_NBLCK) fails with EACCES, flock(LOCK_NB) with
+# EWOULDBLOCK/EAGAIN, a signal with EINTR. Anything else (ENOLCK, ENOTSUP, ENOSYS, EINVAL ...) is permanent for this file.
+_CONTENDED = frozenset({errno.EACCES, errno.EAGAIN, errno.EWOULDBLOCK, errno.EINTR, errno.EDEADLK})
+# Set once the OS refused locking outright (NFS without lockd, a filesystem without locks): the rest of this process then
+# appends unlocked at once instead of re-learning it on every record.
+_lock_unusable = False
 
 
-def _try_lock(fd: int) -> bool:
+def _try_lock(fd: int) -> bool | None:
     """Take an exclusive lock on byte 0 of the lock file without blocking. Owned by the open file, so the OS releases it
-    when the process dies: there is never a stale lock to clean up."""
+    when the process dies: there is never a stale lock to clean up.
+
+    True: taken. False: another process holds it (retry for a moment). None: this system cannot lock this file at all, so
+    waiting is pointless."""
     try:
         if os.name == "nt":
             import msvcrt
@@ -35,8 +46,10 @@ def _try_lock(fd: int) -> bool:
 
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         return True
-    except (OSError, ImportError):
-        return False
+    except ImportError:
+        return None
+    except OSError as exc:
+        return False if exc.errno in _CONTENDED else None
 
 
 def _unlock(fd: int) -> None:
@@ -57,15 +70,29 @@ def _append_lock(target: Path):
 
     O_APPEND makes a single write atomic on POSIX, but on Windows the C runtime emulates it with seek-then-write, so two
     gates that finish together lose or overwrite each other's record. The lock is best effort and fails open: after
-    LOCK_WAIT_S (or if the lock file cannot be used at all) the caller appends anyway, as it did before the lock existed."""
+    LOCK_WAIT_S of contention, or at once when the system cannot lock this file at all (remembered for the process), or if
+    the lock file cannot be opened, the caller appends anyway, as it did before the lock existed."""
+    global _lock_unusable
     fd = None
     held = False
     try:
-        flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_BINARY", 0)
-        fd = os.open(target.with_suffix(".lock"), flags, 0o600)
-        deadline = time.monotonic() + LOCK_WAIT_S
-        while not (held := _try_lock(fd)) and time.monotonic() < deadline:
-            time.sleep(0.002)
+        if not _lock_unusable:
+            flags = (
+                os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_BINARY", 0)
+            )
+            fd = os.open(target.with_suffix(".lock"), flags, 0o600)
+            deadline = time.monotonic() + LOCK_WAIT_S
+            while True:
+                got = _try_lock(fd)
+                if got is None:
+                    _lock_unusable = True
+                    break
+                if got:
+                    held = True
+                    break
+                if time.monotonic() >= deadline:
+                    break
+                time.sleep(0.002)
     except OSError:
         pass
     try:

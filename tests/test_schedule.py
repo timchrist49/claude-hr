@@ -1,3 +1,4 @@
+import os
 import plistlib
 import shutil
 import subprocess
@@ -102,6 +103,118 @@ def test_windows_script_registers_every_job():
         assert needle in script
 
 
+def _powershell_parse(script: str) -> str | None:
+    """Run the real PowerShell PARSER over `script` (None when this machine has no PowerShell). The text travels in an
+    environment variable and is only parsed, never executed: handed to `-Command` as an argument it would RUN, and these
+    scripts register and unregister tasks in the real Task Scheduler."""
+    shell = shutil.which("powershell") or shutil.which("pwsh")
+    if not shell:
+        return None
+    check = (
+        "$e = $null; $t = $null; [void][System.Management.Automation.Language.Parser]::ParseInput("
+        "$env:CLAUDE_HR_TEST_PS_SCRIPT, [ref]$t, [ref]$e); "
+        "if ($e.Count -eq 0) { 'PARSE_OK' } else { $e | ForEach-Object { $_.Message } }"
+    )
+    return subprocess.run(
+        [shell, "-NoProfile", "-NonInteractive", "-Command", check],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        env={**os.environ, "CLAUDE_HR_TEST_PS_SCRIPT": script},
+    ).stdout
+
+
+def _ps_literals(text: str) -> list[str]:
+    """The single-quoted PowerShell string literals of `text`, decoded (a doubled quote is one quote). Any of the four
+    typographic quotes PowerShell accepts opens and closes a literal too; an unterminated one raises."""
+    quotes = schedule._PS_QUOTES
+    out, i = [], 0
+    while i < len(text):
+        if text[i] not in quotes:
+            i += 1
+            continue
+        i += 1
+        buf = []
+        while True:
+            if i >= len(text):
+                raise ValueError("unterminated PowerShell string literal")
+            c = text[i]
+            if c in quotes:
+                if i + 1 < len(text) and text[i + 1] in quotes:
+                    buf.append(c)  # a doubled quote is one quote character
+                    i += 2
+                    continue
+                i += 1
+                break
+            buf.append(c)
+            i += 1
+        out.append("".join(buf))
+    return out
+
+
+@pytest.mark.parametrize(
+    "exe",
+    [
+        r"C:\Users\Tim O'Brien\AppData\Roaming\uv\tools\claude-hr\Scripts\pythonw.exe",
+        "C:\\Users\\Tim O\u2019Brien\\AppData\\Roaming\\uv\\tools\\claude-hr\\Scripts\\pythonw.exe",
+        "C:\\Users\\a'b \u2018c\u201a d\u201be\\pythonw.exe",
+    ],
+)
+def test_windows_script_survives_an_apostrophe_in_the_interpreter_path(exe):
+    """Reproduced: the path went into a PowerShell single-quoted literal unescaped, so `Tim O'Brien` cut -Execute to
+    `C:\\Users\\Tim O`, threw a positional-parameter error for the first job and registered no task at all."""
+    sp = [
+        schedule.Spec("warm", "logon"),
+        schedule.Spec("monitor", "interval", minutes=15),
+        schedule.Spec("update", "daily", at="03:17"),
+        schedule.Spec("maintain", "weekly", at="04:41", weekday=0),
+    ]
+    script = schedule.render_windows_script(sp, [exe, "-m", "claude_hr.ctl", "job"])
+    for line in script.splitlines():
+        _ps_literals(line)  # every line's quotes pair up
+    registers = [ln for ln in script.splitlines() if ln.startswith("Register-ScheduledTask")]
+    assert len(registers) == 4
+    for line, spec in zip(registers, sp, strict=True):
+        lits = _ps_literals(line)
+        assert lits[0] == f"claude-hr\\{spec.name}"  # -TaskName
+        assert lits[1] == exe  # -Execute: the path, exactly
+        assert lits[2] == f"-m claude_hr.ctl job {spec.name}"  # -Argument
+    assert script.count("Register-ScheduledTask") == 4
+
+
+def test_windows_script_with_an_apostrophe_parses_in_real_powershell():
+    """An odd number of jobs (updates.enabled = false) is what made the unescaped apostrophe a parse error:
+    'The string is missing the terminator'."""
+    sp = [
+        schedule.Spec("warm", "logon"),
+        schedule.Spec("monitor", "interval", minutes=15),
+        schedule.Spec("maintain", "weekly", at="04:41", weekday=0),
+    ]
+    exe = r"C:\Users\Tim O'Brien\AppData\Roaming\uv\tools\claude-hr\Scripts\pythonw.exe"
+    out = _powershell_parse(schedule.render_windows_script(sp, [exe, "-m", "claude_hr.ctl", "job"]))
+    assert out is None or "PARSE_OK" in out, out
+
+
+def test_windows_script_escapes_a_time_of_day_from_the_config_too():
+    script = schedule.render_windows_script(
+        [schedule.Spec("update", "daily", at="03:17'; Remove-Item x; '")],
+        [r"C:\py\pythonw.exe", "-m", "claude_hr.ctl", "job"],
+    )
+    assert "-At '03:17''; Remove-Item x; '''" in script
+    assert "03:17'; Remove-Item" not in script
+
+
+def test_ps_quote_doubles_every_quote_character_powershell_accepts():
+    assert schedule.ps_quote("plain") == "'plain'"
+    assert schedule.ps_quote("it's") == "'it''s'"
+    assert schedule.ps_quote("a\u2018b\u2019c\u201ad\u201be") == (
+        "'a\u2018\u2018b\u2019\u2019c\u201a\u201ad\u201b\u201be'"
+    )
+    assert (
+        schedule.ps_quote("$env:X `n") == "'$env:X `n'"
+    )  # nothing else is special inside single quotes
+
+
 def test_cron_install_never_overwrites_an_unreadable_crontab(sandbox, monkeypatch):
     import subprocess as sp
 
@@ -157,20 +270,10 @@ def test_windows_remove_only_touches_this_installs_tasks(sandbox, monkeypatch):
     assert (
         "'selfupdate'" in script and "Test-Path -LiteralPath $_.Execute" in script
     )  # + the one-shot helper and orphans
-    # the real PowerShell parser must accept it (parse only; nothing is run)
-    shell = __import__("shutil").which("powershell") or __import__("shutil").which("pwsh")
-    if shell:
-        check = (
-            "$e = $null; $t = $null; [void][System.Management.Automation.Language.Parser]::ParseInput($args[0], [ref]$t, [ref]$e); "
-            "if ($e.Count -eq 0) { 'PARSE_OK' } else { $e | ForEach-Object { $_.Message } }"
-        )
-        out = subprocess.run(
-            [shell, "-NoProfile", "-NonInteractive", "-Command", check, script],
-            capture_output=True,
-            text=True,
-            timeout=60,
-        ).stdout
-        assert "PARSE_OK" in out, out
+    out = _powershell_parse(
+        script
+    )  # the real PowerShell parser must accept it (None: no PowerShell here)
+    assert out is None or "PARSE_OK" in out, out
 
 
 def test_windows_remove_reports_how_many_tasks_went_and_real_failures(sandbox, monkeypatch):

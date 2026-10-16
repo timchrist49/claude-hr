@@ -125,26 +125,38 @@ def render_launchd(spec: Spec, argv: list[str], path_env: str) -> bytes:
     return plistlib.dumps(d)
 
 
+_PS_QUOTES = "'\u2018\u2019\u201a\u201b"  # PowerShell treats all four typographic single quotes like an ASCII one
+
+
+def ps_quote(value: str) -> str:
+    """A PowerShell single-quoted string literal. PowerShell also accepts U+2018/2019/201A/201B as quote characters, so every
+    one of them is doubled: a typographic apostrophe in a path or environment value must not end the string early. Nothing
+    else is special inside single quotes (no `$` expansion, no escapes)."""
+    return "'" + "".join(c * 2 if c in _PS_QUOTES else c for c in str(value)) + "'"
+
+
 def render_windows_script(all_specs: list[Spec], argv: list[str]) -> str:
+    """The PowerShell that registers every job. Every interpolated value goes through ps_quote: the interpreter path comes
+    from the profile / UV_TOOL_DIR (C:\\Users\\Tim O'Brien ...) and the time of day from config.toml."""
     exe, rest = argv[0], argv[1:]
     args = " ".join(f'"{a}"' if " " in a else a for a in rest)
     lines = ["$ErrorActionPreference = 'Stop'"]
     for s in all_specs:
         name = f"claude-hr\\{s.name}"
-        action = f"New-ScheduledTaskAction -Execute '{exe}' -Argument '{args} {s.name}'"
+        action = f"New-ScheduledTaskAction -Execute {ps_quote(exe)} -Argument {ps_quote(f'{args} {s.name}')}"
         if s.kind == "logon":
             trig = "New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME"
         elif s.kind == "interval":
-            trig = f"New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(2) -RepetitionInterval (New-TimeSpan -Minutes {s.minutes})"
+            trig = f"New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(2) -RepetitionInterval (New-TimeSpan -Minutes {int(s.minutes)})"
         elif s.kind == "daily":
-            trig = f"New-ScheduledTaskTrigger -Daily -At '{s.at}'"
+            trig = f"New-ScheduledTaskTrigger -Daily -At {ps_quote(s.at)}"
         else:
             day = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"][
                 s.weekday
             ]
-            trig = f"New-ScheduledTaskTrigger -Weekly -DaysOfWeek {day} -At '{s.at}'"
+            trig = f"New-ScheduledTaskTrigger -Weekly -DaysOfWeek {day} -At {ps_quote(s.at)}"
         lines.append(
-            f"Register-ScheduledTask -TaskName '{name}' -Force -Action ({action}) -Trigger ({trig}) "
+            f"Register-ScheduledTask -TaskName {ps_quote(name)} -Force -Action ({action}) -Trigger ({trig}) "
             "-Settings (New-ScheduledTaskSettingsSet -StartWhenAvailable -AllowStartIfOnBatteries "
             "-DontStopIfGoingOnBatteries -MultipleInstances IgnoreNew -ExecutionTimeLimit (New-TimeSpan -Hours 2)) "
             "-Description 'Managed by claude-hr-ctl schedule' | Out-Null"
@@ -252,10 +264,10 @@ def remove() -> list[str]:
         # successful removal, not an error. The script prints how many tasks existed.
         # Only tasks that belong to THIS install: they run pythonw.exe from this environment. The one-shot self-update helper
         # and orphans whose executable no longer exists go too; another install's jobs (a sandbox, a second profile) stay.
-        mine = str(Path(job_argv()[0]).parent).replace("'", "''")
+        mine = ps_quote(str(Path(job_argv()[0]).parent))
         script = (
             "$ErrorActionPreference = 'Stop'; "
-            f"try {{ $mine = '{mine}'; "
+            f"try {{ $mine = {mine}; "
             "$t = @(Get-ScheduledTask -TaskPath '\\claude-hr\\' -ErrorAction SilentlyContinue | Where-Object { "
             "$_.TaskName -eq 'selfupdate' -or @($_.Actions | Where-Object { $_.Execute -and "
             "($_.Execute.StartsWith($mine, [StringComparison]::OrdinalIgnoreCase) -or -not (Test-Path -LiteralPath $_.Execute)) }).Count -gt 0 }); "
