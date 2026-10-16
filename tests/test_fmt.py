@@ -5,15 +5,18 @@ Formatter dataclass, against real temporary git repos. Detection tests create co
 emulate both OS naming schemes (`ruff.exe` vs `ruff`) on any host. A few tests run a real tool when it is on PATH.
 """
 
+import errno
 import os
 import subprocess
 import sys
+import threading
 import time
+import types
 from dataclasses import dataclass
 
 import pytest
 
-from claude_hr import fmt, paths
+from claude_hr import fmt, paths, procutil
 
 BOM = b"\xef\xbb\xbf"
 
@@ -201,14 +204,35 @@ def test_lf_file_stays_lf_when_the_formatter_emits_crlf(repo, fake):
     assert f.read_bytes() == b"a = 1\nb = 2\n"
 
 
-def test_gate_treats_an_eol_normalising_formatter_as_drift_for_a_crlf_head(repo, fake):
+def test_gate_judges_a_crlf_head_exactly_like_the_write_path_does(repo, fake):
+    """HEAD is CRLF and clean; the formatter emits LF. The write path keeps CRLF (_match_eol), so the gate must compare
+    HEAD the same way: this file is clean at HEAD and gets formatted, with its CRLF kept."""
     fake("lf")
     f = put(repo / "win.py", "a = 1\r\n")
-    commit(repo)  # HEAD is CRLF, and the formatter wants LF: formatting would rewrite every line
+    commit(repo)
     f.write_bytes(b"a = 1\r\nb = 2  \r\n")
     report = fmt.format_changed(repo)
-    assert report.skipped == [("win.py", fmt.DRIFT_REASON)]
-    assert f.read_bytes() == b"a = 1\r\nb = 2  \r\n"
+    assert report.skipped == [] and report.formatted == ["win.py"]
+    assert f.read_bytes() == b"a = 1\r\nb = 2\r\n"
+
+
+def test_gate_still_sees_real_drift_in_a_crlf_head(repo, fake):
+    fake("lf")
+    f = put(repo / "win.py", "a = 1  \r\n")  # trailing whitespace at HEAD: genuinely drifted
+    commit(repo)
+    f.write_bytes(b"a = 1  \r\nb = 2  \r\n")
+    report = fmt.format_changed(repo)
+    assert report.skipped == [("win.py", fmt.DRIFT_REASON)] and report.formatted == []
+    assert f.read_bytes() == b"a = 1  \r\nb = 2  \r\n"
+
+
+def test_gate_still_sees_a_mixed_eol_head_as_drift(repo, fake):
+    fake("lf")
+    f = put(repo / "mixed.py", "a = 1\r\nb = 2\n")  # no single convention to preserve
+    commit(repo)
+    f.write_bytes(b"a = 1\r\nb = 2\nc = 3  \n")
+    report = fmt.format_changed(repo)
+    assert report.skipped == [("mixed.py", fmt.DRIFT_REASON)]
 
 
 def test_unchanged_output_is_not_rewritten(repo, fake):
@@ -270,6 +294,269 @@ def test_file_edited_while_formatting_is_not_overwritten(repo, fake):
     report = fmt.format_changed(repo)
     assert report.skipped == [("a.py", "changed while formatting")]
     assert f.read_bytes() == b"x = 1  \n# concurrent edit\n"
+
+
+# ---- writing: atomic, never truncating -------------------------------------------------------------------------
+
+
+def _temp_leftovers(directory):
+    return sorted(p.name for p in directory.iterdir() if p.name.startswith(".claude-hr-fmt-"))
+
+
+@pytest.mark.parametrize("failing", ["replace", "fsync", "write"])
+def test_a_failed_write_leaves_the_original_intact_and_no_temp_file(
+    repo, fake, monkeypatch, failing
+):
+    """The old code opened the file with 'wb' (truncating it at once) and wrote into it: a write that failed halfway
+    (full disk, quota, network share) left a truncated file that git cannot restore when it is untracked."""
+    original = b"x = 1  \n" * 50
+    f = put(repo / "a.py", original)
+    disk_full = OSError(errno.ENOSPC, "disk full")
+
+    def boom(*args, **kwargs):
+        raise disk_full
+
+    real_fdopen = os.fdopen
+
+    class FailingFile:
+        def __init__(self, fh):
+            self.fh = fh
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            self.fh.close()
+            return False
+
+        def write(self, data):
+            raise disk_full
+
+    with monkeypatch.context() as m:
+        if failing == "replace":
+            m.setattr(os, "replace", boom)
+        elif failing == "fsync":
+            m.setattr(os, "fsync", boom)
+        else:
+            m.setattr(os, "fdopen", lambda fd, mode: FailingFile(real_fdopen(fd, mode)))
+        report = fmt.format_changed(repo)
+    assert report.errors == [("a.py", "cannot write: disk full")]
+    assert report.formatted == []
+    assert f.read_bytes() == original
+    assert _temp_leftovers(repo) == []
+    assert fmt.format_changed(repo).formatted == [
+        "a.py"
+    ]  # and it works again once the disk is back
+
+
+@pytest.mark.parametrize(
+    ("on_windows", "fail_times", "attempts", "formatted"),
+    [
+        (True, 2, 3, True),  # a lock that goes away: retried, written
+        (True, 99, 4, False),  # a lock that stays: given up after _REPLACE_TRIES, reported
+        (False, 1, 1, False),  # elsewhere a permission error is final at once
+    ],
+)
+def test_a_locked_file_is_retried_briefly_on_windows_only(
+    repo, monkeypatch, on_windows, fail_times, attempts, formatted
+):
+    original = b"x = 1  \n"
+    f = put(repo / "a.py", original)
+    real_replace, tries = os.replace, []
+
+    def locked(src, dst):
+        tries.append(1)
+        if len(tries) <= fail_times:
+            raise PermissionError(errno.EACCES, "locked by another process")
+        return real_replace(src, dst)
+
+    with monkeypatch.context() as m:
+        # _replace_atomically spawns nothing, so IS_WINDOWS can be flipped around the call on any host
+        m.setattr(paths, "IS_WINDOWS", on_windows)
+        m.setattr(os, "replace", locked)
+        m.setattr(time, "sleep", lambda s: None)
+        if formatted:
+            assert fmt._replace_atomically(f, b"x = 1\n", os.lstat(f)) is None
+        else:
+            with pytest.raises(PermissionError, match="locked by another process"):
+                fmt._replace_atomically(f, b"x = 1\n", os.lstat(f))
+    assert len(tries) == attempts
+    assert f.read_bytes() == (b"x = 1\n" if formatted else original)
+    assert _temp_leftovers(repo) == []
+
+
+def test_owner_is_kept_or_the_rewrite_is_refused(repo, monkeypatch):
+    f = put(repo / "a.py", "x = 1  \n")
+    owned_by_other = types.SimpleNamespace(st_uid=0, st_gid=0)
+    chowned = []
+
+    def chown_fails(path, uid, gid):
+        chowned.append((uid, gid))
+        raise PermissionError(errno.EPERM, "not permitted")
+
+    with monkeypatch.context() as m:
+        m.setattr(os, "geteuid", lambda: 1000, raising=False)
+        m.setattr(os, "getegid", lambda: 1000, raising=False)
+        m.setattr(os, "chown", chown_fails, raising=False)
+        assert fmt._keeps_owner("t", owned_by_other) is False and chowned == [(0, 0)]
+        mine_other_group = types.SimpleNamespace(st_uid=1000, st_gid=7)
+        assert fmt._keeps_owner("t", mine_other_group) is True  # the group is best effort
+        same = types.SimpleNamespace(st_uid=1000, st_gid=1000)
+        chowned.clear()
+        assert fmt._keeps_owner("t", same) is True and chowned == []
+        m.setattr(os, "chown", lambda path, uid, gid: chowned.append((uid, gid)), raising=False)
+        assert fmt._keeps_owner("t", owned_by_other) is True  # root: allowed
+    with monkeypatch.context() as m:
+        m.setattr(fmt, "_keeps_owner", lambda tmp, before: False)
+        with pytest.raises(PermissionError, match="owner"):
+            fmt._replace_atomically(f, b"x = 1\n", os.lstat(f))
+    assert f.read_bytes() == b"x = 1  \n" and _temp_leftovers(repo) == []
+
+
+def test_a_successful_write_leaves_no_temp_file_behind(repo, fake):
+    f = put(repo / "a.py", "x = 1  \n")
+    assert fmt.format_changed(repo).formatted == ["a.py"]
+    assert f.read_bytes() == b"x = 1\n"
+    assert _temp_leftovers(repo) == []
+
+
+@pytest.mark.skipif(not hasattr(os, "geteuid"), reason="POSIX permission bits")
+def test_the_rewritten_file_keeps_its_permission_bits(repo, fake):
+    f = put(repo / "run.py", "x = 1  \n")
+    f.chmod(0o750)
+    assert fmt.format_changed(repo).formatted == ["run.py"]
+    assert f.read_bytes() == b"x = 1\n"
+    assert f.stat().st_mode & 0o7777 == 0o750
+
+
+@pytest.mark.skipif(
+    hasattr(os, "geteuid") and os.geteuid() == 0, reason="root can write read-only files"
+)
+def test_a_read_only_file_is_not_replaced_behind_its_back(repo, fake):
+    """os.replace needs only a writable directory, so without a check an atomic rewrite would overwrite a file the
+    user made read-only (the old in-place write failed on it)."""
+    f = put(repo / "locked.py", "x = 1  \n")
+    f.chmod(0o444)
+    try:
+        report = fmt.format_changed(repo)
+        assert report.errors == [("locked.py", "cannot write: file is read-only")]
+        assert f.read_bytes() == b"x = 1  \n"
+        assert _temp_leftovers(repo) == []
+    finally:
+        f.chmod(0o644)
+
+
+def _one(f, repo, name, **kw):
+    """Drive _format_one for a single file, as _process does."""
+    report = fmt.FormatReport()
+    cand = fmt._Cand(repo / name, name, name, tracked=False)
+    fmt._format_one(
+        f,
+        cand,
+        repo,
+        report,
+        deadline=fmt._now() + 60,
+        clean_gate=False,
+        check=kw.get("check", False),
+    )
+    return report
+
+
+def test_a_symlink_is_never_written_through(repo, fake):
+    target = put(repo / "real.py", "x = 1  \n")
+    try:
+        os.symlink(target, repo / "link.py")
+    except (OSError, NotImplementedError):
+        pytest.skip("symlinks are not available here")
+    report = _one(
+        fake(), repo, "link.py"
+    )  # as if the file had been swapped for a link after the scan
+    assert report.skipped == [("link.py", "not a regular file")] and report.formatted == []
+    assert target.read_bytes() == b"x = 1  \n"
+    assert (repo / "link.py").is_symlink()
+
+
+def test_a_hard_linked_file_is_skipped_not_unlinked_from_its_twin(repo, fake):
+    first = put(repo / "a.py", "x = 1  \n")
+    try:
+        os.link(first, repo / "twin.py")
+    except (OSError, NotImplementedError):
+        pytest.skip("hard links are not available here")
+    report = _one(fake(), repo, "a.py")
+    assert report.skipped == [("a.py", "hard-linked file")] and report.formatted == []
+    assert os.path.samefile(first, repo / "twin.py")
+    assert first.read_bytes() == b"x = 1  \n"
+    assert _one(fake(), repo, "a.py", check=True).skipped == [("a.py", "hard-linked file")]
+
+
+def test_the_scope_is_every_uncommitted_file_not_only_the_ones_an_agent_edited(repo, fake):
+    """Deliberate: the formatter at the end of a turn does what a pre-commit hook would. Nothing in the gate knows
+    who changed a file, so a file the user edited by hand is formatted too (the clean gate keeps it to their lines)."""
+    mine = put(repo / "mine.py", "x = 1\n")
+    commit(repo)
+    mine.write_bytes(b"x = 1\ny = 2   \n")  # the user's own work in progress, not the agent's
+    assert fmt.format_changed(repo).formatted == ["mine.py"]
+    assert mine.read_bytes() == b"x = 1\ny = 2\n"
+
+
+# ---- the clean gate and renamed files ---------------------------------------------------------------------------
+
+
+def test_gate_judges_a_renamed_file_against_its_old_path(repo, fake):
+    """`git mv` + an edit shows up as `RM new <- old`. HEAD has no `new`, which used to read as "a new file" (always
+    formatted), so the whole drifted file was reformatted."""
+    old = put(repo / "a.py", "x = 1   \n")  # drifted at HEAD
+    commit(repo)
+    git(repo, "mv", "a.py", "b.py")
+    moved = repo / "b.py"
+    moved.write_bytes(b"x = 1   \ny = 2   \n")
+    assert old.exists() is False
+    report = fmt.format_changed(repo)
+    assert report.skipped == [("b.py", fmt.DRIFT_REASON)] and report.formatted == []
+    assert moved.read_bytes() == b"x = 1   \ny = 2   \n"
+    assert fmt.format_changed(repo, clean_gate=False).formatted == [
+        "b.py"
+    ]  # the deliberate run still formats it
+
+
+def test_a_pure_rename_of_a_drifted_file_is_not_reformatted(repo, fake):
+    put(repo / "a.py", "x = 1   \n")
+    commit(repo)
+    git(repo, "mv", "a.py", "b.py")
+    report = fmt.format_changed(repo)
+    assert report.skipped == [("b.py", fmt.DRIFT_REASON)]
+    assert (repo / "b.py").read_bytes() == b"x = 1   \n"
+
+
+def test_a_renamed_file_that_was_clean_at_its_old_path_is_formatted(repo, fake):
+    put(repo / "a.py", "x = 1\n")
+    commit(repo)
+    git(repo, "mv", "a.py", "sub_b.py")
+    moved = repo / "sub_b.py"
+    moved.write_bytes(b"x = 1\ny = 2   \n")
+    assert fmt.format_changed(repo).formatted == ["sub_b.py"]
+    assert moved.read_bytes() == b"x = 1\ny = 2\n"
+
+
+def test_renames_are_detected_even_when_the_user_turned_rename_detection_off(repo, fake):
+    git(repo, "config", "diff.renames", "false")
+    put(repo / "a.py", "x = 1   \n")
+    commit(repo)
+    git(repo, "mv", "a.py", "b.py")
+    (repo / "b.py").write_bytes(b"x = 1   \ny = 2   \n")
+    assert fmt.format_changed(repo).skipped == [("b.py", fmt.DRIFT_REASON)]
+
+
+def test_a_rename_whose_original_is_not_in_head_is_unknowable_and_skipped(repo, fake):
+    put(repo / "seed.py", "x = 1\n")
+    commit(repo)
+    f = fake()
+    put(repo / "b.py", "x = 1\ny = 2   \n")
+    gone = fmt._Cand(repo / "b.py", "b.py", "b.py", tracked=True, orig_top_rel="never_committed.py")
+    why = fmt._gate(f, repo, gone, fmt._now() + 60)
+    assert why and "renamed from" in why
+    seed = fmt._Cand(repo / "b.py", "b.py", "b.py", tracked=True, orig_top_rel="seed.py")
+    assert fmt._gate(f, repo, seed, fmt._now() + 60) is None  # seed.py is clean at HEAD
 
 
 def test_skips_binary_large_lock_minified_generated_and_vendored_files(repo, fake):
@@ -625,6 +912,18 @@ def test_parse_status_handles_renames_untracked_and_spaces():
     assert fmt._parse_status(b"") == []
 
 
+def test_parse_status_entries_keep_the_original_path_of_renames_and_copies():
+    raw = b" M a.py\0R  new.py\0old dir/old.py\0C  copy.py\0src.py\0?? b c.py\0RM x.py\0y.py\0"
+    assert fmt._parse_status_entries(raw) == [
+        (" M", "a.py", ""),
+        ("R ", "new.py", "old dir/old.py"),
+        ("C ", "copy.py", "src.py"),
+        ("??", "b c.py", ""),
+        ("RM", "x.py", "y.py"),
+    ]
+    assert fmt._parse_status_entries(b"R  truncated.py\0") == [("R ", "truncated.py", "")]
+
+
 def test_match_eol():
     assert fmt._match_eol("a\r\nb\r\n", "a\nb\n") == "a\r\nb\r\n"
     assert fmt._match_eol("a\nb\n", "a\r\nb\r\n") == "a\nb\n"
@@ -698,6 +997,153 @@ def test_child_environment_has_no_credentials_and_no_git_redirects(monkeypatch):
     ):
         assert gone not in env
     assert env["GIT_OPTIONAL_LOCKS"] == "0"
+
+
+CREDENTIAL_LIKE = [
+    # what verify.scrubbed_env drops, and what fmt used to let through (a formatter may run repo-controlled code)
+    "AWS_ACCESS_KEY_ID",
+    "STRIPE_KEY",
+    "ENCRYPTION_KEY",
+    "SIGNING_KEY",
+    "DD_APP_KEY",
+    # the other names the review found reaching the formatter
+    "GH_PAT",
+    "CI_JOB_JWT",
+    "SENTRY_DSN",
+    "SLACK_WEBHOOK_URL",
+    "DATABASE_URL",
+    # the families the review asked for
+    "ANTHROPIC_BASE_URL",
+    "CLAUDE_CODE_OAUTH_TOKEN",
+    "AWS_REGION",
+    "AZURE_CLIENT_ID",
+    "GOOGLE_APPLICATION_CREDENTIALS",
+    "GCP_PROJECT",
+    "GITHUB_ACTOR",
+    "GH_HOST",
+    "NPM_CONFIG_REGISTRY",
+    "SSH_AUTH_SOCK",
+    "GIT_ASKPASS",
+    "SSH_ASKPASS",
+    "DB_PWD",
+    "MY_COOKIE",
+    "ORM_CONNECTION_STRING",
+    "TLS_PRIVATE_FILE",
+    "SSL_CERT_FILE",
+    "GIT_CONFIG_COUNT",
+    "GIT_CONFIG_KEY_0",
+    "GIT_CONFIG_VALUE_0",
+    "GIT_CONFIG_PARAMETERS",
+]
+
+
+@pytest.mark.parametrize("name", CREDENTIAL_LIKE)
+def test_child_environment_drops_every_credential_like_name(monkeypatch, name):
+    monkeypatch.setenv(name, "secret-value")
+    assert name.upper() not in {k.upper() for k in fmt._clean_env()}
+
+
+def test_child_environment_drops_urls_with_embedded_passwords_whatever_they_are_called(monkeypatch):
+    monkeypatch.setenv("HTTPS_PROXY", "http://user:hunter2@proxy.example:3128")
+    monkeypatch.setenv("REDIS_URL", "redis://:hunter2@cache.example:6379/0")
+    monkeypatch.setenv("MONGODB_URI", "mongodb+srv://app:hunter2@db.example/x")
+    monkeypatch.setenv("PIP_INDEX_URL", "https://__token__:hunter2@pypi.example/simple")
+    monkeypatch.setenv("NO_PROXY_URL", "http://proxy.example:3128")  # no credentials: stays
+    monkeypatch.setenv(
+        "REPO_HOMEPAGE", "https://example.com/a@b/c"
+    )  # an @ without user:password: stays
+    env = fmt._clean_env()
+    for gone in ("HTTPS_PROXY", "REDIS_URL", "MONGODB_URI", "PIP_INDEX_URL"):
+        assert gone not in {k.upper() for k in env}
+    assert env["NO_PROXY_URL"] == "http://proxy.example:3128"
+    assert env["REPO_HOMEPAGE"] == "https://example.com/a@b/c"
+
+
+def test_child_environment_keeps_what_git_and_toolchains_need(monkeypatch):
+    kept = {
+        "GIT_AUTHOR_NAME": "A",
+        "GIT_AUTHOR_EMAIL": "a@example.com",
+        "GIT_COMMITTER_NAME": "C",
+        "GIT_COMMITTER_EMAIL": "c@example.com",
+        "CARGO_HOME": "/cargo",
+        "RUSTUP_HOME": "/rustup",
+        "HOME": "/home/u",
+        "TMPDIR": "/tmp",
+        "LANG": "C.UTF-8",
+        "VIRTUAL_ENV": "/venv",
+        "GOPATH": "/go",
+    }
+    for k, v in kept.items():
+        monkeypatch.setenv(k, v)
+    env = {k.upper(): v for k, v in fmt._clean_env().items()}
+    for k, v in kept.items():
+        assert env[k] == v, k
+    assert "PATH" in env
+
+
+def test_git_still_works_when_injected_git_config_is_in_the_environment(repo, monkeypatch):
+    """GIT_CONFIG_COUNT without its GIT_CONFIG_KEY_n makes git die, so the family is dropped together."""
+    monkeypatch.setenv("GIT_CONFIG_COUNT", "1")
+    monkeypatch.setenv("GIT_CONFIG_KEY_0", "core.fmtprobe")
+    monkeypatch.setenv("GIT_CONFIG_VALUE_0", "x")
+    r = fmt._git(repo, "rev-parse", "--show-toplevel", timeout=30)
+    assert r.rc == 0, r.err
+
+
+def test_windows_children_do_not_search_the_repository_directory_first(monkeypatch):
+    monkeypatch.delenv("NoDefaultCurrentDirectoryInExePath", raising=False)
+    with monkeypatch.context() as m:
+        m.setattr(paths, "IS_WINDOWS", True)
+        assert fmt._clean_env()["NoDefaultCurrentDirectoryInExePath"] == "1"
+    with monkeypatch.context() as m:
+        m.setattr(paths, "IS_WINDOWS", False)
+        assert "NoDefaultCurrentDirectoryInExePath" not in fmt._clean_env()
+
+
+def test_taskkill_is_called_by_absolute_path_never_by_bare_name(tmp_path, monkeypatch):
+    system32 = tmp_path / "Windows" / "System32"
+    system32.mkdir(parents=True)
+    exe = system32 / "taskkill.exe"
+    exe.write_bytes(b"")
+    calls = []
+    killed = []
+    proc = types.SimpleNamespace(pid=4242, kill=lambda: killed.append(True))
+    with monkeypatch.context() as m:
+        m.setattr(paths, "IS_WINDOWS", True)
+        m.setattr(procutil, "run", lambda argv, **kw: calls.append(argv))
+        m.setenv("SystemRoot", str(tmp_path / "Windows"))
+        fmt._kill_tree(proc)
+        assert calls == [[str(exe), "/PID", "4242", "/T", "/F"]] and killed == [True]
+        # no taskkill.exe in System32: the bare name is the fallback, and procutil.run resolves it without the cwd
+        exe.unlink()
+        calls.clear()
+        fmt._kill_tree(proc)
+        assert calls == [["taskkill", "/PID", "4242", "/T", "/F"]]
+        # a relative SystemRoot is never trusted
+        m.setenv("SystemRoot", "relative-dir")
+        assert not fmt._taskkill_exe().startswith("relative-dir")
+
+
+def test_git_is_resolved_through_procutil_and_never_from_the_current_directory(
+    tmp_path, monkeypatch
+):
+    with monkeypatch.context() as m:
+        m.setattr(fmt, "_GIT_EXE", {})
+        seen = []
+        m.setattr(procutil, "resolve_exe", lambda name, env=None: seen.append(name) or "/abs/git")
+        assert fmt._git_exe() == "/abs/git" and seen == ["git"]
+    planted = tmp_path / "clone"
+    planted.mkdir()
+    (planted / ("git.exe" if paths.IS_WINDOWS else "git")).write_bytes(b"")
+    (planted / ("git.exe" if paths.IS_WINDOWS else "git")).chmod(0o755)
+    with monkeypatch.context() as m:
+        m.setattr(fmt, "_GIT_EXE", {})
+        m.setenv(
+            "PATH", os.pathsep.join([".", ""])
+        )  # relative and empty entries: the current directory
+        m.chdir(planted)
+        assert fmt._git_exe() is None
+        assert fmt._git(planted, "--version", timeout=10).rc == 127  # reported, never run
 
 
 @pytest.mark.parametrize("eol", ["\n", "\r\n"], ids=["lf", "crlf"])
@@ -915,6 +1361,108 @@ def test_path_outside_root_has_no_formatter(proj, win, tmp_path):
     assert fmt.detect(tmp_path / "elsewhere" / "a.py", proj) is None
 
 
+# ---- detection reads files the repository controls: bounded, regular files only ----------------------------------
+
+
+def test_an_oversized_config_file_is_never_read_and_means_not_configured(proj, win, monkeypatch):
+    monkeypatch.setattr(fmt, "_MAX_CONFIG_BYTES", 300)
+    venv_tool(proj, "ruff", win)
+    config = proj / "pyproject.toml"
+    config.write_text("[tool.ruff]\n" + "# padding\n" * 40, encoding="utf-8")  # about 400 bytes
+    assert config.stat().st_size > 300
+    assert fmt.detect(proj / "a.py", proj) is None
+    config.write_text("[tool.ruff]\n" + "# padding\n" * 10, encoding="utf-8")
+    assert fmt.detect(proj / "a.py", proj).name == "ruff"
+
+
+def test_read_regular_never_takes_more_than_limit_plus_one_bytes(tmp_path, monkeypatch):
+    big = tmp_path / "grows.toml"
+    big.write_bytes(b"x" * 1000)
+    requested = []
+    real_read, real_stat = os.read, os.stat
+
+    def spy(fd, n):
+        requested.append(n)
+        return real_read(fd, n)
+
+    def stale_stat(p, *a, **kw):  # the file "was small" when it was checked, and then it grew
+        st = real_stat(p, *a, **kw)
+        return types.SimpleNamespace(st_mode=st.st_mode, st_size=0)
+
+    with monkeypatch.context() as m:
+        m.setattr(os, "read", spy)
+        m.setattr(os, "stat", stale_stat)
+        assert fmt._read_regular(big, 100) is None
+    assert sum(requested) <= 101
+    assert fmt._read_regular(big, 1000) == b"x" * 1000
+    assert fmt._read_regular(big, 999) is None
+    assert fmt._read_regular(tmp_path / "missing.toml", 10) is None
+
+
+def test_a_directory_named_like_a_config_file_is_not_a_config(proj, win):
+    venv_tool(proj, "ruff", win)
+    (proj / "pyproject.toml").mkdir()
+    assert fmt._read_text(proj / "pyproject.toml") is None
+    assert fmt.detect(proj / "a.py", proj) is None
+
+
+def _within(seconds, fn, *args):
+    """Run fn in a daemon thread and fail (instead of hanging the suite) if it blocks."""
+    box = []
+    t = threading.Thread(target=lambda: box.append(fn(*args)), daemon=True)
+    t.start()
+    t.join(seconds)
+    assert box, f"{fn.__name__} blocked for more than {seconds} s"
+    return box[0]
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="needs a FIFO")
+@pytest.mark.parametrize("name", ["pyproject.toml", "package.json", "Cargo.toml"])
+def test_a_fifo_in_place_of_a_config_file_does_not_block_detection(proj, win, name):
+    """open() on a FIFO with nobody writing blocks forever; the Stop hook would hang until Claude Code kills it."""
+    os.mkfifo(proj / name)
+    assert _within(10, fmt._read_text, proj / name) is None
+    venv_tool(proj, "ruff", win)
+    assert _within(10, fmt.detect, proj / "a.py", proj) is None
+    assert _within(10, fmt.detect, proj / "a.ts", proj) is None
+    assert _within(10, fmt._rust_edition, proj / "src" / "lib.rs") == "2021"
+
+
+@pytest.mark.skipif(not os.path.exists("/dev/null"), reason="needs /dev/null")
+def test_a_symlink_to_a_device_is_not_read(proj):
+    """/dev/zero (endless) and /dev/ptmx (opening it allocates a terminal) are the dangerous ones. /dev/null is the safe
+    stand-in for the test: it reads as empty text if the file kind is not checked, and as None when it is."""
+    try:
+        os.symlink("/dev/null", proj / "pyproject.toml")
+    except (OSError, NotImplementedError):
+        pytest.skip("symlinks are not available here")
+    assert (
+        fmt._read_text(proj / "pyproject.toml") is None
+    )  # os.stat follows the link: a character device
+
+
+def test_hostile_nesting_in_a_config_file_does_not_abort_detection(proj, win):
+    node_tool(proj, "prettier", win)
+    (proj / "package.json").write_text(
+        '{"name": "x", "prettier": {"semi": false}}\n', encoding="utf-8"
+    )
+    sub = proj / "sub"
+    sub.mkdir()
+    # package.json mentions "prettier" and is deeply nested: json.loads raises RecursionError, not ValueError
+    (sub / "package.json").write_text('{"prettier": ' + "[" * 100_000, encoding="utf-8")
+    assert (
+        fmt.detect(sub / "a.ts", proj).name == "prettier"
+    )  # the parent's configuration is still found
+
+
+def test_rust_edition_survives_a_hostile_manifest_and_a_directory(tmp_path):
+    (tmp_path / "Cargo.toml").write_text("a = " + "[" * 100_000, encoding="utf-8")
+    assert fmt._rust_edition(tmp_path / "src" / "lib.rs") == "2021"
+    nested = tmp_path / "nested"
+    (nested / "Cargo.toml").mkdir(parents=True)  # a directory is not a manifest
+    assert fmt._rust_edition(nested / "lib.rs") == "2021"
+
+
 @pytest.mark.parametrize(
     "config",
     [
@@ -1114,6 +1662,38 @@ def test_real_tool_stdin_roundtrip(tmp_path, name, binary, filename, src, want):
     assert (
         fmt.format_text(f, tmp_path / filename, want, cwd=tmp_path, timeout=60) == want
     )  # idempotent
+
+
+def test_real_gofmt_crlf_head_that_is_clean_is_formatted_and_stays_crlf(repo):
+    """gofmt always emits LF. A CRLF blob that is clean apart from that used to be judged "pre-existing drift"."""
+    if fmt._which("gofmt") is None:
+        pytest.skip("gofmt is not installed")
+    put(repo / "go.mod", "module example.com/x\n\ngo 1.21\n")
+    a = put(repo / "a.go", b"package main\r\n\r\nfunc a() {\r\n}\r\n")
+    commit(repo)
+    a.write_bytes(
+        b"package main\r\n\r\nfunc a() {\r\n}\r\n\r\nfunc   b(  ) {\r\nx:=1\r\n_ = x\r\n}\r\n"
+    )
+    report = fmt.format_changed(repo)
+    assert report.formatted == ["a.go"] and report.skipped == [] and report.errors == []
+    assert a.read_bytes() == (
+        b"package main\r\n\r\nfunc a() {\r\n}\r\n\r\nfunc b() {\r\n\tx := 1\r\n\t_ = x\r\n}\r\n"
+    )
+
+
+def test_real_gofmt_does_not_reformat_a_drifted_file_that_was_moved(repo):
+    if fmt._which("gofmt") is None:
+        pytest.skip("gofmt is not installed")
+    put(repo / "go.mod", "module example.com/x\n\ngo 1.21\n")
+    put(repo / "a.go", "package main\nfunc  A(){}\n")  # drifted at HEAD
+    commit(repo)
+    git(repo, "mv", "a.go", "b.go")
+    moved = repo / "b.go"
+    drifted = b"package main\nfunc  A(){}\nfunc B() {}\n"
+    moved.write_bytes(drifted)
+    report = fmt.format_changed(repo)
+    assert report.formatted == [] and report.skipped == [("b.go", fmt.DRIFT_REASON)]
+    assert moved.read_bytes() == drifted
 
 
 def test_real_gofmt_end_to_end_through_format_changed(repo):
