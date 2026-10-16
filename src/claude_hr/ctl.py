@@ -831,7 +831,7 @@ def _show_recipe(
     root: Path, recipe, gate_timeout_s: float | None = None, gate_tier: str = "fast"
 ) -> None:
     """Every check of both tiers, in full, exactly as the gate would run it (see gate_offer.recipe_lines)."""
-    for line in gate_offer.recipe_lines(recipe, gate_timeout_s, gate_tier):
+    for line in gate_offer.recipe_lines(recipe, gate_timeout_s, gate_tier, root=root):
         out(line)
 
 

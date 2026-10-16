@@ -528,10 +528,10 @@ def test_a_state_directory_inside_the_repository_means_the_gate_does_nothing(
     monkeypatch.setenv("CLAUDE_HR_HOME", str(repo / rel) if rel else str(repo))
     assert stop_gate.handle(payload(repo)) is None
     assert fakes.fingerprint_calls == [] and fakes.fmt_calls == [] and fakes.gate_calls == []
-    row = auditlog.tail(1)[0]
-    assert row["event"] == "gate" and row["verify"] == "skip"
-    assert "state directory inside the repository" in row["note"]
     assert not (paths.state_dir() / "gates.json").exists(), "it did not even remember the tree"
+    assert not (paths.hr_home() / "audit").exists(), (
+        "and it wrote nothing into the folder the repository chose"
+    )
 
 
 def test_the_working_folder_counts_as_well_as_the_repository_root(
@@ -653,8 +653,6 @@ def test_a_trust_record_the_repository_shipped_does_not_run_its_recipe(real_repo
     )
     assert stop_gate.handle(payload(real_repo)) is None
     assert not (real_repo / "ran.txt").exists(), "the repository's recipe must not have run"
-    row = auditlog.tail(1)[0]
-    assert row["verify"] == "skip" and "state directory inside the repository" in row["note"]
 
 
 def test_a_trust_record_in_the_users_own_state_directory_runs_the_recipe(real_repo):
