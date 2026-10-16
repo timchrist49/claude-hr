@@ -14,8 +14,11 @@ indent_size = 2
 [*.md]
 trim_trailing_whitespace = false
 
+[*.{bat,cmd,ps1}]
+end_of_line = crlf
+
 [*.go]
 indent_style = tab
 
-[Makefile]
+[{Makefile,makefile,GNUmakefile,*.mk}]
 indent_style = tab

@@ -63,6 +63,9 @@ def make_repo(path, files=None, origin=None, branch="main"):
 
 
 PYPROJECT = '[project]\nname = "demo"\nversion = "0.1"\n'
+RUFF_CONFIG = "[tool.ruff]\nline-length = 100\n"
+# a repo where pytest and ruff have something to run (a bare pyproject.toml has neither: pytest would exit 5)
+PY_TOOLS = {"tests/test_a.py": "def test_a():\n    pass\n", "ruff.toml": "line-length = 100\n"}
 
 
 @pytest.fixture
@@ -71,7 +74,8 @@ def rich(tmp_path):
     return make_repo(
         tmp_path / "rich",
         {
-            "pyproject.toml": PYPROJECT,
+            "pyproject.toml": PYPROJECT + RUFF_CONFIG,
+            "tests/test_demo.py": "def test_demo():\n    pass\n",
             "package.json": json.dumps({"scripts": {"test": "jest"}}),
             "package-lock.json": "{}",
             "go.mod": "module demo\n",
@@ -340,7 +344,7 @@ def test_existing_files_are_marked_kept_and_never_overwritten(tmp_path):
         ".editorconfig": "mine = 1\n",
         "REVIEW.md": "my review rules\n",
         ".gitattributes": "* text=auto\n",
-        ".github/ISSUE_TEMPLATE/bug.yml": "name: my bug\n",
+        ".github/pull_request_template.md": "my pr template\n",
         "docs/plans/README.md": "my plans\n",
     }
     root = make_repo(
@@ -382,6 +386,57 @@ def test_equivalent_locations_count_as_existing(tmp_path):
     assert not (root / ".github" / "CODEOWNERS").exists()
     assert not (root / ".github" / "dependabot.yml").exists()
     assert not (root / ".github" / "workflows" / "ci.yml").exists()
+
+
+ISSUE_FORMS = [
+    ".github/ISSUE_TEMPLATE/bug.yml",
+    ".github/ISSUE_TEMPLATE/feature.yml",
+    ".github/ISSUE_TEMPLATE/agent-task.yml",
+    ".github/ISSUE_TEMPLATE/config.yml",
+]
+
+
+@pytest.mark.parametrize(
+    "existing",
+    [
+        {".github/ISSUE_TEMPLATE/bug_report.md": "---\nname: Bug report\n---\n"},
+        {".github/ISSUE_TEMPLATE/my-form.yml": "name: mine\n"},
+        {".github/ISSUE_TEMPLATE/my-form.yaml": "name: mine\n"},
+        {".github/ISSUE_TEMPLATE/config.yml": "blank_issues_enabled: true\n"},
+        {".github/ISSUE_TEMPLATE/bug.yml": "name: my bug\n"},
+        {".github/ISSUE_TEMPLATE.md": "legacy single template\n"},
+        {".github/issue_template.md": "legacy single template, lower case\n"},
+        {"ISSUE_TEMPLATE.md": "legacy single template at the root\n"},
+        {"docs/ISSUE_TEMPLATE.md": "legacy single template in docs\n"},
+        {"ISSUE_TEMPLATE/bug.md": "template folder at the root\n"},
+        {"docs/ISSUE_TEMPLATE/bug.yml": "name: template folder in docs\n"},
+    ],
+)
+def test_a_repos_own_issue_templates_win_over_the_scaffolded_forms(tmp_path, existing):
+    """A second set shows up twice in the chooser, and our config.yml (blank_issues_enabled: false) would remove the
+    blank-issue option and hide a legacy single template."""
+    root = make_repo(tmp_path / "r", {"pyproject.toml": PYPROJECT, **existing})
+    actions, notes = initrepo.plan_with_notes(root, only="github")
+    planned = {a.path for a in actions}
+    assert not planned & set(ISSUE_FORMS), planned
+    assert ".github/pull_request_template.md" in planned, "only the issue forms are skipped"
+    assert "github: issue templates already present, issue forms skipped" in notes
+    written = initrepo.apply(root, actions)
+    assert written == [".github/pull_request_template.md"]
+    for rel in ISSUE_FORMS:
+        assert not (root / rel).exists() or rel in existing
+
+
+def test_without_issue_templates_the_forms_are_planned_and_a_second_run_changes_nothing(tmp_path):
+    root = make_repo(tmp_path / "r", {"pyproject.toml": PYPROJECT})
+    (root / ".github" / "ISSUE_TEMPLATE").mkdir(parents=True)  # an empty folder is not a template
+    actions, notes = initrepo.plan_with_notes(root, only="github")
+    assert set(ISSUE_FORMS) <= {a.path for a in actions} and notes == []
+    assert initrepo.apply(root, actions)
+    again, notes = initrepo.plan_with_notes(
+        root, only="github"
+    )  # our own forms now count as "present"
+    assert initrepo.apply(root, again) == [] and "issue forms skipped" in "\n".join(notes)
 
 
 def test_existing_codeowners_without_an_origin_is_not_a_noted_problem(tmp_path):
@@ -607,12 +662,27 @@ def test_parse_github_remote(url, expected):
 )
 def test_codeowners_owner_comes_from_the_origin_remote(tmp_path, origin):
     root = make_repo(tmp_path / "r", origin=origin)
-    action = by_path(initrepo.plan(root))[".github/CODEOWNERS"]
+    actions, notes = initrepo.plan_with_notes(root, only="codeowners")
+    action = by_path(actions)[".github/CODEOWNERS"]
     lines = [ln for ln in action.content.splitlines() if ln and not ln.startswith("#")]
-    assert lines == ["* @acme-co"]
-    assert (
-        "@org/team-name" in action.content
-    )  # warns that a bare organization name is not a valid owner
+    assert lines == [
+        "* @acme-co"
+    ]  # the user-valid form: offline there is no telling a user from an organization
+    comments = [ln for ln in action.content.splitlines() if ln.startswith("#")]
+    text = "\n".join(comments)
+    assert "ORGANIZATION" in text and "Unknown owner" in text
+    assert "* @acme-co/team-name" in text, "the comment shows exactly how to switch to a team"
+    # a bare organization name is silently ignored by GitHub, so the plan says where the owner came from
+    (note,) = notes
+    assert "@acme-co was taken from the origin URL" in note and "@acme-co/team-name" in note
+
+
+def test_codeowners_note_is_only_given_when_the_file_will_be_created(tmp_path):
+    root = make_repo(
+        tmp_path / "r", {"CODEOWNERS": "* @someone\n"}, origin="https://github.com/acme-co/w"
+    )
+    actions, notes = initrepo.plan_with_notes(root, only="codeowners")
+    assert notes == [] and by_path(actions)["CODEOWNERS"].exists
 
 
 def test_codeowners_is_skipped_with_a_note_when_there_is_no_usable_origin(tmp_path):
@@ -759,7 +829,7 @@ def test_ci_is_hardened(rich):
 
 
 def test_ci_for_python(tmp_path):
-    root = make_repo(tmp_path / "r", {"pyproject.toml": PYPROJECT})
+    root = make_repo(tmp_path / "r", {"pyproject.toml": PYPROJECT, **PY_TOOLS})
     _, steps = ci_steps(root)
     assert [s["uses"] for s in steps if "uses" in s] == [
         "actions/checkout@v4",
@@ -770,6 +840,55 @@ def test_ci_for_python(tmp_path):
         "python -m pytest -q",
         "ruff check .",
     ]
+
+
+def test_python_with_nothing_to_run_installs_only_and_says_so(tmp_path):
+    """pytest exits 5 ("no tests ran") on a repo without tests, which would turn the very first push red; ruff would run
+    without any configuration. Both are left out until the repo has them, and a note says so."""
+    root = make_repo(tmp_path / "r", {"pyproject.toml": PYPROJECT, "src/a.py": "x = 1\n"})
+    actions, notes = initrepo.plan_with_notes(root, only="ci")
+    _, steps = ci_steps(root)
+    assert run_lines(steps) == ["python -m pip install -e ."]
+    assert any("no tests directory, pytest configuration or ruff configuration" in n for n in notes)
+    assert actions
+
+
+@pytest.mark.parametrize(
+    "files, pytest_runs",
+    [
+        ({"tests/test_a.py": "def test_a():\n    pass\n"}, True),
+        ({"test/test_a.py": "def test_a():\n    pass\n"}, True),
+        ({"tests/unit/test_a.py": "def test_a():\n    pass\n"}, True),
+        ({"pytest.ini": "[pytest]\n"}, True),
+        ({"pyproject.toml": "[tool.pytest.ini_options]\naddopts = '-q'\n"}, True),
+        ({"setup.cfg": "[tool:pytest]\naddopts = -q\n"}, True),
+        ({"tests/README.md": "no python here\n"}, False),
+        ({"tests/__init__.py": ""}, True),  # still a package that pytest would collect from
+        ({"src/a.py": "x = 1\n"}, False),
+    ],
+)
+def test_pytest_is_only_run_when_something_can_be_collected(tmp_path, files, pytest_runs):
+    root = make_repo(tmp_path / "r", {"pyproject.toml": PYPROJECT, **files})
+    _, steps = ci_steps(root)
+    assert ("python -m pytest -q" in run_lines(steps)) == pytest_runs
+
+
+@pytest.mark.parametrize(
+    "files, ruff_runs",
+    [
+        ({"ruff.toml": ""}, True),
+        ({".ruff.toml": ""}, True),
+        ({"pyproject.toml": PYPROJECT + RUFF_CONFIG}, True),
+        ({}, False),
+    ],
+)
+def test_ruff_is_only_run_when_the_repo_configures_it(tmp_path, files, ruff_runs):
+    root = make_repo(tmp_path / "r", {"pyproject.toml": PYPROJECT, **files})
+    _, steps = ci_steps(root)
+    assert ("ruff check ." in run_lines(steps)) == ruff_runs
+    assert (
+        "ruff" in run_lines(steps)[0].split()
+    ) == ruff_runs  # and ruff is only installed when it is run
 
 
 @pytest.mark.parametrize(
@@ -790,7 +909,7 @@ def test_ci_for_python(tmp_path):
     ],
 )
 def test_python_install_command_matches_how_the_project_is_packaged(tmp_path, files, install):
-    root = make_repo(tmp_path / "r", files)
+    root = make_repo(tmp_path / "r", {**files, **PY_TOOLS})
     _, steps = ci_steps(root)
     assert run_lines(steps)[0] == f"python -m pip install {install}"
 
@@ -817,6 +936,126 @@ def test_ci_for_node_uses_the_repos_package_manager(tmp_path, files, install, ru
         "actions/setup-node@v4",
     ]
     assert run_lines(steps) == [install, *runs]
+
+
+def uses_of(steps):
+    return [s["uses"] for s in steps if "uses" in s]
+
+
+@pytest.mark.parametrize(
+    "files, pkg, uses, install, runs",
+    [
+        # bun: setup-bun, a frozen install with a lock file, and `run` (bare `bun test` is bun's own runner)
+        (
+            {"bun.lock": ""},
+            {},
+            ["actions/checkout@v4", "actions/setup-node@v4", "oven-sh/setup-bun@v2"],
+            "bun install --frozen-lockfile",
+            ["bun run test", "bun run lint"],
+        ),
+        (
+            {"bun.lockb": ""},
+            {},
+            ["actions/checkout@v4", "actions/setup-node@v4", "oven-sh/setup-bun@v2"],
+            "bun install --frozen-lockfile",
+            ["bun run test", "bun run lint"],
+        ),
+        (
+            {},
+            {"packageManager": "bun@1.1.0"},
+            ["actions/checkout@v4", "actions/setup-node@v4", "oven-sh/setup-bun@v2"],
+            "bun install",
+            ["bun run test", "bun run lint"],
+        ),
+        # pnpm declared by packageManager but no pnpm-lock.yaml: corepack provides it, and a frozen install would fail
+        (
+            {},
+            {"packageManager": "pnpm@9.0.0"},
+            ["actions/checkout@v4", "actions/setup-node@v4"],
+            "corepack enable && pnpm install --no-frozen-lockfile",
+            ["pnpm test", "pnpm run lint"],
+        ),
+        (
+            {"pnpm-lock.yaml": ""},
+            {"packageManager": "pnpm@9.0.0"},
+            ["actions/checkout@v4", "actions/setup-node@v4"],
+            "corepack enable && pnpm install --frozen-lockfile",
+            ["pnpm test", "pnpm run lint"],
+        ),
+        (
+            {},
+            {"packageManager": "yarn@4.0.0"},
+            ["actions/checkout@v4", "actions/setup-node@v4"],
+            "corepack enable && yarn install",
+            ["yarn test", "yarn run lint"],
+        ),
+        # a lock file beats the packageManager field, exactly as in the verify recipe discovery
+        (
+            {"package-lock.json": "{}"},
+            {"packageManager": "pnpm@9.0.0"},
+            ["actions/checkout@v4", "actions/setup-node@v4"],
+            "npm ci",
+            ["npm test", "npm run lint"],
+        ),
+    ],
+)
+def test_ci_installs_the_package_manager_it_runs(tmp_path, files, pkg, uses, install, runs):
+    package = {"scripts": {"test": "jest", "lint": "eslint ."}, **pkg}
+    root = make_repo(tmp_path / "r", {"package.json": json.dumps(package), **files})
+    _, steps = ci_steps(root)
+    assert uses_of(steps) == uses
+    assert run_lines(steps) == [install, *runs]
+
+
+def test_ci_and_the_verify_recipe_agree_on_the_node_package_manager(tmp_path):
+    """The install step and the commands come from two modules; they once disagreed for bun and for packageManager."""
+    from claude_hr import verify
+
+    cases = [
+        {"pnpm-lock.yaml": ""},
+        {"yarn.lock": ""},
+        {"bun.lock": ""},
+        {"bun.lockb": ""},
+        {"package-lock.json": "{}"},
+        {"npm-shrinkwrap.json": "{}"},
+        {},
+    ]
+    for i, files in enumerate(cases):
+        for pm in (None, "pnpm@9", "yarn@4", "bun@1", "npm@10", "weird@1"):
+            pkg = {"scripts": {"test": "jest"}, **({"packageManager": pm} if pm else {})}
+            root = tmp_path / f"c{i}-{pm}"
+            for rel, text in {"package.json": json.dumps(pkg), **files}.items():
+                write(root, rel, text)  # no git needed: only files decide the package manager
+            discovered = [c.argv[0] for c in verify.discover(root).fast]
+            assert discovered == [initrepo._Repo(root).node_pm], (files, pm)
+
+
+def test_node_placeholder_and_watch_scripts_are_not_run_in_ci(tmp_path):
+    """`npm init -y` writes a test script that exits 1, and `jest --watch` never exits: the verify discovery skips both,
+    so the defaults must too."""
+    placeholder = 'echo "Error: no test specified" && exit 1'
+    for name, scripts, lint_runs in (
+        ("npm-init", {"test": placeholder}, False),
+        ("watch", {"test": "jest --watch"}, False),
+        ("watchall", {"test": "jest --watchAll"}, False),
+        ("both", {"test": placeholder, "lint": "eslint ."}, True),
+        ("lint-placeholder", {"lint": placeholder}, False),
+        ("not-a-string", {"test": 5, "lint": ["x"]}, False),
+        ("empty", {"test": "  "}, False),
+    ):
+        root = make_repo(tmp_path / name, {"package.json": json.dumps({"scripts": scripts})})
+        actions, notes = initrepo.plan_with_notes(root, only="ci")
+        _, steps = ci_steps(root)
+        assert run_lines(steps) == ["npm install", *(["npm run lint"] if lint_runs else [])], name
+        assert actions
+        if "test" in scripts and name != "empty" and name != "not-a-string":
+            assert any("script 'test' is a placeholder or a watcher" in n for n in notes), name
+        if not lint_runs:
+            assert any("no test or lint script" in n for n in notes), name
+    ok = make_repo(
+        tmp_path / "ok", {"package.json": json.dumps({"scripts": {"test": "jest --watch=false"}})}
+    )
+    assert run_lines(ci_steps(ok)[1]) == ["npm install", "npm test"]
 
 
 def test_node_without_a_test_script_installs_only_and_says_so(tmp_path):
@@ -891,6 +1130,83 @@ def test_commands_replace_the_language_defaults(tmp_path):
         "python -m mypy src",
         "make check",
         "pytest -k 'a and b' -m 'not slow'",
+    ]
+
+
+@pytest.mark.parametrize(
+    "lock, commands, uses, install",
+    [
+        (
+            "uv.lock",
+            [["uv", "run", "ruff", "check", "."], ["uv", "run", "pytest", "-q"]],
+            ["actions/checkout@v4", "actions/setup-python@v5", "astral-sh/setup-uv@v6"],
+            "uv sync --locked",
+        ),
+        (
+            "poetry.lock",
+            [["poetry", "run", "ruff", "check", "."], ["poetry", "run", "pytest", "-q"]],
+            ["actions/checkout@v4", "actions/setup-python@v5"],
+            "python -m pip install poetry && poetry install --no-interaction",
+        ),
+        (
+            "pdm.lock",
+            [["pdm", "run", "ruff", "check", "."], ["pdm", "run", "pytest", "-q"]],
+            ["actions/checkout@v4", "actions/setup-python@v5"],
+            "python -m pip install pdm && pdm install",
+        ),
+    ],
+)
+def test_ci_installs_the_python_runner_the_commands_start_with(
+    tmp_path, lock, commands, uses, install
+):
+    """`uv run ...` on a runner without uv fails with `command not found` on the first push."""
+    root = make_repo(
+        tmp_path / "r", {"pyproject.toml": PYPROJECT + RUFF_CONFIG, lock: "", **PY_TOOLS}
+    )
+    _, steps = ci_steps(root, commands=commands)
+    assert uses_of(steps) == uses
+    assert run_lines(steps) == [install, *(shlex.join(c) for c in commands)]
+
+
+def test_the_runner_comes_from_the_verify_recipe_end_to_end(tmp_path):
+    from claude_hr import verify
+
+    root = make_repo(
+        tmp_path / "r", {"pyproject.toml": PYPROJECT + RUFF_CONFIG, "uv.lock": "", **PY_TOOLS}
+    )
+    commands = [c.argv for c in verify.discover(root).fast]
+    assert commands and commands[0][:2] == ["uv", "run"]
+    _, steps = ci_steps(root, commands=commands)
+    assert "astral-sh/setup-uv@v6" in uses_of(steps) and run_lines(steps)[0] == "uv sync --locked"
+
+
+def test_the_pip_install_path_is_unchanged_without_a_runner(tmp_path):
+    root = make_repo(tmp_path / "r", {"pyproject.toml": PYPROJECT, "uv.lock": ""})
+    _, steps = ci_steps(root, commands=[["make", "test"]])  # uv.lock alone does not make CI use uv
+    assert "astral-sh/setup-uv@v6" not in uses_of(steps)
+    assert run_lines(steps) == ["python -m pip install -e .", "make test"]
+
+
+def test_commands_the_workflow_cannot_install_are_left_out_with_a_note(tmp_path):
+    root = make_repo(tmp_path / "r", {"pyproject.toml": PYPROJECT + RUFF_CONFIG, **PY_TOOLS})
+    commands = [["just", "lint"], ["python", "-m", "pytest", "-q"], ["just", "test"]]
+    actions, notes = initrepo.plan_with_notes(root, only="ci", commands=commands)
+    text = actions[0].content
+    assert "just lint" not in text and "just test" not in text
+    assert run_lines(ci_steps(root, commands=commands)[1]) == [
+        "python -m pip install -e . pytest",
+        "python -m pytest -q",
+    ]
+    (note,) = [n for n in notes if "left out" in n]
+    assert "`just lint`" in note and "`just test`" in note and "cannot install just" in note
+
+
+def test_only_just_commands_leave_an_install_only_workflow_and_a_note(tmp_path):
+    root = make_repo(tmp_path / "r", {"pyproject.toml": PYPROJECT})
+    actions, notes = initrepo.plan_with_notes(root, only="ci", commands=[["just", "check"]])
+    assert actions and any("left out `just check`" in n for n in notes)
+    assert run_lines(ci_steps(root, commands=[["just", "check"]])[1]) == [
+        "python -m pip install -e ."
     ]
 
 
@@ -1049,9 +1365,13 @@ def test_template_files_on_disk_are_all_used_and_all_exist(rich, monkeypatch):
         seen.append(name)
         return real(name)
 
+    uv = make_repo(rich.parent / "uv", {"pyproject.toml": PYPROJECT, "uv.lock": ""})
+    bun = make_repo(rich.parent / "bun", {"package.json": "{}", "bun.lock": ""})
     with monkeypatch.context() as m:
         m.setattr(initrepo, "_template", spy)
         initrepo.plan(rich)
+        initrepo.plan(uv, commands=[["uv", "run", "pytest", "-q"]])  # the tool-setup fragments
+        initrepo.plan(bun)
     on_disk = {p.relative_to(TEMPLATES).as_posix() for p in TEMPLATES.rglob("*") if p.is_file()}
     assert on_disk == set(seen)
 
@@ -1173,7 +1493,15 @@ def test_review_md_is_short_and_covers_the_always_check_list(rich):
 
 def test_editor_files(rich, tmp_path):
     attrs = content_of(rich, ".gitattributes")
-    assert attrs == "* text=auto eol=lf\n"
+    rules = [ln for ln in attrs.splitlines() if ln and not ln.startswith("#")]
+    assert rules == [
+        "* text=auto eol=lf",
+        "*.bat text eol=crlf",
+        "*.cmd text eol=crlf",
+        "*.ps1 text eol=crlf",
+    ]
+    assert "binary" not in "\n".join(rules), "text=auto already detects binaries"
+    assert "{" not in attrs, "gitattributes has no brace expansion"
     ec = content_of(rich, ".editorconfig")
     assert ec.splitlines()[0] == "root = true"
     for line in (
@@ -1190,8 +1518,270 @@ def test_editor_files(rich, tmp_path):
     assert (existing / ".gitattributes").read_text(encoding="utf-8") == "*.png binary\n"
 
 
+def editorconfig_sections(text):
+    sections, current = {}, None
+    for line in text.splitlines():
+        if line.startswith("[") and line.endswith("]"):
+            current = sections.setdefault(line[1:-1], {})
+        elif "=" in line and current is not None:
+            key, _, value = line.partition("=")
+            current[key.strip()] = value.strip()
+    return list(sections), sections
+
+
+def test_editorconfig_keeps_crlf_scripts_crlf_and_make_and_go_on_tabs(rich):
+    order, sections = editorconfig_sections(content_of(rich, ".editorconfig"))
+    assert order[0] == "*" and sections["*"]["end_of_line"] == "lf"
+    # a later section overrides an earlier one, so the exceptions come after [*]
+    crlf = "*.{bat,cmd,ps1}"
+    assert sections[crlf] == {"end_of_line": "crlf"} and order.index(crlf) > 0
+    for glob in ("*.go", "{Makefile,makefile,GNUmakefile,*.mk}"):
+        assert sections[glob] == {"indent_style": "tab"}, glob
+        assert order.index(glob) > 0
+
+
+def test_gitattributes_keeps_batch_scripts_crlf_and_everything_else_lf(tmp_path):
+    root = make_repo(tmp_path / "attrs")
+    assert ".gitattributes" in initrepo.apply(root, initrepo.plan(root, only="editor"))
+    r = subprocess.run(
+        [
+            "git",
+            "check-attr",
+            "text",
+            "eol",
+            "--",
+            "build.bat",
+            "run.cmd",
+            "setup.ps1",
+            "main.py",
+            "logo.png",
+        ],
+        cwd=root,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    got = {}
+    for line in r.stdout.splitlines():
+        name, attr, value = line.split(": ")
+        got.setdefault(name, {})[attr] = value
+    for crlf in ("build.bat", "run.cmd", "setup.ps1"):
+        assert got[crlf] == {"text": "set", "eol": "crlf"}, crlf
+    for lf in (
+        "main.py",
+        "logo.png",
+    ):  # binaries are not forced anywhere: text=auto decides by content
+        assert got[lf] == {"text": "auto", "eol": "lf"}, lf
+
+
 def test_repo_name_falls_back_to_a_safe_directory_name(tmp_path):
     root = make_repo(tmp_path / "{{owner}} (weird)", {})
     first = content_of(root, "REVIEW.md").splitlines()[0]
     assert first == "# Review guidance for owner weird"
     assert "{{" not in first
+
+
+# ---- the repository being scaffolded is untrusted input -----------------------------------------------------------------
+
+
+def test_a_planted_git_in_the_repository_is_never_run(tmp_path, monkeypatch):
+    """On Windows CreateProcess looks in the current directory before PATH, so a git.exe committed to a cloned repository ran
+    when `init-repo` (even the dry run) asked git for the origin."""
+    exe = "git.exe" if os.name == "nt" else "git"
+    root = make_repo(
+        tmp_path / "r", {"pyproject.toml": PYPROJECT}, origin="https://github.com/acme/w.git"
+    )
+    planted = root / exe
+    planted.write_bytes(b"")
+    planted.chmod(planted.stat().st_mode | stat.S_IXUSR)
+    elsewhere = tmp_path / "bin"
+    elsewhere.mkdir()
+    monkeypatch.chdir(root)
+    # the Claude Code shell sets this variable, which hides the bug
+    monkeypatch.delenv("NoDefaultCurrentDirectoryInExePath", raising=False)
+    for path_value in (str(elsewhere), "", os.pathsep.join([".", str(elsewhere)]), "relative/dir"):
+        monkeypatch.setenv("PATH", path_value)
+        r = initrepo._git(root, "--version")
+        assert r.returncode == 127 and "not found on PATH" in r.stderr, path_value
+    actions, notes = initrepo.plan_with_notes(
+        root
+    )  # no git, no origin: a note, not a crash and not the planted binary
+    assert ".github/CODEOWNERS" not in by_path(actions)
+    assert any(n.startswith("codeowners:") for n in notes)
+
+
+def test_a_manifest_that_is_not_a_regular_file_is_ignored_with_a_note(tmp_path):
+    root = make_repo(tmp_path / "r", {"pyproject.toml": PYPROJECT})
+    (root / "package.json").mkdir()
+    actions, notes = initrepo.plan_with_notes(root, only="ci")
+    assert actions and "ci: package.json is not a regular file, so it was not read" in notes
+    assert run_lines(ci_steps(root)[1]) == ["python -m pip install -e .", "npm install"]
+
+
+@pytest.mark.skipif(os.name == "nt", reason="needs a symlink to a device and FIFOs")
+@pytest.mark.parametrize("kind", ["dev-zero", "fifo", "dev-zero-pyproject"])
+def test_a_device_or_fifo_named_like_a_manifest_is_never_read(tmp_path, kind):
+    """A committed symlink to /dev/zero made json.load grow without bound (about 400 MB/s); a FIFO blocks open() for ever.
+    Run in a child process with a timeout so a regression fails instead of hanging or exhausting the machine."""
+    import sys
+
+    root = make_repo(tmp_path / "r", {"go.mod": "module x\n"})
+    name = "pyproject.toml" if kind == "dev-zero-pyproject" else "package.json"
+    if kind == "fifo":
+        os.mkfifo(root / name)
+    else:
+        (root / name).symlink_to("/dev/zero")
+    code = (
+        "import sys\n"
+        "sys.path.insert(0, sys.argv[1])\n"
+        "from pathlib import Path\n"
+        "from claude_hr import initrepo\n"
+        "actions, notes = initrepo.plan_with_notes(Path(sys.argv[2]), only='ci')\n"
+        "print(chr(10).join(notes))\n"
+    )
+    src = str(Path(initrepo.__file__).resolve().parents[1])
+    r = subprocess.run(
+        [sys.executable, "-c", code, src, str(root)], capture_output=True, text=True, timeout=60
+    )
+    assert r.returncode == 0, r.stderr
+    assert f"ci: {name} is not a regular file, so it was not read" in r.stdout
+
+
+def test_an_oversized_manifest_is_ignored_with_a_note_and_one_at_the_limit_is_read(tmp_path):
+    limit = initrepo._MAX_MANIFEST_BYTES
+    base = json.dumps({"scripts": {"test": "jest"}, "pad": ""})
+    exact = base[:-2] + "x" * (limit - len(base)) + '"}'
+    assert len(exact.encode()) == limit
+    ok = make_repo(tmp_path / "ok", {"package.json": exact})
+    assert run_lines(ci_steps(ok)[1]) == ["npm install", "npm test"]
+    big = make_repo(tmp_path / "big", {"package.json": exact + " "})
+    _, notes = initrepo.plan_with_notes(big, only="ci")
+    assert "ci: package.json is larger than 1000 KB, so it was ignored" in notes
+    assert run_lines(ci_steps(big)[1]) == ["npm install"], "an ignored manifest contributes nothing"
+    huge = make_repo(tmp_path / "huge", {"pyproject.toml": PYPROJECT + "# " + "x" * limit + "\n"})
+    _, notes = initrepo.plan_with_notes(huge, only="ci")
+    assert "ci: pyproject.toml is larger than 1000 KB, so it was ignored" in notes
+
+
+def test_deeply_nested_manifests_degrade_to_not_detected_instead_of_crashing(tmp_path):
+    root = make_repo(
+        tmp_path / "r", {"package.json": "[" * 200_000, "pyproject.toml": "a = " + "[" * 200_000}
+    )
+    actions, notes = initrepo.plan_with_notes(root, only="ci")  # used to raise RecursionError
+    assert actions
+    assert "ci: package.json is nested too deeply to read, so it was ignored" in notes
+    assert "ci: pyproject.toml is nested too deeply to read, so it was ignored" in notes
+    assert run_lines(ci_steps(root)[1])[-1] == "npm install"
+
+
+def test_invalid_manifests_are_ignored_with_a_note(tmp_path):
+    root = make_repo(
+        tmp_path / "r", {"package.json": "{not json", "pyproject.toml": "this is [not toml"}
+    )
+    (root / "setup.cfg").write_bytes(
+        b"\xff\xfe\x00[tool:pytest]"
+    )  # not UTF-8: read leniently, never raises
+    _, notes = initrepo.plan_with_notes(root, only="ci")
+    assert "ci: package.json is not valid, so it was ignored" in notes
+    assert "ci: pyproject.toml is not valid, so it was ignored" in notes
+    binary = make_repo(tmp_path / "bin")
+    (binary / "package.json").write_bytes(b"\x80\x80\x80")
+    _, notes = initrepo.plan_with_notes(binary, only="ci")
+    assert "ci: package.json is not valid, so it was ignored" in notes
+
+
+def test_init_repo_on_a_hostile_repository_exits_normally(tmp_path, capsys):
+    root = make_repo(tmp_path / "r", {"package.json": "[" * 200_000})
+    assert run_init_repo(root) == 0
+    text = capsys.readouterr().out
+    assert "nested too deeply" in text and "dry run: nothing written" in text
+
+
+# ---- init-repo on a subdirectory ---------------------------------------------------------------------------------------
+
+
+def run_init_repo(path, apply=False, only=None):
+    import argparse
+
+    from claude_hr import config, ctl
+
+    ns = argparse.Namespace(path=str(path), only=only, apply=apply)
+    return ctl.cmd_init_repo(ns, config.load())
+
+
+def monorepo(tmp_path):
+    top = make_repo(
+        tmp_path / "mono",
+        {"pyproject.toml": PYPROJECT, "packages/api/package.json": json.dumps({"name": "api"})},
+        origin="https://github.com/acme/mono.git",
+    )
+    return top, top / "packages" / "api"
+
+
+def test_git_top_level_is_only_reported_for_a_subdirectory(tmp_path):
+    top, sub = monorepo(tmp_path)
+    assert initrepo.git_top_level(top) is None
+    found = initrepo.git_top_level(sub)
+    assert found is not None and os.path.samefile(found, top)
+    assert (
+        initrepo.git_top_level(sub / ".." / "..") is None
+    )  # the same directory, spelled differently
+    plain = tmp_path / "plain"
+    plain.mkdir()
+    assert initrepo.git_top_level(plain) is None  # not a repository: nothing to compare with
+    assert initrepo.git_top_level(tmp_path / "missing") is None
+
+
+def test_init_repo_on_a_subdirectory_warns_and_leaves_github_files_out(tmp_path, capsys):
+    """GitHub reads .github/ only from the top level: a ci.yml or CODEOWNERS under packages/api is inert, and a
+    Dependabot `directory: /` there would be wrong."""
+    top, sub = monorepo(tmp_path)
+    assert run_init_repo(sub) == 0
+    text = capsys.readouterr().out
+    assert "warning:" in text and "is a subdirectory of the git repository at" in text
+    assert "GitHub reads .github/" in text and "only from the top level" in text
+    assert (
+        "claude-hr-ctl init-repo " in text and top.name in text.split("warning:")[1].split("\n")[0]
+    )
+    assert "github, dependabot, codeowners, ci are not scaffolded here" in text
+    assert ".github/" not in text.split("warning:")[1].split("\n", 1)[1], (
+        "no .github file is planned"
+    )
+    assert "docs/plans/README.md" in text and "dry run: nothing written" in text
+    assert run_init_repo(sub, apply=True) == 0
+    capsys.readouterr()
+    assert not (sub / ".github").exists() and not (top / ".github").exists()
+    assert (sub / "docs" / "plans" / "README.md").is_file() and (sub / ".editorconfig").is_file()
+
+
+def test_init_repo_at_the_top_level_still_scaffolds_github_files_without_a_warning(
+    tmp_path, capsys
+):
+    top, _ = monorepo(tmp_path)
+    assert run_init_repo(top, apply=True) == 0
+    text = capsys.readouterr().out
+    assert "warning:" not in text
+    assert (top / ".github" / "workflows" / "ci.yml").is_file()
+    assert (top / ".github" / "CODEOWNERS").is_file()
+
+
+def test_init_repo_only_github_groups_on_a_subdirectory_is_refused(tmp_path, capsys):
+    _, sub = monorepo(tmp_path)
+    assert run_init_repo(sub, apply=True, only="ci,codeowners") == 2
+    text = capsys.readouterr().out
+    assert "codeowners, ci are not scaffolded here" in text and "nothing left to scaffold" in text
+    assert not (sub / ".github").exists()
+
+
+def test_init_repo_only_groups_that_work_anywhere_is_not_warned_about(tmp_path, capsys):
+    _, sub = monorepo(tmp_path)
+    assert run_init_repo(sub, only="docs,editor") == 0
+    assert "warning:" not in capsys.readouterr().out
+
+
+def test_init_repo_outside_a_repository_behaves_as_before(tmp_path, capsys):
+    plain = tmp_path / "plain"
+    plain.mkdir()
+    assert run_init_repo(plain) == 0
+    text = capsys.readouterr().out
+    assert "warning:" not in text and ".github/ISSUE_TEMPLATE/bug.yml" in text

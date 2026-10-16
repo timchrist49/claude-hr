@@ -1,1 +1,6 @@
+# Normalise text to LF in the repository and in working trees. Binary files are detected automatically and left alone.
 * text=auto eol=lf
+# Windows batch and PowerShell scripts need CRLF line endings (cmd.exe mis-finds labels in LF-only batch files).
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.ps1 text eol=crlf

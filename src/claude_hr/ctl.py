@@ -1018,6 +1018,24 @@ def cmd_init_repo(a, cfg) -> int:
     from . import initrepo
 
     root = Path(os.path.abspath(a.path)) if a.path else _repo_root()
+    try:
+        groups = initrepo.parse_groups(a.only)
+    except ValueError as exc:  # an unknown group name; the message lists the valid ones
+        out(str(exc))
+        return 2
+    skipped = [g for g in groups if g in initrepo.ROOT_ONLY_GROUPS]
+    top = initrepo.git_top_level(root) if skipped else None
+    if top is not None:
+        # GitHub only reads .github/ from the top level of the repository: a copy under a subdirectory would be inert
+        groups = [g for g in groups if g not in skipped]
+        out(
+            f"warning: {root} is a subdirectory of the git repository at {top}. GitHub reads .github/ (issue forms, "
+            f"PR template, CODEOWNERS, Dependabot, workflows) only from the top level, so "
+            f"{', '.join(skipped)} are not scaffolded here. Run `claude-hr-ctl init-repo {top}` for them."
+        )
+        if not groups:
+            out("nothing left to scaffold in this directory.")
+            return 2
     commands = None
     try:  # the CI skeleton runs the same checks the end-of-turn gate would
         from . import verify
@@ -1025,11 +1043,7 @@ def cmd_init_repo(a, cfg) -> int:
         commands = [c.argv for c in verify.discover(root).fast] or None
     except Exception:  # noqa: BLE001
         pass
-    try:
-        actions, notes = initrepo.plan_with_notes(root, only=a.only, commands=commands)
-    except ValueError as exc:  # an unknown group name; the message lists the valid ones
-        out(str(exc))
-        return 2
+    actions, notes = initrepo.plan_with_notes(root, only=groups, commands=commands)
     out(initrepo.format_plan(actions, notes))
     if not a.apply:
         out(
