@@ -6,7 +6,7 @@ quality*, not popularity.
 ## Included (default)
 | Component | Why |
 |---|---|
-| **Headroom** `headroom-ai[all]` — proxy, SmartCrusher/CodeCompressor/Kompress, CCR, memory, `learn`, output shaping, MCP server, `headroom-snip` plugin | The requested core. All extras that matter for Claude Code are in `[all]`. Framework adapters (`langchain`, `agno`, `strands`, `bedrock`, `anyllm`, `autogen`), `vector` (needs a C++ toolchain), `memory-stack` (Qdrant + Neo4j), `voice-train`, `pytorch-mps` are **not** installed: they serve other stacks or add infrastructure. Add via `headroom.extras` |
+| **Headroom** `headroom-ai[all]` — proxy, SmartCrusher/CodeCompressor/Kompress, CCR, memory and output shaping (both off by default since 0.2.1), `learn`, MCP server, `headroom-snip` plugin | The requested core. All extras that matter for Claude Code are in `[all]`. Framework adapters (`langchain`, `agno`, `strands`, `bedrock`, `anyllm`, `autogen`), `vector` (needs a C++ toolchain), `memory-stack` (Qdrant + Neo4j), `voice-train`, `pytorch-mps` are **not** installed: they serve other stacks or add infrastructure. Add via `headroom.extras` |
 | **Serena** (via Headroom's registration, pinned with `headroom.serena_version`) | Symbol-level navigation; one stdio instance per session, started only when a session calls it |
 | **Native statusLine** | Model, context %, cost, Headroom savings, 5-hour plan usage; no third-party package |
 | **Native usage ledger** (`usage`) | Replaces `ccusage` without an npm dependency; daily snapshot survives Claude's transcript pruning |
@@ -35,7 +35,7 @@ quality*, not popularity.
 ## Rejected
 | Component | Reason |
 |---|---|
-| claude-mem | Duplicates Headroom memory and Claude auto-memory; sign-in/cloud sync prompts, paid tier after trial |
+| claude-mem | Duplicates Claude auto-memory (and Headroom's optional memory); sign-in/cloud sync prompts, paid tier after trial |
 | Caveman suite | Overlaps Headroom/RTK; measured output-token reduction ~8.5% vs 65% advertised; its own README shows ~3% beyond "answer concisely" |
 | Claude-Code-Usage-Monitor | Stale; native statusLine `rate_limits` + ledger cover it |
 | claude-squad / ccmanager / Conductor | `claude agents`, `--bg`, `--worktree` now cover the use case; claude-squad is AGPL and tmux-only; Conductor is a GUI |

@@ -152,17 +152,31 @@ provably there: starting an interactive session in a normal terminal.
   an agent still cannot approve it. The launcher asks only when `human.not_a_person()` says a person is at a terminal (the same
   refusal as `verify trust`: not in a Claude Code shell, not without a terminal on both ends), never in `-p`, `agents`, a
   subcommand, a nested launch or `--hr-dry-run`, and no flag or variable answers for the person.
-- *What the person approves is what runs.* The offer shows the discovered commands in plain words; `yes` runs each once while they
+- *Only after Claude Code's own trust.* A freshly cloned repository must not be asked "run its checks every turn" before its owner has
+  vouched for it once, so the launcher offers only when Claude Code's state file (`~/.claude.json`) records
+  `hasTrustDialogAccepted` for the repository's top folder (a trusted parent or launch subfolder does not count: Claude Code
+  inherits parent trust silently, which is the case to exclude). `verify enable` works anywhere.
+- *The answer has to be a person's.* Pending console input is discarded right before the question (a habitual Enter typed during the
+  start-up cannot answer it), the wait ends after five minutes as "not now", and two unclear answers are "not now" too: only an
+  explicit yes or no is ever recorded. On Windows a real console is required (`NUL` is not a person).
+- *What the person approves is what runs.* The offer shows the discovered commands in plain words, and for a check that goes
+  through a task runner (`npm run`, `make`, `just`) the script it will run; `yes` runs each once while they
   watch, keeps only those that pass today (a gate that blocks Claude on a failure that predates it wastes tokens and trust),
   writes exactly those through the no-symlink writer, hashes the bytes it wrote and trusts that hash. A recipe that ships with
   the repository gets the old full screen (both tiers, escaped, audit preflight, SHA-256) and the default answer No.
-- *Default answer follows risk.* Enter is Yes only when the audit preflight (read-only, bounded) finds nothing high or medium,
-  or No with the findings printed. EOF and Ctrl-C are "not now" and record nothing; an explicit `n` is remembered per folder in
+- *Honest limit.* The approval is the hash of the recipe, not of the files its commands run: a pulled change to a `package.json` script,
+  a Makefile target or a `conftest.py` runs after the next turn without a new question. Re-asking on every manifest change would
+  make the gate unusable (the gate exists to run the tests Claude just edited), so the screen says it and SECURITY.md lists it.
+- *Default answer follows risk.* Enter is Yes only when the audit preflight (read-only, bounded) finds nothing high or medium and
+  no shown script text matches a short list of obviously dangerous shapes (fetch or send data, decode and run, credential files,
+  `rm -rf` of `/` or `~`, non-local URLs), or No with the findings printed. EOF and Ctrl-C are "not now" and record nothing; an explicit `n` is remembered per folder in
   `state/verify-offer.json` (a record of an answer, never an approval) and `verify enable|disable` move it either way.
 - *Costs nothing when nothing is due.* The launcher imports `gate_offer` only for a plain interactive session; "trusted", "declined" and
   "nothing in this folder to propose from" are decided with a handful of `stat`s and one SHA-256, without importing `verify` or
   `audit` and without a subprocess (about 3 ms, measured), by mirroring three constants of `verify.py` that a test keeps in step.
-  Only a folder that has project files but nothing discovery can propose pays for `verify.discover` on each start.
+  A folder that has project files but nothing discovery can propose pays for `verify.discover` once: the empty answer is
+  remembered with the newest modification time of the files that decide it, and asked again only when one of them changes.
+  A probe that edits tracked files while it runs is left out of the recipe (a gate that rewrites files cannot run every turn).
 - *Rejected:* an environment variable or flag that auto-answers (it would be the agent's lever too); asking from the Stop hook
   (no terminal there, and the person cannot answer a hook); a modal at first-ever `claude-hr` run (the answer is per folder);
   committing the generated file (it is the user's local choice, so it is kept out of `git status` through `.git/info/exclude`

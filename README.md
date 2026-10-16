@@ -92,6 +92,8 @@ claude-hr-ctl doctor                                          # lists what is st
 claude-hr-ctl setup --only settings claude-md plugins         # adds hr-gates, the lean profile and the new permission rules; it only adds
 ```
 
+0.2.1 also turns two Headroom features off by default (`headroom.memory`, `headroom.output_shaper`; see the changelog). They reach a Headroom proxy that is already running only after a restart, which `claude-hr-ctl doctor` reminds you of (`claude-hr-ctl headroom restart`, when no Claude session is running).
+
 The 0.2.0 `standard` profile no longer includes Superpowers, feature-dev or code-simplifier; a machine that already has them keeps them. Uninstall them by name (`claude plugin uninstall superpowers`) to save their tokens, or keep them with `--profile process`. (`plugins sync --prune` removes *every* user-scope plugin outside the profile, including ones you added yourself.) The end-of-turn test gate needs no per-repository setup any more: the first time you start `claude-hr` in a git repository in a normal terminal it offers to turn the gate on (see [Automatic checks](#automatic-checks-the-test-gate)).
 
 ## What it does about each concern
@@ -130,36 +132,43 @@ it costs **no model tokens** unless something fails or you ask for a review. cla
 fails, hand the failure back to Claude to fix before the turn can end. It only uses checks the project already has (for
 example `ruff check .` and `pytest -q`) and it costs no tokens unless something fails.
 
-**What you see the first time.** The first time you start `claude-hr` in a folder that is a git repository, in a normal
-terminal, it asks once:
+**What you see the first time.** The first time you start `claude-hr` in a git repository, in a normal terminal, after you
+have already answered Claude Code's own "do you trust this folder?" question for it (so a freshly cloned repository is
+offered nothing on its very first start), it asks once:
 
 ```
 claude-hr can double-check Claude's work in this folder (optional; asked once per folder).
 After each turn it would run this project's own checks and send any failure back to Claude to fix:
     1. ruff check .
     2. pytest -q
+This also runs the project's own scripts and test code (package.json scripts, Makefile targets, conftest.py) and lets the end-of-turn formatter use tools and config from this folder (.venv, node_modules, prettier configuration).
 Nothing runs unless you say yes now. If you do, they run once, here, to see which pass today.
 These checks run code from this folder, so say no if you do not trust it.
 Turn it on? [Y/n]
 ```
 
-Enter means yes. claude-hr then runs each check once, while you watch, and keeps only the ones that pass today (a check that
+Enter means yes (keys you pressed before the question appeared are ignored, so a stray Enter cannot answer it). For a check
+that goes through `npm run`, `make` or `just`, the script it will run is printed under it. claude-hr then runs each check once, while you watch, and keeps only the ones that pass today (a check that
 already fails would only block Claude on a problem it did not cause; those are listed so you can fix them or add them
 yourself). The list is saved as `.claude/hr-verify.toml` and kept out of `git status` through `.git/info/exclude` (local to
 your clone, never committed by accident). If the folder's agent settings look risky (the same scan as `claude-hr-ctl audit`),
-the findings are shown first and the default answer is No.
+the findings are shown first and the default answer is No; so it is when a script shown on the screen looks like fetching or
+sending data, decoding and running something, reading credentials or deleting your home (a short pattern list, not proof).
 
-**How to say no.** Type `n`: you are not asked again for that folder. Ctrl-C or closing the terminal means "not now" and it
-asks again next time. To stop the question everywhere: `claude-hr-ctl config set verify.offer off`.
+**How to say no.** Type `n`: you are not asked again for that folder. Ctrl-C, closing the terminal, two unclear answers or
+five minutes without an answer mean "not now" and it asks again next time. To stop the question everywhere: `claude-hr-ctl config set verify.offer off`.
 
 **How to undo it.** `claude-hr-ctl verify disable` turns the gate off for this folder and keeps the file;
 `claude-hr-ctl verify enable` turns it on again; `claude-hr-ctl verify status` shows where the folder stands (on, off, or never
-offered). To remove it completely, delete `.claude/hr-verify.toml` (and its line in `.git/info/exclude`).
+offered). To remove the file as well, delete `.claude/hr-verify.toml` (and its line in `.git/info/exclude`); a folder you turned
+on and then removed the file from is not asked about again, `verify enable` turns it on again.
 
 **What it never does.** It never asks in `claude -p`, `claude agents`, `claude mcp ...` or any other subcommand, inside a
 Claude Code session, with piped input, a redirected stderr or without a terminal, and no flag or environment variable answers for you. A repository
 that brings its own `.claude/hr-verify.toml` (a clone, a pull request) is shown in full, every command of both tiers, with No as
-the default; editing the file later asks again. The gate runs the commands you saw and nothing else.
+the default; editing the file later asks again. The gate runs the commands you saw and nothing else, but those commands run
+the project's own scripts and tests as they are at that moment: a `git pull` that changes a `package.json` script, a Makefile
+target or a `conftest.py` changes what runs after the next turn, without a new question.
 
 ### The manual way
 

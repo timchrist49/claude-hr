@@ -13,8 +13,8 @@ is unchanged: the checks still run only after a person approved the exact file, 
   `verify.offer` (`"ask"`, or `"off"`).
 - **New commands:** `claude-hr-ctl verify enable` (the same thing on request, a person at a terminal only, no `--yes`) and
   `verify disable` (untrust, remember the no, keep the file). `verify status` says when a folder was declined or never offered;
-  `verify trust` by hand also stops the offer for that folder. The bash guard and the settings baseline treat `verify enable` /
-  `disable` like `verify trust`.
+  `verify trust` by hand also stops the offer for that folder. The bash guard denies an agent that types `verify enable` /
+  `disable` / `trust` / `untrust`; the settings baseline asks before `verify trust` and `verify enable`.
 - **Cost:** about 3 ms on an interactive start in a folder that is already decided, and nothing on any other launch (`-p`, agents,
   subcommands, dry runs do not even import the module). The launcher stays fail-open: any error in the offer starts Claude.
 - The manual way (`verify init --write`, `verify trust`) still works and is documented as such.
@@ -30,8 +30,31 @@ is unchanged: the checks still run only after a person approved the exact file, 
     benefit was never measured on real traffic. Set `headroom.output_shaper = true` to bring it back. Run `claude-hr-ctl headroom
     restart` once for either change to reach the shared proxy.
   Together with disabling unused plugins this took a fresh session on one machine from 43,791 to 30,588 input tokens (-30%).
-- Tests no longer depend on the machine: the sandbox points git's global ignore (`XDG_CONFIG_HOME`) at a temporary folder, and the
-  CLAUDE.md test counts only files inside its own folder.
+- **Found by an adversarial review of the offer, fixed before release:**
+  - A stray Enter could answer the question: pending console input is now discarded right before it, the wait ends after five
+    minutes as "not now", two unclear answers are "not now" (nothing recorded), and on Windows `NUL` no longer counts as a terminal.
+  - The screen now shows what a task-runner check will run (`npm run` script text, Makefile or justfile recipe lines), says that
+    the project's own scripts and the formatter's repo tools are part of the yes, names the repository folder when it differs from
+    where Claude started, and the default turns to No when a shown script looks like fetching or sending data, decoding and
+    running, reading credentials or deleting your home.
+  - Only the repository's top folder counts as trusted by Claude Code (not a launch subfolder or a trusted parent).
+  - The Stop hook ignores a state folder that lies inside the repository or the working folder, so a repository can no longer
+    ship its own trust record through project settings (`CLAUDE_HR_HOME`). This closes a gap that existed in 0.2.0.
+  - The bash guard's verify/trust patterns can no longer be made to time out with a padded command (bounded gaps, first and
+    last 64 KiB; the secret and git patterns are unchanged and still unbounded).
+  - Recipes are kept out of git in linked worktrees and submodules too; a check that edits tracked files while it is probed is
+    left out; a folder turned on and then emptied is not asked again; a folder with nothing to propose is remembered until a
+    project file changes (no repeated discovery cost); a broken `config.toml` no longer drops `verify.offer = "off"`; discovery
+    proposes `python3` where only that exists; the end of `verify enable` says when the `hr-gates` plugin is not enabled.
+  - `doctor` warns when the running Headroom proxy still has settings older than the current ones (`headroom restart` applies
+    them; it now says how many sessions are running).
+  - Known limits, documented in SECURITY.md: the approval covers the recipe's bytes, not the scripts it runs; a process that fakes
+    a terminal can still answer the question (as with `verify trust` in 0.2.0); the guard's secret and git patterns can be padded
+    past the hook time limit (fails open); a check that starts failing for reasons outside Claude's edits blocks twice per turn.
+- Tests no longer depend on the machine: the sandbox hides git's global and system configuration and `XDG_CONFIG_HOME`, the
+  CLAUDE.md tests read only files inside their own folder, the Headroom footprint tests set the footprint they need, and the
+  "never asked" tests fail when an unscripted question is asked (they used to pass vacuously because the launcher swallowed
+  the test's own error).
 
 ## 0.2.0 (2026-10-16)
 A verified development loop with no always-on token cost, for sessions run at Ultracode effort on `opusplan` (claude-hr still sets
