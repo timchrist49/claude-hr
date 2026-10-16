@@ -64,7 +64,7 @@ if ($Local) {
     Log "using checkout $Local"
     if (Test-Path $src) { Remove-Item -Recurse -Force $src }
     # copy the working tree as it is on disk (committed or not)
-    robocopy $Local $src /E /XD .git __pycache__ .venv .pytest_cache .ruff_cache /NFL /NDL /NJH /NJS /NP | Out-Null
+    robocopy $Local $src /E /XD .git __pycache__ .venv .pytest_cache .ruff_cache /XF .git /NFL /NDL /NJH /NJS /NP | Out-Null  # /XF .git: a git worktree has a .git FILE that would point the copy at the original repository
     if ($LASTEXITCODE -ge 8) { Die "copy failed (robocopy $LASTEXITCODE)" }
     $global:LASTEXITCODE = 0
   }

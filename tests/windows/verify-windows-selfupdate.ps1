@@ -13,6 +13,8 @@ if (Test-Path $sb) { Remove-Item -Recurse -Force $sb }
 New-Item -ItemType Directory -Force -Path "$sb\h\.claude", "$sb\tooldir", "$sb\toolbin", "$sb\src" | Out-Null
 $realConfig = "$env:USERPROFILE\.claude"
 $tasksBefore = (@(Get-ScheduledTask -TaskPath '\claude-hr\' -ErrorAction SilentlyContinue | ForEach-Object TaskName) | Sort-Object) -join ','
+function RealProfileSnapshot { (@("$env:USERPROFILE\.claude\settings.json", "$env:USERPROFILE\.claude-hr\config.toml", "$env:USERPROFILE\.claude-hr\state\verify-trust.json", "$env:USERPROFILE\.claude-hr\state\verify-offer.json") | ForEach-Object { if (Test-Path $_) { "$_=" + (Get-FileHash $_ -Algorithm SHA256).Hash } else { "$_=absent" } }) -join ';' }
+$realBefore = RealProfileSnapshot  # a machine may already run claude-hr: compare before and after, not 'absent'
 $pass = 0; $fail = 0
 function Check($name, [bool]$ok, $detail = '') { if ($ok) { $script:pass++; "  PASS $name" } else { $script:fail++; "  FAIL $name  $detail" } }
 $utf8 = New-Object Text.UTF8Encoding $false
@@ -50,7 +52,7 @@ if ($FromRef) {
   git -C $repo archive --format=zip $FromRef -o "$sb\src.zip" 2>&1 | Out-Null
   Expand-Archive -Path "$sb\src.zip" -DestinationPath $src -Force
 } else {
-  robocopy $repo $src /E /XD .git .venv __pycache__ .pytest_cache .ruff_cache /NFL /NDL /NJH /NJS /NP | Out-Null
+  robocopy $repo $src /E /XD .git .venv __pycache__ .pytest_cache .ruff_cache /XF .git /NFL /NDL /NJH /NJS /NP | Out-Null  # /XF .git: in a git worktree .git is a FILE; copied, it made the git commands below commit into the real repository
 }
 Check "source tree copied" (Test-Path "$src\src\claude_hr\updater.py") "from '$FromRef'"
 git -C $src init -q -b main 2>&1 | Out-Null
@@ -118,8 +120,7 @@ Check "nothing left to update" ((Run "claude-hr-ctl update --check --only self")
 "== 5. uninstall + real profile untouched =="
 $un = Run "claude-hr-ctl uninstall"
 Check "uninstall does not claim the scheduler failed" ($un -notmatch 'schedule: FAILED') $un
-Check "no ~/.claude-hr" (-not (Test-Path "$env:USERPROFILE\.claude-hr"))
-Check "no claude-hr keys in real settings.json" ((Get-Content "$realConfig\settings.json" -Raw) -notmatch 'CLAUDE_HR_MANAGED')
+Check "the real ~/.claude/settings.json and ~/.claude-hr (config, trust, offer records) are unchanged by this run" ((RealProfileSnapshot) -eq $realBefore)
 $tasksAfter = (@(Get-ScheduledTask -TaskPath '\claude-hr\' -ErrorAction SilentlyContinue | ForEach-Object TaskName) | Sort-Object) -join ','
 Check "scheduler tasks unchanged (none left behind, none of yours removed)" ($tasksAfter -eq $tasksBefore) "before: $tasksBefore after: $tasksAfter"
 $realUvAfter = RealUvState

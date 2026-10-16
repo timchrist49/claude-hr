@@ -10,6 +10,8 @@ if (Test-Path $sb) { Remove-Item -Recurse -Force $sb }
 New-Item -ItemType Directory -Force -Path "$sb\h\.claude", "$sb\tooldir", "$sb\toolbin", "$sb\proj" | Out-Null
 $realConfig = "$env:USERPROFILE\.claude"
 $tasksBefore = (@(Get-ScheduledTask -TaskPath '\claude-hr\' -ErrorAction SilentlyContinue | ForEach-Object TaskName) | Sort-Object) -join ','
+function RealProfileSnapshot { (@("$env:USERPROFILE\.claude\settings.json", "$env:USERPROFILE\.claude-hr\config.toml", "$env:USERPROFILE\.claude-hr\state\verify-trust.json", "$env:USERPROFILE\.claude-hr\state\verify-offer.json") | ForEach-Object { if (Test-Path $_) { "$_=" + (Get-FileHash $_ -Algorithm SHA256).Hash } else { "$_=absent" } }) -join ';' }
+$realBefore = RealProfileSnapshot  # a machine may already run claude-hr: compare before and after, not 'absent'
 $pass = 0; $fail = 0
 function Check($name, [bool]$ok, $detail = '') { if ($ok) { $script:pass++; "  PASS $name" } else { $script:fail++; "  FAIL $name  $detail" } }
 
@@ -144,8 +146,7 @@ Check "managed settings removed" ($after -notmatch 'DISABLE_AUTOUPDATER|CLAUDE_H
 Check "CLAUDE.md block removed" ((-not (Test-Path "$sb\h\.claude\CLAUDE.md")) -or ((Get-Content "$sb\h\.claude\CLAUDE.md" -Raw) -notmatch 'CLAUDE-HR:BEGIN'))
 
 "== real profile untouched? =="
-Check "no ~/.claude-hr" (-not (Test-Path "$env:USERPROFILE\.claude-hr"))
-Check "no claude-hr keys in real settings.json" ((Get-Content "$realConfig\settings.json" -Raw) -notmatch 'CLAUDE_HR_MANAGED')
+Check "the real ~/.claude/settings.json and ~/.claude-hr (config, trust, offer records) are unchanged by this run" ((RealProfileSnapshot) -eq $realBefore)
 $tasksAfter = (@(Get-ScheduledTask -TaskPath '\claude-hr\' -ErrorAction SilentlyContinue | ForEach-Object TaskName) | Sort-Object) -join ','
 Check "scheduler tasks unchanged (none created, none of yours removed)" ($tasksAfter -eq $tasksBefore) "before: $tasksBefore after: $tasksAfter"
 "WIN_RESULT: $pass passed, $fail failed"
