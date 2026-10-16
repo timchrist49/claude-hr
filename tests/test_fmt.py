@@ -85,6 +85,7 @@ def fake(monkeypatch, fake_script, sandbox):
 def git(repo, *args, check=True):
     env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
     env["GIT_CONFIG_GLOBAL"] = os.devnull
+    env["GIT_CONFIG_NOSYSTEM"] = "1"  # the same isolation the sandbox gives the code under test
     r = subprocess.run(
         ["git", *args], cwd=repo, env=env, capture_output=True, text=True, timeout=60
     )

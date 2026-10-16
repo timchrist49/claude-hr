@@ -31,6 +31,7 @@ timeout_s = 30
 def git(repo, *args):
     env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
     env["GIT_CONFIG_GLOBAL"] = os.devnull
+    env["GIT_CONFIG_NOSYSTEM"] = "1"  # the same isolation the sandbox gives the code under test
     subprocess.run(["git", *args], cwd=repo, env=env, check=True, capture_output=True, timeout=60)
 
 
