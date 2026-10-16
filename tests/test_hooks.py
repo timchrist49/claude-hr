@@ -196,10 +196,52 @@ def test_secret_rules_still_win_over_git_asks(monkeypatch, capsys):
     assert run_guard(monkeypatch, "git reset --hard && cat .env") == 2
 
 
-def test_stop_entry_point_fails_open(monkeypatch):
-    import sys as _sys
+TRUST_BLOCK = [
+    "claude-hr-ctl verify trust",
+    "claude-hr-ctl.exe verify trust --yes",
+    "claude-hr-ctl  verify   untrust",
+    "claude-hr ctl verify trust",
+    "uv run claude-hr-ctl verify trust",
+    "cd repo && claude-hr-ctl verify trust",
+    "python -m claude_hr.ctl verify trust",
+    "CI=1 python3 -m claude_hr.ctl verify trust",
+    "bash -c 'claude-hr-ctl verify trust'",
+    'python -c "from claude_hr import verify; verify.trust(root, state)"',
+    "cat ~/.claude-hr/state/verify-trust.json",
+    "echo '{}' > ~/.claude-hr/state/verify-trust.json",
+]
+TRUST_ALLOW = [
+    "claude-hr-ctl verify status",
+    "claude-hr-ctl verify init --write",
+    "claude-hr-ctl verify run --tier fast",
+    "npm run verify",
+    "git commit -m 'verify the build'",
+    "echo trust me",
+    "pytest tests/test_verify.py",
+]
 
-    monkeypatch.setitem(
-        _sys.modules, "claude_hr.stop_gate", None
-    )  # an import failure must not break the session
+
+@pytest.mark.parametrize("cmd", TRUST_BLOCK)
+def test_an_agent_cannot_trust_a_verify_recipe_on_its_own(monkeypatch, capsys, cmd):
+    monkeypatch.delenv("CLAUDE_HR_GUARD_OFF", raising=False)
+    assert run_guard(monkeypatch, cmd) == 2
+    assert "only the user does it" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("cmd", TRUST_ALLOW)
+def test_verify_commands_that_do_not_grant_trust_are_allowed(monkeypatch, cmd):
+    monkeypatch.delenv("CLAUDE_HR_GUARD_OFF", raising=False)
+    monkeypatch.delenv("CLAUDE_HR_GIT_GUARD", raising=False)
+    assert run_guard(monkeypatch, cmd) == 0
+
+
+def test_stop_entry_point_fails_open(sandbox, monkeypatch):
+    """A broken gate (here: it raises, as an import error would) must not break the session. `sandbox`: the real gate
+    writes a crash log, and this test once did so into the real profile."""
+    from claude_hr import stop_gate
+
+    def boom():
+        raise ImportError("gate module is broken")
+
+    monkeypatch.setattr(stop_gate, "run", boom)
     assert hooks.main(["stop"]) == 0

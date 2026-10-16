@@ -51,14 +51,13 @@ def _desktop_markers(own_port: int) -> list[str]:
     return found
 
 
-def _security_guidance(log: Path) -> dict | None:
+def _security_guidance() -> dict | None:
+    """security-guidance's log summary, or None (plugin not installed, no log, or footprint missing)."""
     try:
-        from .footprint import security_guidance_health
-    except (
-        ImportError
-    ):  # the footprint module ships in the same release; tolerate a partial install
+        from .footprint import security_guidance_health, security_log_path
+    except ImportError:  # tolerate a partial install
         return None
-    return security_guidance_health(log)
+    return security_guidance_health(security_log_path())
 
 
 def run(cfg: Config, cwd: Path, deep: bool = False) -> list[Check]:
@@ -163,13 +162,13 @@ def run(cfg: Config, cwd: Path, deep: bool = False) -> list[Check]:
                 "uv tool update-shell, then open a new terminal",
             )
         )
-    sg = _security_guidance(paths.claude_home() / "security" / "log.txt")
-    if sg and sg.get("skipped") and not sg.get("reviews"):
+    sg = _security_guidance()
+    if sg and sg.get("skipped_reviews") and not sg.get("completed_reviews"):
         out.append(
             Check(
                 "security-guidance",
                 WARN,
-                f"its model reviews were skipped {sg['skipped']} time(s) and none ran (no API credentials found: a known "
+                f"its model reviews were skipped {sg['skipped_reviews']} time(s) and none ran (no API credentials found: a known "
                 "issue for /login users). Its regex layer still works",
                 "run /security-review or `claude-hr-ctl audit` before merging; or set ANTHROPIC_API_KEY for the plugin",
             )

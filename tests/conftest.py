@@ -28,6 +28,12 @@ def sandbox(tmp_path, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _every_test_is_sandboxed(sandbox):
+    """No test can reach the real profile by forgetting the `sandbox` fixture (a hook test once wrote a crash log into
+    the real ~/.claude-hr). Tests that need the path ask for `sandbox` as before and get this same instance."""
+
+
+@pytest.fixture(autouse=True)
 def _never_start_real_update_helpers(request, monkeypatch):
     """No test may register a scheduled task or spawn a reinstall on the machine running the suite (on Windows the real
     code path does exactly that). Tests that exercise the real functions are marked `real_helpers` and stub what they call."""

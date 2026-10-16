@@ -107,12 +107,16 @@ def test_missing_hook_binary_is_reported(sandbox, fake_claude, monkeypatch):
 
 
 def test_security_guidance_silently_skipping_reviews_is_reported(sandbox, fake_claude, monkeypatch):
-    monkeypatch.setattr(doctor, "_security_guidance", lambda log: {"skipped": 7, "reviews": 0})
+    monkeypatch.setattr(
+        doctor, "_security_guidance", lambda: {"skipped_reviews": 7, "completed_reviews": 0}
+    )
     got = checks()["security-guidance"]
     assert got.status == "warn" and "skipped 7 time" in got.detail and "/security-review" in got.fix
-    monkeypatch.setattr(doctor, "_security_guidance", lambda log: {"skipped": 7, "reviews": 3})
+    monkeypatch.setattr(
+        doctor, "_security_guidance", lambda: {"skipped_reviews": 7, "completed_reviews": 3}
+    )
     assert "security-guidance" not in checks()  # reviews do run for this user
-    monkeypatch.setattr(doctor, "_security_guidance", lambda log: None)
+    monkeypatch.setattr(doctor, "_security_guidance", lambda: None)
     assert "security-guidance" not in checks()  # plugin not installed / no log
 
 

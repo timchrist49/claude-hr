@@ -758,6 +758,44 @@ def _repo_root() -> Path:
     return worktree.repo_root(Path.cwd()) or Path.cwd()
 
 
+def _not_a_person() -> str | None:
+    """Why nobody can be assumed to be at the keyboard (None = a person plausibly is).
+
+    Used for the two decisions that let a repository's own commands run: `verify trust` and `verify run` of an
+    untrusted recipe. An agent that was talked into running them must not be able to approve itself: there is no
+    --yes flag, and a shell that belongs to a Claude Code session or has no terminal is refused. This is a speed bump
+    (a determined agent can allocate a pty); the permission prompts and the bash guard are the other layers.
+    """
+    if os.environ.get("CLAUDECODE") or os.environ.get("CLAUDE_CODE_ENTRYPOINT"):
+        return "this shell belongs to a Claude Code session"
+    if not (sys.stdin and sys.stdin.isatty() and sys.stdout and sys.stdout.isatty()):
+        return "there is no interactive terminal"
+    return None
+
+
+def _show_recipe(root: Path, recipe) -> None:
+    for tier in ("fast", "full"):
+        shown = list(getattr(recipe, tier))
+        if tier == "full":
+            fast = {c.name for c in recipe.fast}
+            shown = [
+                c for c in shown if c.name not in fast
+            ]  # `full` repeats `fast`: show only the additions
+        for c in shown:
+            from . import verify
+
+            out(
+                f"  [{tier}] {c.name}: {verify.command_line(c)}   (timeout {c.timeout_s}s, cwd {c.cwd})"
+            )
+
+
+def _confirm(question: str) -> bool:
+    try:
+        return input(f"{question} type 'yes': ").strip().lower() == "yes"
+    except (EOFError, KeyboardInterrupt):
+        return False
+
+
 def cmd_fmt(a, cfg) -> int:
     """Format (or, with --check, only report) files with a formatter the repo ALREADY configures. No arguments: say which."""
     from . import fmt
@@ -772,70 +810,40 @@ def cmd_fmt(a, cfg) -> int:
             )
             return 0
         for d in found:
+            refused = "" if d.get("usable", True) else f"   NOT USED: {d.get('reason', '')}"
             out(
                 f"{d['name']:<9} {' '.join(d.get('extensions', []))}   "
-                f"(configured by {d.get('configured_by', '?')}; {d.get('exe', '')})"
+                f"(configured by {d.get('configured_by', '?')}; {d.get('exe', '')}){refused}"
             )
         return 0
-    timeout = float(cfg.get("format.timeout_s", 30))
+    kw = {
+        "timeout_s": max(
+            float(cfg.get("format.timeout_s", 30)), 120.0
+        ),  # you asked for it: no hurry
+        "max_kb": int(cfg.get("format.max_file_kb", 512)),
+        "skip_globs": tuple(cfg.get("format.skip_globs", []) or ()),
+        "allow": list(cfg.get("format.allow", []) or []) or None,
+        "check": bool(a.check),
+        "clean_gate": False,  # deliberate command: format the whole file even if it had drifted
+    }
     if a.paths:
-        files = [Path(x).resolve() for x in a.paths]
+        rep = fmt.format_paths(root, [Path(os.path.abspath(x)) for x in a.paths], **kw)
     else:
-        files = fmt.changed_files(
-            root,
-            max_files=500,
-            max_kb=int(cfg.get("format.max_file_kb", 512)),
-            skip_globs=tuple(cfg.get("format.skip_globs", []) or ()),
-        )
-    dirty: list[Path] = []
-    errors: list[tuple[Path, str]] = []
-    clean = 0
-    for f in files:
-        spec = fmt.detect(f, root)
-        if spec is None:
-            continue
-        try:
-            text = f.read_bytes().decode("utf-8")
-        except (OSError, UnicodeDecodeError):
-            errors.append((f, "unreadable"))
-            continue
-        new = fmt.format_text(spec, f, text, cwd=root, timeout=timeout)
-        if new is None:
-            errors.append((f, f"{spec.name} failed"))
-            continue
-        nl = "\r\n" if "\r\n" in text else "\n"  # a formatter must not flip the file's line endings
-        new = new.replace("\r\n", "\n").replace("\n", nl)
-        if new == text:
-            clean += 1
-            continue
-        dirty.append(f)
-        if not a.check:
-            f.write_bytes(new.encode("utf-8"))
-    for f in dirty:
-        out(f"{'would reformat' if a.check else 'reformatted'}: {f}")
-    for f, why in errors:
-        out(f"error: {f}: {why}")
+        rep = fmt.format_changed(root, max_files=500, **kw)
+    for p in rep.formatted:
+        out(f"{'would reformat' if a.check else 'reformatted'}: {p}")
+    for p, why in rep.skipped:
+        out(f"skipped: {p} ({why})")
+    for p, why in rep.errors:
+        out(f"error: {p}: {why}")
     out(
-        f"{len(dirty)} {'need formatting' if a.check else 'reformatted'}, {clean} already formatted, {len(errors)} errors"
+        f"{len(rep.formatted)} {'need formatting' if a.check else 'reformatted'}, "
+        f"{len(rep.errors)} error(s), {len(rep.skipped)} skipped"
+        + (f" ({', '.join(rep.formatters)})" if rep.formatters else "")
     )
-    if errors:
+    if rep.errors:
         return 2
-    return 1 if (dirty and a.check) else 0
-
-
-def _trust_prompt(root: Path, recipe, assume_yes: bool) -> bool:
-    out(f"The end-of-turn gate will run these commands unattended in {root}:")
-    for tier in ("fast", "full"):
-        for c in getattr(recipe, tier):
-            out(f"  [{tier}] {c.name}: {' '.join(c.argv)}   (timeout {c.timeout_s}s, cwd {c.cwd})")
-    if assume_yes:
-        return True
-    if not sys.stdin.isatty():
-        out(
-            "refusing to trust without a human: run this in a terminal, or pass --yes if you have reviewed the file yourself"
-        )
-        return False
-    return input("Trust this file? type 'yes': ").strip().lower() == "yes"
+    return 1 if (a.check and rep.formatted) else 0
 
 
 def cmd_verify(a, cfg) -> int:
@@ -843,121 +851,168 @@ def cmd_verify(a, cfg) -> int:
     from . import verify
 
     root = _repo_root()
+    cp = verify.config_path(root)
     if a.action == "init":
         recipe = verify.discover(root)
         text = verify.render_toml(recipe)
-        target = verify.config_path(root)
         if not a.write:
             out(text)
             out(
-                f"# dry run: `claude-hr-ctl verify init --write` saves this to {target}, then review it and run `verify trust`"
+                f"# dry run: `claude-hr-ctl verify init --write` saves this to {cp}; review it, then run "
+                "`claude-hr-ctl verify trust` in a terminal"
             )
             return 0
-        if target.exists() and not a.force:
-            out(
-                f"{target} already exists (use --force to overwrite); review it, then run `claude-hr-ctl verify trust`"
-            )
+        if cp.exists() and not a.force:
+            out(f"{cp} already exists (use --force to overwrite); review it, then trust it")
             return 1
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(text, encoding="utf-8", newline="\n")
+        cp.parent.mkdir(parents=True, exist_ok=True)
+        cp.write_text(text, encoding="utf-8", newline="\n")
         out(
-            f"wrote {target}\nReview it (these commands run at the end of each Claude turn), then: claude-hr-ctl verify trust"
+            f"wrote {cp}\nReview it (these commands run at the end of each Claude turn), then, in a terminal "
+            "outside Claude Code: claude-hr-ctl verify trust"
         )
         return 0
     try:
         recipe = verify.load(root)
     except ValueError as exc:
-        out(f"{verify.config_path(root)}: {exc}")
+        out(f"{cp}: {exc}")
         return 2
-    if a.action == "trust":
-        if recipe is None:
-            out(
-                f"no {verify.config_path(root)}; create one with `claude-hr-ctl verify init --write`"
-            )
-            return 1
-        if not _trust_prompt(root, recipe, a.yes):
-            return 1
-        out(
-            f"trusted ({verify.trust(root, paths.state_dir())[:12]}...): the end-of-turn gate may now run these commands"
-        )
-        return 0
-    if a.action == "untrust":
-        verify.untrust(root, paths.state_dir())
-        out("trust removed: the end-of-turn gate will not run this repository's commands")
-        return 0
+    state = verify.trust_state(root, paths.state_dir())
     if a.action == "status":
-        cp = verify.config_path(root)
         if recipe is None:
             out(f"no recipe at {cp}  ->  `claude-hr-ctl verify init --write`")
             return 0
-        trusted = verify.is_trusted(root, paths.state_dir())
-        out(
-            f"{cp}: {'TRUSTED' if trusted else 'NOT trusted (new or changed since you trusted it)'}"
-        )
-        for tier in ("fast", "full"):
-            for c in getattr(recipe, tier):
-                out(f"  [{tier}] {c.name}: {' '.join(c.argv)}")
-        if not trusted:
-            out("the end-of-turn gate does nothing until you run `claude-hr-ctl verify trust`")
+        meaning = {
+            "trusted": "TRUSTED: the end-of-turn gate runs these checks",
+            "untrusted": "NOT trusted: the gate does nothing until a person runs `claude-hr-ctl verify trust`",
+            "modified": "CHANGED since it was trusted: the gate does nothing until it is reviewed and trusted again",
+        }.get(state, state)
+        out(f"{cp}: {meaning}")
+        _show_recipe(root, recipe)
         return 0
-    # run: explicit and interactive, so it works without trust (you are asking for exactly this)
+    if a.action == "untrust":
+        removed = verify.untrust(root, paths.state_dir())
+        out(
+            "trust removed: the end-of-turn gate will not run this repository's commands"
+            if removed
+            else "this repository was not trusted"
+        )
+        return 0
+    if a.action == "trust":
+        if recipe is None:
+            out(f"no {cp}; create one with `claude-hr-ctl verify init --write`")
+            return 1
+        why = _not_a_person()
+        if why:
+            out(
+                f"refusing to trust a verify recipe: {why}.\n"
+                "Trusting lets the end-of-turn gate run these commands unattended, so a person has to do it: open a "
+                f"normal terminal (not a Claude Code session), cd to {root} and run `claude-hr-ctl verify trust`."
+            )
+            return 1
+        out(f"The end-of-turn gate will run these commands without asking, in {root}:")
+        _show_recipe(root, recipe)
+        try:
+            from . import audit
+
+            findings = audit.preflight(root)
+            if findings:
+                out("\nThe repository's agent surface has findings you should read first:")
+                out(audit.render(findings, [], root=root))
+        except Exception:  # noqa: BLE001 - the preflight is advice; it must not block the decision
+            pass
+        if not _confirm("\nTrust exactly this file?"):
+            out("not trusted")
+            return 1
+        try:
+            digest = verify.trust(root, paths.state_dir())
+        except ValueError as exc:
+            out(str(exc))
+            return 1
+        out(f"trusted ({digest[:12]}...): the end-of-turn gate may now run these commands")
+        return 0
+    # ---- run -------------------------------------------------------------------------------------------------
     if recipe is None:
         recipe = verify.discover(root)
-        out("(no .claude/hr-verify.toml: running the commands that would be proposed)")
-    checks = list(recipe.fast) + (list(recipe.full) if a.tier == "full" else [])
+        out("(no .claude/hr-verify.toml: these are the commands that would be proposed)")
+    if state != "trusted":
+        # a recipe nobody approved is the repository's own text: it only runs with a person's say-so, never for an agent
+        why = _not_a_person()
+        if why:
+            out(
+                f"refusing to run an untrusted recipe: {why}.\n"
+                "Ask the user to review `.claude/hr-verify.toml` and run `claude-hr-ctl verify trust` in a terminal."
+            )
+            return 1
+        out(f"These commands come from {root} and have not been trusted:")
+        _show_recipe(root, recipe)
+        if not _confirm("\nRun them once now?"):
+            return 1
+    checks = list(recipe.full if (a.tier == "full" and recipe.full) else recipe.fast)
     if not checks:
         out("nothing to run: no checks were found for this repository")
         return 1
-    res = verify.run(root, checks, stop_on_fail=False)
-    ok = True
+    res = verify.run(root, checks, total_timeout_s=float(sum(c.timeout_s for c in checks)))
     for r in res.results:
-        out(f"[{'ok ' if r.rc == 0 else 'FAIL'}] {r.name} ({r.seconds:.1f}s, exit {r.rc})")
-        if r.rc != 0:
-            ok = False
-            out("\n".join("      " + ln for ln in (r.tail or "").splitlines()))
-    notes = verify.test_weakening(root) if cfg.flag("verify.test_guard", True) else []
-    for n in notes:
-        out(f"[warn] possible test weakening: {n}")
-    return 0 if ok else 1
+        flag = "ok  " if r.ok else "FAIL"
+        out(f"[{flag}] {r.name} ({r.seconds:.1f}s, exit {r.rc})")
+        if not r.ok and r.output:
+            out("\n".join("      " + ln for ln in r.output.splitlines()))
+    for name in res.skipped:
+        out(f"[skip] {name} (not started: time budget)")
+    if cfg.flag("verify.test_guard", True):
+        for note in verify.test_weakening(root):
+            out(f"[warn] possible test weakening: {note}")
+    return 0 if res.ok else 1
 
 
 def cmd_audit(a, cfg) -> int:
     """Read-only repository audit: agent-config attack surface, workflow lint, secrets. Zero tokens, runs nothing from the repo."""
     from . import audit
 
-    root = _repo_root()
-    findings = audit.scan_repo(root)
-    tools = (
-        audit.run_tools(root, timeout_s=int(cfg.get("audit.timeout_s", 60)))
-        if (a.tools and cfg.flag("audit.tools", True))
-        else []
+    root = Path(os.path.abspath(a.path)) if a.path else _repo_root()
+    text, code = audit.report(
+        root,
+        tools=bool(a.tools and cfg.flag("audit.tools", True)),
+        as_json=a.json,
+        strict=a.strict,
+        timeout_s=float(cfg.get("audit.timeout_s", 60)),
     )
-    out(audit.render(findings, tools, as_json=a.json))
-    return 1 if (a.strict and any(f.severity == "high" for f in findings)) else 0
+    out(text)
+    return code
 
 
 def cmd_init_repo(a, cfg) -> int:
     """Scaffold issue templates, PR template, CODEOWNERS, Dependabot, docs/plans, REVIEW.md, .editorconfig. Dry run by default."""
     from . import initrepo
 
-    root = _repo_root()
-    actions = initrepo.plan(root, only=a.only or None)
-    if not actions:
-        out("nothing to scaffold for the selected groups")
-        return 0
-    for act in actions:
-        out(f"{'exists  ' if act.exists else 'new     '} {act.path}   [{act.group}]")
-    new = [x for x in actions if not x.exists]
+    root = Path(os.path.abspath(a.path)) if a.path else _repo_root()
+    commands = None
+    try:  # the CI skeleton runs the same checks the end-of-turn gate would
+        from . import verify
+
+        commands = [c.argv for c in verify.discover(root).fast] or None
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        actions, notes = initrepo.plan_with_notes(root, only=a.only, commands=commands)
+    except ValueError as exc:  # an unknown group name; the message lists the valid ones
+        out(str(exc))
+        return 2
+    out(initrepo.format_plan(actions, notes))
     if not a.apply:
         out(
-            f"\ndry run: {len(new)} new file(s). `claude-hr-ctl init-repo --apply` writes them (existing files are never overwritten); review with git diff, then commit."
+            "dry run: nothing written. `claude-hr-ctl init-repo --apply` creates the files marked new "
+            "(existing files are never overwritten); review with git diff, then commit."
         )
         return 0
-    written = initrepo.apply(root, actions)
-    out(
-        f"\nwrote {len(written)} file(s); nothing was committed or pushed. Review with `git status` / `git diff`."
-    )
-    return 0
+    res = initrepo.apply_detailed(root, actions)
+    for p in res.written:
+        out(f"created {p}")
+    for p, why in res.errors:
+        out(f"failed {p}: {why}")
+    out("nothing was committed or pushed: review with `git status` / `git diff`.")
+    return 1 if res.errors else 0
 
 
 def cmd_footprint(a, cfg) -> int:
@@ -974,21 +1029,26 @@ def cmd_footprint(a, cfg) -> int:
     except ValueError:
         out("could not read `claude plugin list --json`")
         return 1
+    if isinstance(listing, dict):
+        listing = listing.get("plugins", [])
     fps = footprint.scan_installed(listing if isinstance(listing, list) else [])
-    out(footprint.render(fps, int(cfg.get("footprint.budget_standard_tokens", 1500))))
+    # the budget is for the standard profile; other profiles add plugins on purpose
+    budget = (
+        int(cfg.get("footprint.budget_standard_tokens", 1500))
+        if str(cfg.get("plugins.profile", "standard")) == "standard"
+        else None
+    )
+    out(footprint.render(fps, budget))
+    over = budget is not None and footprint.always_on_tokens(fps) > budget
     if a.probe:
-        out("\nprobe: one tiny real request (this spends roughly 25-40k cached input tokens) ...")
+        out(
+            "\nprobe: one real `claude -p` turn in an empty temp directory (this spends real tokens) ..."
+        )
         res = footprint.probe(str(claude))
-        if res.get("ok"):
-            out(
-                f"first-message input: {res.get('input_tokens', 0) + res.get('cache_creation_tokens', 0) + res.get('cache_read_tokens', 0):,} tokens "
-                f"(new {res.get('input_tokens', 0):,}, cache write {res.get('cache_creation_tokens', 0):,}, cache read {res.get('cache_read_tokens', 0):,}); "
-                f"cost ${res.get('total_cost_usd', 0):.4f}"
-            )
-        else:
-            out("the probe did not return usable usage data")
+        out(footprint.render_probe(res))
+        if not res.get("ok"):
             return 1
-    return 0
+    return 1 if (a.strict and over) else 0
 
 
 def cmd_trail(a, cfg) -> int:
@@ -1160,19 +1220,17 @@ def build_parser() -> argparse.ArgumentParser:
     )
     s.add_argument("--force", action="store_true", help="init --write: overwrite an existing file")
     s.add_argument("--tier", choices=["fast", "full"], default="fast", help="run: which checks")
-    s.add_argument(
-        "--yes",
-        action="store_true",
-        help="trust: skip the confirmation (only after reviewing the file)",
-    )
     s.set_defaults(fn=cmd_verify)
 
     s = sub.add_parser(
         "audit", help="read-only repo audit: agent-config attack surface, workflow lint, secrets"
     )
+    s.add_argument("path", nargs="?", help="repository to audit (default: the current one)")
     s.add_argument("--json", action="store_true")
     s.add_argument(
-        "--strict", action="store_true", help="exit 1 if there is a high-severity finding"
+        "--strict",
+        action="store_true",
+        help="exit 1 on any high or medium finding (or a scanner that reported findings)",
     )
     s.add_argument(
         "--tools",
@@ -1185,12 +1243,12 @@ def build_parser() -> argparse.ArgumentParser:
         "init-repo",
         help="scaffold issue/PR templates, CODEOWNERS, Dependabot, docs/plans (dry run by default)",
     )
+    s.add_argument("path", nargs="?", help="repository (default: the current one)")
     s.add_argument("--apply", action="store_true", help="write the files that do not exist yet")
     s.add_argument(
         "--only",
-        nargs="+",
-        metavar="GROUP",
-        help="github docs editor dependabot codeowners review ci",
+        metavar="GROUPS",
+        help="comma-separated: github,docs,editor,dependabot,codeowners,review,ci (default: all)",
     )
     s.set_defaults(fn=cmd_init_repo)
 
@@ -1201,6 +1259,7 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument(
         "--probe", action="store_true", help="also measure one real first message (spends tokens)"
     )
+    s.add_argument("--strict", action="store_true", help="exit 1 when over the profile's budget")
     s.set_defaults(fn=cmd_footprint)
 
     s = sub.add_parser("trail", help="metadata-only audit trail of the end-of-turn gate")

@@ -58,9 +58,9 @@ def handle(payload: dict) -> dict | None:
 
     state = _State.load()
     key = _repo_key(root)
-    fp_before = verify.fingerprint(root)
-    if state.seen(key) == fp_before:
-        return None  # nothing changed since the last time this gate looked at the tree
+    sig_before = _signature(verify, root)
+    if state.seen(key) == sig_before:
+        return None  # nothing changed since the last time this gate looked at the tree (and the recipe's trust did not)
     started = time.monotonic()
 
     formatted: list[str] = []
@@ -89,13 +89,17 @@ def handle(payload: dict) -> dict | None:
             max_blocks=int(cfg.get("verify.gate_max_blocks", 2)),
             timeout_s=int(cfg.get("verify.gate_timeout_s", 120)),
             tier=str(cfg.get("verify.tier", "fast")),
+            test_guard=cfg.flag("verify.test_guard", True),
         )
 
     blocked = outcome is not None and outcome.action == "block"
-    if not blocked:
+    if not blocked and not (outcome is not None and outcome.action == "error"):
         # remember the tree as it is NOW (after formatting) so the next idle Stop is a no-op. A blocked tree is NOT
-        # remembered: if Claude stops again without changing anything, the failing checks must be looked at again.
-        state.remember(key, verify.fingerprint(root) if formatted else fp_before)
+        # remembered (if Claude stops again without changing anything, the failing checks must be looked at again) and
+        # neither is an error (a missing tool may be installed before the next turn).
+        # The state AFTER the checks: they may leave files behind (coverage output, build artifacts that are not
+        # gitignored), and the next idle Stop must not mistake that for a change by Claude.
+        state.remember(key, _signature(verify, root))
         state.save()
 
     if cfg.flag("gates.trail", True):
@@ -125,6 +129,11 @@ def _trail(
         checks=checks,
         seconds=round(seconds, 2),
     )
+
+
+def _signature(verify, root: Path) -> str:
+    """The working tree plus the recipe's trust state: trusting a recipe must re-run the gate even if no file changed."""
+    return f"{verify.fingerprint(root)}|{verify.trust_state(root, paths.state_dir())}"
 
 
 def _git_root(cwd: str) -> Path | None:

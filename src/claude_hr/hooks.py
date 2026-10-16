@@ -100,6 +100,16 @@ GIT_RISKS: list[tuple[re.Pattern, str]] = [
 ]
 
 
+# Trusting a verify recipe is what lets a repository's own commands run unattended at the end of every turn, so only the
+# user does it (in their own terminal). The CLI refuses a Claude Code shell; this refuses the agent that tries anyway,
+# in every permission mode, as long as hooks run. Like every pattern here it is not a boundary (`sh -c "$(echo ...)"`).
+_VERIFY_TRUST = re.compile(
+    r"(?ism)claude[-_]hr[\w.-]*\b[^\n;&|]*?\bverify\s+(?:un)?trust\b"
+    r"|\bverify-trust\.json\b"
+    r"|\bclaude_hr\b[^\n]*\bverify\b[^\n]*\b(?:un)?trust\s*\("
+)
+
+
 def git_risk(command: str) -> str | None:
     """Why `command` deserves a confirmation (see GIT_RISKS), or None."""
     for pattern, why in GIT_RISKS:
@@ -146,6 +156,13 @@ def bash_guard() -> int:
                 "run it themselves.\n"
             )
             return 2
+    if _VERIFY_TRUST.search(command):
+        sys.stderr.write(
+            "Blocked by the claude-hr guard: trusting (or editing the trust record of) a verify recipe lets commands "
+            "run unattended after every turn, so only the user does it. Show the user .claude/hr-verify.toml and ask "
+            "them to run `claude-hr-ctl verify trust` in their own terminal.\n"
+        )
+        return 2
     mode = os.environ.get("CLAUDE_HR_GIT_GUARD", "ask").strip().lower()
     if mode != "off":
         why = git_risk(command)

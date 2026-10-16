@@ -189,6 +189,9 @@ def test_baseline_lean_defaults_for_the_dev_workflow(sandbox):
     assert (
         "Bash(claude-hr-ctl verify trust*)" in ask
     )  # only the user decides which commands run unattended
+    deny = doc["permissions"]["deny"]  # the trust record and gate counters are not Claude's to edit
+    assert "Edit(~/.claude-hr/state/**)" in deny and "Write(~/.claude-hr/state/**)" in deny
+    assert "Read(~/.ssh/**)" in deny  # next to, not instead of, the secret-read rules
     allow = doc["permissions"]["allow"]
     assert "Bash(gh pr view *)" in allow and not [
         a for a in allow if "create" in a or "merge" in a or "edit" in a
@@ -205,6 +208,7 @@ def test_baseline_stop_review_can_be_restored_and_gates_protection_dropped(sandb
     doc, _ = baseline.build(config.load())
     assert "ENABLE_STOP_REVIEW" not in doc["env"]
     assert "ask" not in doc["permissions"] and "allow" not in doc["permissions"]
+    assert not [r for r in doc["permissions"]["deny"] if ".claude-hr" in r]
 
 
 def test_strict_profile_refuses_risky_git_instead_of_asking(sandbox, monkeypatch):

@@ -48,6 +48,8 @@ TAMPER_ASK = [
     "Bash(claude-hr-ctl verify trust*)",
     "Bash(claude-hr ctl verify trust*)",
 ]
+# claude-hr's own state holds the verify trust record and the gate counters: Claude never needs to edit it.
+STATE_DENY = ["Edit(~/.claude-hr/state/**)", "Write(~/.claude-hr/state/**)"]
 # Read-only GitHub CLI calls used by the hr-gh skill. Pre-approving reads only; anything that writes still prompts.
 GH_READONLY_ALLOW = [
     "Bash(gh issue view *)",
@@ -100,6 +102,8 @@ def build(
         doc["permissions"] = {"deny": SECRET_READ_DENY + SECRET_BASH_DENY}
     if bool(cfg.get("gates.protect_config", True)):
         doc.setdefault("permissions", {})["ask"] = list(TAMPER_ASK)
+        deny = doc.setdefault("permissions", {}).setdefault("deny", [])
+        deny.extend(r for r in STATE_DENY if r not in deny)
     if bool(cfg.get("github.readonly_allow", True)):
         doc.setdefault("permissions", {})["allow"] = list(GH_READONLY_ALLOW)
 

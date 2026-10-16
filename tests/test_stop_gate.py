@@ -18,6 +18,7 @@ class Fakes:
 
     def __init__(self):
         self.tree = "A"
+        self.trust = "trusted"
         self.fmt_calls = []
         self.gate_calls = []
         self.formatted = []
@@ -28,6 +29,9 @@ class Fakes:
 
     def fingerprint(self, root):
         return f"fp-{self.tree}"
+
+    def trust_state(self, root, state_dir):
+        return self.trust
 
     def format_changed(self, root, **kw):
         self.fmt_calls.append(kw)
@@ -53,6 +57,7 @@ def fakes(sandbox, monkeypatch):
     f = Fakes()
     verify = types.ModuleType("claude_hr.verify")
     verify.fingerprint, verify.gate = f.fingerprint, f.gate
+    verify.trust_state = f.trust_state
     fmt = types.ModuleType("claude_hr.fmt")
     fmt.format_changed = f.format_changed
     for name, mod in (("verify", verify), ("fmt", fmt)):
@@ -131,6 +136,24 @@ def test_a_blocked_tree_is_looked_at_again_even_if_nothing_changed(fakes, repo):
     assert stop_gate.handle(payload(repo)) is None
 
 
+def test_trusting_the_recipe_reruns_the_gate_even_if_no_file_changed(fakes, repo):
+    fakes.trust = "untrusted"
+    fakes.gate_result = NS(action="skip", reason="not trusted", results=[])
+    assert stop_gate.handle(payload(repo)) is None
+    assert stop_gate.handle(payload(repo)) is None  # still untrusted, same tree: idle
+    assert len(fakes.gate_calls) == 1
+    fakes.trust = "trusted"  # the user ran `verify trust`; nothing else changed
+    stop_gate.handle(payload(repo))
+    assert len(fakes.gate_calls) == 2
+
+
+def test_an_error_is_not_remembered_so_it_is_retried(fakes, repo):
+    fakes.gate_result = NS(action="error", reason="tool missing", results=[])
+    stop_gate.handle(payload(repo))
+    stop_gate.handle(payload(repo))
+    assert len(fakes.gate_calls) == 2
+
+
 def test_stop_hook_active_still_evaluates_because_the_gate_has_its_own_cap(fakes, repo):
     stop_gate.handle(payload(repo, stop_hook_active=True))
     assert len(fakes.gate_calls) == 1
@@ -187,6 +210,7 @@ def test_config_values_reach_the_modules(fakes, repo, monkeypatch):
         stop_gate.handle(payload(repo))
     assert fakes.fmt_calls[0]["max_files"] == 7 and fakes.fmt_calls[0]["clean_gate"] is False
     assert fakes.gate_calls[0]["max_blocks"] == 5 and fakes.gate_calls[0]["tier"] == "full"
+    assert fakes.gate_calls[0]["test_guard"] is True
 
 
 def test_run_prints_json_only_when_blocking(fakes, repo, monkeypatch, capsys):
