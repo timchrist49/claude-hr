@@ -1,0 +1,3 @@
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod

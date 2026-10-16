@@ -1,0 +1,4 @@
+# Default owner for everything; the last matching pattern wins, so add narrower rules below.
+# A user repository uses @username. An organization repository needs @org/team-name
+# (a bare organization name is not a valid owner).
+* @{{owner}}

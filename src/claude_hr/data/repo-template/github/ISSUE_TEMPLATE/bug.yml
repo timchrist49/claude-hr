@@ -1,0 +1,43 @@
+name: Bug report
+description: Something does not work as documented or as expected
+title: "[bug] "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Exact commands and exact error text are worth more than a description.
+        Do not paste secrets, tokens or personal data.
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What you did, what you expected, and what happened instead.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to reproduce
+      description: The smallest sequence of commands or actions that triggers it.
+      placeholder: |
+        1. Run ...
+        2. Then ...
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Version or commit
+      description: Output of the version command, or the commit SHA.
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: OS, runtime and tool versions, and anything unusual about the setup.
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs and output
+      description: Relevant output only. Remove secrets first.
+      render: text

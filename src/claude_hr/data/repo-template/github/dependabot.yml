@@ -1,0 +1,6 @@
+# Version updates: one grouped pull request per ecosystem per week for minor and patch bumps.
+# The cooldown waits 7 days after a release before proposing it, so a compromised or yanked release is usually caught
+# first. Security updates are separate and are not delayed.
+version: 2
+updates:
+{{ecosystems_block}}
