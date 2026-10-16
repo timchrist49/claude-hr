@@ -112,6 +112,112 @@ def test_every_skill_but_one_is_manual_only():
         assert bool(manual) == (name not in MODEL_INVOKED_SKILLS), name
 
 
+# What a skill may pre-approve (its `allowed-tools` skips the permission prompt while the skill is active, so an injected
+# agent inherits it). Only verbs that read state, or run the repository's own checks (`verify run` refuses an untrusted
+# recipe from an agent shell). Never: config, setup, update, uninstall, cleanup, schedule, shim, wt, workflows,
+# init-repo, creds, verify trust/untrust/init, monitor, job.
+READ_ONLY_CTL_VERBS = {
+    "status",
+    "doctor",
+    "usage",
+    "plugins audit",
+    "plugins list",
+    "claudemd lint",
+    "skills",
+    "footprint",
+    "trail",
+    "audit",
+    "verify status",
+    "verify run",
+    "fmt --check",
+}
+READ_ONLY_GH = {"gh issue view", "gh issue list", "gh pr view", "gh pr diff", "gh pr checks"}
+
+
+def allowed_tools_problems(value: str) -> list[str]:
+    """Why a skill's `allowed-tools` line is broader than a fixed read-only command prefix (empty = fine)."""
+    problems = []
+    leftover = re.sub(r"Bash\([^)]*\)", "", value).strip()
+    if leftover:
+        problems.append(f"not a Bash(<prefix> *) entry: {leftover!r}")
+    for entry in re.findall(r"Bash\(([^)]*)\)", value):
+        if not entry.endswith(" *") or re.search(r"[*?;&|<>`$()]", entry[:-2]):
+            problems.append(f"Bash({entry}) is not a plain `<command prefix> *` pattern")
+            continue
+        prefix = entry[:-2]
+        if prefix.startswith("claude-hr-ctl "):
+            if prefix[len("claude-hr-ctl ") :] not in READ_ONLY_CTL_VERBS:
+                problems.append(
+                    f"Bash({entry}) pre-approves a verb that is not on the read-only list"
+                )
+        elif prefix not in READ_ONLY_GH:
+            problems.append(f"Bash({entry}) is not a read-only claude-hr-ctl or gh command")
+    return problems
+
+
+def test_allowed_tools_check_rejects_broad_grants():
+    for bad in (
+        "Bash(claude-hr-ctl *)",
+        "Bash(*)",
+        "Bash",
+        "Write Edit",
+        "Bash(claude-hr-ctl config set *)",
+        "Bash(claude-hr-ctl config *)",
+        "Bash(claude-hr-ctl verify trust *)",
+        "Bash(claude-hr-ctl status *) Bash(claude-hr-ctl update *)",
+        "Bash(claude-hr-ctl status)",
+        "Bash(claude-hr-ctl status; rm -rf * *)",
+        "Bash(gh pr create *)",
+        "Bash(gh api *)",
+        "Bash(gh *)",
+    ):
+        assert allowed_tools_problems(bad), bad
+    for good in (
+        "",
+        "Bash(claude-hr-ctl status *) Bash(claude-hr-ctl doctor *)",
+        "Bash(claude-hr-ctl fmt --check *)",
+        "Bash(gh issue view *) Bash(gh pr checks *)",
+    ):
+        assert not allowed_tools_problems(good), good
+
+
+def test_every_skills_allowed_tools_is_an_explicit_read_only_list():
+    """hr-status once pre-approved `Bash(claude-hr-ctl *)`: after /hr-core:hr-status a prompt-injected agent could run
+    `config set`, `update` or `setup` without a prompt."""
+    seen = 0
+    for md in (ROOT / "plugins").rglob("SKILL.md"):
+        m = re.search(r"(?m)^allowed-tools:[ ]*(.*)$", skill_frontmatter(md))
+        if not m:
+            continue
+        seen += 1
+        assert not allowed_tools_problems(m.group(1)), (
+            md.parent.name,
+            allowed_tools_problems(m.group(1)),
+        )
+    assert seen >= 4, "the skills that pre-approve commands were not found"
+
+
+def test_hr_status_pre_approves_exactly_status_and_doctor():
+    fm = skill_frontmatter(ROOT / "plugins" / "hr-core" / "skills" / "hr-status" / "SKILL.md")
+    tools = re.search(r"(?m)^allowed-tools:[ ]*(.*)$", fm).group(1)
+    assert tools == "Bash(claude-hr-ctl status *) Bash(claude-hr-ctl doctor *)"
+
+
+def test_manual_only_skills_do_not_tell_the_model_to_start_each_other():
+    """The Skill tool refuses a skill with disable-model-invocation, so `Then run /hr-core:hr-done` addressed to the model
+    is dead text (it falls back to ad-hoc commands without the skill's allowed-tools or its untrusted-data recipe).
+    A reference must address the user (ask / tell / they) or only point at the skill (see)."""
+    reference = re.compile(r"/hr-core:hr-[a-z-]+")
+    addressed = re.compile(r"(?i)\b(ask|tell|user|they|see)\b")
+    for md in (ROOT / "plugins").rglob("SKILL.md"):
+        body = md.read_text(encoding="utf-8").split("---", 2)[2]
+        for line in body.splitlines():
+            if reference.search(line):
+                assert addressed.search(line), (
+                    f"{md.parent.name}: tells the model to start a skill: {line!r}"
+                )
+
+
 def test_skill_descriptions_are_short_and_calm():
     """Listed descriptions cost tokens on every turn, and Claude 5 over-triggers on shouted instructions."""
     for md in (ROOT / "plugins").rglob("SKILL.md"):

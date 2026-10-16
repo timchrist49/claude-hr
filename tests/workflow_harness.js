@@ -10,9 +10,11 @@ const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor;
 
 const logs = [];
 const calls = [];
+const prompts = [];
 const agent = async (prompt, opts = {}) => {
   const label = String(opts.label || '');
   calls.push(label);
+  prompts.push({ label, prompt, agentType: opts.agentType || null, isolation: opts.isolation || null });
   if (label === 'scope') {
     if (scenario === 'empty') return { base: 'origin/main', files: [], summary: '', empty: true };
     return { base: 'origin/main', files: ['a.py', 'b.py'], summary: 'adds a feature', empty: false };
@@ -45,5 +47,5 @@ const pipeline = async (items, ...stages) => Promise.all(items.map(async (item, 
 (async () => {
   const run = new AsyncFunction('args', 'agent', 'parallel', 'pipeline', 'log', 'phase', 'budget', 'workflow', src);
   const result = await run(argsIn, agent, parallel, pipeline, m => logs.push(m), () => {}, { total: null }, null);
-  console.log(JSON.stringify({ result, logs, calls }));
+  console.log(JSON.stringify({ result, logs, calls, prompts }));
 })().catch(e => { console.error(e.stack || String(e)); process.exit(1); });

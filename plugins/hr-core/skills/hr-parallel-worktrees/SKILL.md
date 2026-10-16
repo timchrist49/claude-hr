@@ -1,6 +1,6 @@
 ---
 name: hr-parallel-worktrees
-description: Run several independent changes in parallel using git worktrees and background sessions. Use when the user wants multiple separate tasks or branches handled at the same time.
+description: Run several independent changes in parallel using git worktrees and background sessions. Run it for multiple separate tasks or branches at the same time.
 disable-model-invocation: true
 ---
 Only parallelize work that does not touch the same files. If tasks depend on each other, do them in order.
