@@ -10,14 +10,74 @@ import hashlib
 import json
 import os
 import time
+from contextlib import contextmanager
 from pathlib import Path
 
 from . import paths
 
 MAX_STR = 120  # no free text: names and short reasons only
-MAX_LINE = (
-    3500  # one O_APPEND write below the pipe/page size stays intact when two gates finish together
-)
+MAX_LINE = 3500  # one record is one write: small enough that nothing splits it
+# how long an append waits for another process's append before it goes ahead unlocked
+LOCK_WAIT_S = 1.0
+
+
+def _try_lock(fd: int) -> bool:
+    """Take an exclusive lock on byte 0 of the lock file without blocking. Owned by the open file, so the OS releases it
+    when the process dies: there is never a stale lock to clean up."""
+    try:
+        if os.name == "nt":
+            import msvcrt
+
+            os.lseek(fd, 0, 0)
+            msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return True
+    except (OSError, ImportError):
+        return False
+
+
+def _unlock(fd: int) -> None:
+    try:
+        if os.name == "nt":
+            import msvcrt
+
+            os.lseek(fd, 0, 0)
+            msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+        # POSIX: closing the descriptor releases the flock
+    except (OSError, ImportError):
+        pass
+
+
+@contextmanager
+def _append_lock(target: Path):
+    """Serialise appenders of one month file across processes, then yield (True when the lock is held).
+
+    O_APPEND makes a single write atomic on POSIX, but on Windows the C runtime emulates it with seek-then-write, so two
+    gates that finish together lose or overwrite each other's record. The lock is best effort and fails open: after
+    LOCK_WAIT_S (or if the lock file cannot be used at all) the caller appends anyway, as it did before the lock existed."""
+    fd = None
+    held = False
+    try:
+        flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_BINARY", 0)
+        fd = os.open(target.with_suffix(".lock"), flags, 0o600)
+        deadline = time.monotonic() + LOCK_WAIT_S
+        while not (held := _try_lock(fd)) and time.monotonic() < deadline:
+            time.sleep(0.002)
+    except OSError:
+        pass
+    try:
+        yield held
+    finally:
+        if fd is not None:
+            if held:
+                _unlock(fd)
+            try:
+                os.close(fd)
+            except OSError:
+                pass
 
 
 def audit_dir() -> Path:
@@ -56,11 +116,12 @@ def record(event: str, **fields) -> bool:
         paths.make_private(d)
         f = d / f"{time.strftime('%Y-%m')}.jsonl"
         flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND | getattr(os, "O_NOFOLLOW", 0)
-        fd = os.open(f, flags | getattr(os, "O_BINARY", 0), 0o600)
-        try:
-            os.write(fd, (line + "\n").encode("utf-8"))
-        finally:
-            os.close(fd)
+        with _append_lock(f):  # fails open: an unobtainable lock never costs the record
+            fd = os.open(f, flags | getattr(os, "O_BINARY", 0), 0o600)
+            try:
+                os.write(fd, (line + "\n").encode("utf-8"))
+            finally:
+                os.close(fd)
         return True
     except Exception:
         return False
@@ -103,4 +164,13 @@ def prune(keep_days: int = 90) -> int:
                 removed += 1
         except OSError:
             continue
+    try:  # the append lock files of month files that are gone (an old lock whose month file exists is still in use)
+        for lk in audit_dir().glob("*.lock"):
+            try:
+                if not lk.with_suffix(".jsonl").exists() and lk.stat().st_mtime < cutoff:
+                    lk.unlink()
+            except OSError:
+                continue
+    except OSError:
+        pass
     return removed

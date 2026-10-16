@@ -12,6 +12,7 @@ from pathlib import Path
 
 from . import (
     __version__,
+    claude_setup,
     claudemd,
     creds,
     doctor,
@@ -124,6 +125,8 @@ def cmd_setup(a, cfg) -> int:
             )
         _print_step(st)
         failed += 0 if st.ok else 1
+    # outcome of the steps that make up the managed baseline (see applied-version.json)
+    baseline_ok: dict[str, bool] = {}
     for name, fn in (
         ("settings", lambda: setup.apply_settings(force=a.force)),
         ("claude-md", setup.sync_claude_md),
@@ -134,10 +137,12 @@ def cmd_setup(a, cfg) -> int:
             if name in {"mcp", "plugins"} and not claude:
                 out(f"[ERR] {name}: claude not found - install Claude Code first")
                 failed += 1
+                baseline_ok[name] = False
                 continue
             st = fn()
             _print_step(st)
             failed += 0 if st.ok else 1
+            baseline_ok[name] = st.ok
     if "schedule" in steps and not a.dry_run:
         for m in schedule.install(cfg):
             line, bad = _schedule_line(m)
@@ -149,6 +154,17 @@ def cmd_setup(a, cfg) -> int:
             st_file,
             {"version": __version__, "ts": time.time(), "profile": cfg.get("plugins.profile")},
         )
+        # Remember which release this baseline came from, so doctor and the daily update job can tell when a newer release
+        # (installed unattended) has not been applied yet. Only when the settings step ran and every baseline step that ran
+        # succeeded: a half-applied baseline must stay visible.
+        if "settings" in baseline_ok and all(
+            baseline_ok[n] for n in claude_setup.BASELINE_STEPS if n in baseline_ok
+        ):
+            try:
+                claude_setup.record_applied_version()
+            except OSError as exc:
+                out(f"[ERR] could not record the applied version: {exc}")
+                failed += 1
     out(
         "\nDone. Open a NEW terminal, then run: claude-hr"
         if not failed
@@ -181,9 +197,13 @@ def cmd_uninstall(a, cfg) -> int:
         line, bad = _schedule_line(m)
         out(line)
         sched_failed = sched_failed or bad
-    _print_step(setup.revert_settings())
-    _print_step(setup.remove_claude_md())
-    _print_step(setup.unregister_mcp())
+    step_failed = False
+    # a step that cannot run (an unparsable settings.json or ~/.claude.json is never rewritten) is reported and skipped: the
+    # rest of the uninstall must still happen, and the exit status says it was not complete
+    reverted = setup.revert_settings()
+    for st in (reverted, setup.remove_claude_md(), setup.unregister_mcp()):
+        _print_step(st)
+        step_failed = step_failed or not st.ok
     if claude and not a.dry_run:
         for pid in ("hr-core@claude-hr",):
             procutil.run(
@@ -196,22 +216,34 @@ def cmd_uninstall(a, cfg) -> int:
             (paths.bin_dir() / f).unlink(missing_ok=True)
         if a.purge:
             procutil.run(["uv", "tool", "uninstall", "headroom-ai"], timeout=300)
-            _rmtree_force(paths.hr_home())
-            if paths.hr_home().exists():
+            if not reverted.ok:
+                # the ownership record in state/ is what lets a later uninstall remove exactly the keys claude-hr added
                 out(
-                    f"[warn] could not delete everything under {paths.hr_home()} (files in use?); remove it by hand"
+                    f"[warn] {paths.hr_home()} was kept: it holds the record needed to revert settings.json "
+                    "(fix that file, then run `claude-hr-ctl uninstall --purge` again)"
                 )
             else:
-                out("[ok ] purged ~/.claude-hr and uninstalled Headroom")
-    out(
-        "Uninstalled managed configuration. Your own settings, plugins and CLAUDE.md content were left untouched."
-    )
+                _rmtree_force(paths.hr_home())
+                if paths.hr_home().exists():
+                    out(
+                        f"[warn] could not delete everything under {paths.hr_home()} (files in use?); remove it by hand"
+                    )
+                else:
+                    out("[ok ] purged ~/.claude-hr and uninstalled Headroom")
+    if step_failed:
+        out(
+            "Uninstall is INCOMPLETE: a step above is marked ERR (it was skipped, everything else ran). Fix what it "
+            "names and run `claude-hr-ctl uninstall` again; your own settings, plugins and CLAUDE.md content were left untouched."
+        )
+    else:
+        out(
+            "Uninstalled managed configuration. Your own settings, plugins and CLAUDE.md content were left untouched."
+        )
     if sched_failed:
         out(
             "[warn] the scheduled jobs could not be removed (see above); remove them with `claude-hr-ctl schedule remove` or in Task Scheduler / systemd"
         )
-        return 1
-    return 0
+    return 1 if (step_failed or sched_failed) else 0
 
 
 # ---------------------------------------------------------------------------------------------
@@ -823,9 +855,13 @@ def cmd_fmt(a, cfg) -> int:
     if not a.paths and not a.changed:
         found = fmt.describe(root, trusted=trusted)
         if not found:
+            # `describe` lists only a formatter that is configured AND installed, so an empty answer does not mean the repo
+            # has no configuration: say both, or the user is told "none configured" about a repo that names ruff
             out(
-                "no formatter is configured in this repository (claude-hr only uses one the repo already sets up: "
-                "ruff/black, prettier/biome, gofmt, rustfmt)"
+                "no formatter is configured and installed in this repository (claude-hr only uses one the repo already "
+                "configures AND that is installed: ruff/black, prettier/biome, gofmt, rustfmt). If the repo does configure "
+                "one (a [tool.ruff] table in pyproject.toml, a prettier config, go.mod, Cargo.toml ...) but nothing is "
+                "listed here, its tool is not installed: put it on PATH, in .venv or in node_modules/.bin"
             )
             return 0
         for d in found:
@@ -1069,8 +1105,13 @@ def cmd_footprint(a, cfg) -> int:
         out("Claude Code not found")
         return 1
     r = procutil.run([str(claude), "plugin", "list", "--json"], timeout=60)
+    if r.returncode != 0 or not (r.stdout or "").strip():
+        # a timeout (124), an old claude without --json, a crash: nothing was measured, so never print "0 tokens, budget OK"
+        why = (r.stderr or "").strip()[:200]
+        out(f"`claude plugin list --json` failed (exit {r.returncode}){': ' + why if why else ''}")
+        return 1
     try:
-        listing = json.loads(r.stdout or "[]")
+        listing = json.loads(r.stdout)
     except ValueError:
         out("could not read `claude plugin list --json`")
         return 1

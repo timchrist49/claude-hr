@@ -1265,3 +1265,55 @@ def test_hook_binary_on_path(tmp_path, monkeypatch):
         assert footprint.hook_binary_on_path("definitely-not-installed-xyz") is None
         m.setenv("PATH", str(tmp_path / "empty"))
         assert footprint.hook_binary_on_path() is None
+
+
+# ---- `claude-hr-ctl footprint`: a failed measurement is an error, never "0 tokens, budget OK" ----------------------
+@pytest.fixture
+def ctl_with_claude(sandbox, monkeypatch):
+    from claude_hr import ctl
+
+    monkeypatch.setattr(ctl.procutil, "find_claude", lambda *a, **k: Path("claude"))
+    return ctl
+
+
+def _plugin_list(monkeypatch, ctl, rc, stdout, stderr=""):
+    calls = []
+
+    def fake_run(cmd, **kw):
+        calls.append(list(cmd[1:]))
+        return subprocess.CompletedProcess(cmd, rc, stdout, stderr)
+
+    monkeypatch.setattr(ctl.procutil, "run", fake_run)
+    return calls
+
+
+@pytest.mark.parametrize(
+    "rc, stdout, stderr",
+    [
+        (1, "", "error: unknown option '--json'"),  # claude too old for --json
+        (124, "", ""),  # procutil.run's timeout
+        (127, "", "claude: not found on PATH"),
+        (0, "", ""),  # exited 0 but printed nothing
+        (1, "[]", "boom"),  # a non-zero exit is a failure even when it printed something parsable
+    ],
+)
+def test_footprint_reports_a_failed_plugin_list_and_exits_one(
+    ctl_with_claude, monkeypatch, capsys, rc, stdout, stderr
+):
+    calls = _plugin_list(monkeypatch, ctl_with_claude, rc, stdout, stderr)
+    assert ctl_with_claude._run(["footprint", "--strict"]) == 1
+    text = capsys.readouterr().out
+    assert calls == [["plugin", "list", "--json"]]
+    assert "failed" in text and "budget" not in text and "0 tokens" not in text
+
+
+def test_footprint_still_prints_the_table_when_the_list_is_fine(
+    ctl_with_claude, monkeypatch, capsys
+):
+    _plugin_list(monkeypatch, ctl_with_claude, 0, "[]")
+    assert (
+        ctl_with_claude._run(["footprint", "--strict"]) == 0
+    )  # no plugins is a measurement, not a failure
+    assert "No enabled plugins found" in capsys.readouterr().out
+    _plugin_list(monkeypatch, ctl_with_claude, 0, "this is not json")
+    assert ctl_with_claude._run(["footprint"]) == 1

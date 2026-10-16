@@ -754,3 +754,174 @@ def test_a_reinstall_that_never_finished_is_retried(managed_repo, monkeypatch, s
     # an up-to-date tool is left alone
     monkeypatch.setattr("claude_hr.__version__", "0.2.0")
     assert updater.Updater(config.load()).update_self().detail == ""
+
+
+# ---- after an unattended self-update the new release's baseline must be applied (wiring review) ------------------------
+@pytest.fixture
+def upgraded_machine(sandbox, monkeypatch):
+    """A machine `setup` ran on under an older release: install.json exists, applied-version.json does not. The claude CLI
+    is faked at the one place ClaudeSetup calls it, and nothing that installs Headroom or touches the scheduler may run."""
+    from claude_hr import claude_setup, schedule
+    from claude_hr.headroom import Headroom
+
+    calls = []
+
+    def fake_claude(self, *args, timeout=120):
+        calls.append(args)
+        listing = args[:3] == ("plugin", "list", "--json") or args[:3] == (
+            "plugin",
+            "marketplace",
+            "list",
+        )
+        return subprocess.CompletedProcess(args, 0, "[]" if listing else "", "")
+
+    def forbidden(*a, **k):
+        raise AssertionError(
+            "re-applying the baseline must not install Headroom or touch the scheduler"
+        )
+
+    monkeypatch.setattr(claude_setup.ClaudeSetup, "_claude", fake_claude)
+    monkeypatch.setattr(Headroom, "install", forbidden)
+    monkeypatch.setattr(schedule, "install", forbidden)
+    state = updater.paths.state_dir()
+    state.mkdir(parents=True, exist_ok=True)
+    (state / "install.json").write_text(json.dumps({"version": "0.1.3"}), encoding="utf-8")
+    u = updater.Updater(config.load())
+    u.claude = Path("/fake/claude")
+    u.calls = calls
+    return u
+
+
+def test_reapply_baseline_applies_settings_claude_md_and_plugins_once(upgraded_machine):
+    from claude_hr import __version__, claude_setup, paths
+
+    u = upgraded_machine
+    assert claude_setup.baseline_is_stale() == (True, None)
+    res = u.reapply_baseline()
+    assert res.component == "baseline" and res.action == "updated", res.detail
+    assert (
+        "settings ok" in res.detail and "claude-md ok" in res.detail and "plugins ok" in res.detail
+    )
+    doc = json.loads(paths.claude_settings().read_text(encoding="utf-8"))
+    assert (
+        doc["env"]["ENABLE_STOP_REVIEW"] == "0"
+    )  # the 0.2.0 baseline that doctor used to report as fine
+    assert any(
+        r.startswith("Edit(") and r.endswith("/state/**)") for r in doc["permissions"]["deny"]
+    )
+    assert "CLAUDE-HR:BEGIN" in paths.claude_user_md().read_text(encoding="utf-8")
+    installed = [c[2] for c in u.calls if c[:2] == ("plugin", "install")]
+    assert "hr-gates@claude-hr" in installed
+    assert claude_setup.applied_version() == __version__
+    u.calls.clear()
+    assert u.reapply_baseline() is None  # the next run finds nothing to do
+    assert u.calls == []
+
+
+def test_reapply_baseline_does_nothing_on_a_dry_run_or_a_machine_setup_never_ran_on(
+    upgraded_machine, sandbox
+):
+    from claude_hr import claude_setup, paths
+
+    u = upgraded_machine
+    u.dry = True
+    assert u.reapply_baseline() is None
+    assert not paths.claude_settings().exists() and claude_setup.applied_version() is None
+    u.dry = False
+    (updater.paths.state_dir() / "install.json").unlink()
+    assert (
+        u.reapply_baseline() is None
+    )  # never set up: this is not where the baseline is first applied
+    assert not paths.claude_settings().exists()
+
+
+def test_reapply_baseline_that_fails_is_reported_retried_and_never_raises(
+    upgraded_machine, monkeypatch
+):
+    from claude_hr import claude_setup, paths
+
+    u = upgraded_machine
+    paths.claude_settings().write_text("{ not json", encoding="utf-8")
+    res = u.reapply_baseline()
+    assert res.action == "failed" and "settings FAILED" in res.detail and "retry" in res.detail
+    assert claude_setup.applied_version() is None  # not recorded: the next update run tries again
+    assert paths.claude_settings().read_text(encoding="utf-8") == "{ not json"
+    paths.claude_settings().write_text("{}", encoding="utf-8")
+    u.claude = (
+        None  # Claude Code missing: plugins cannot be synced, so the baseline is not complete
+    )
+    res = u.reapply_baseline()
+    assert res.action == "failed" and "plugins FAILED" in res.detail
+    assert claude_setup.applied_version() is None
+    u.claude = Path("/fake/claude")
+    monkeypatch.setattr(
+        claude_setup.ClaudeSetup,
+        "sync_claude_md",
+        lambda self: (_ for _ in ()).throw(RuntimeError("disk full")),
+    )
+    res = u.reapply_baseline()
+    assert res.action == "failed" and "RuntimeError" in res.detail and "disk full" in res.detail
+
+
+def test_a_full_update_run_starts_with_the_baseline_and_a_partial_one_does_not(
+    upgraded_machine, monkeypatch
+):
+    u = upgraded_machine
+    for name in ("update_claude", "update_headroom", "update_self", "update_plugins"):
+        comp = name.split("_", 1)[1]
+        monkeypatch.setattr(u, name, lambda comp=comp: updater.Result(comp))
+    rep = u.run(["plugins"])
+    assert [r.component for r in rep.results] == [
+        "plugins"
+    ]  # `update --only plugins` is not an upgrade of the config
+    rep = u.run()
+    assert [r.component for r in rep.results] == [
+        "baseline",
+        "claude",
+        "headroom",
+        "self",
+        "plugins",
+    ]
+    assert rep.results[0].action == "updated" and rep.ok
+    rep = u.run()  # applied now: no row at all
+    assert [r.component for r in rep.results] == ["claude", "headroom", "self", "plugins"]
+    log = (updater.paths.logs_dir() / "update.jsonl").read_text(encoding="utf-8")
+    assert '"component": "baseline"' in log
+
+
+def test_a_failed_baseline_makes_the_update_run_fail_but_does_not_stop_it(
+    upgraded_machine, monkeypatch
+):
+    from claude_hr import paths
+
+    u = upgraded_machine
+    paths.claude_settings().write_text("{ not json", encoding="utf-8")
+    for name in ("update_claude", "update_headroom", "update_self", "update_plugins"):
+        comp = name.split("_", 1)[1]
+        monkeypatch.setattr(u, name, lambda comp=comp: updater.Result(comp))
+    rep = u.run()
+    assert [r.component for r in rep.results][:2] == ["baseline", "claude"] and len(
+        rep.results
+    ) == 5
+    assert not rep.ok
+
+
+def test_the_scheduled_update_job_reapplies_the_baseline_at_its_start(
+    upgraded_machine, monkeypatch
+):
+    from claude_hr import claude_setup, ctl, paths
+
+    monkeypatch.setattr(updater.procutil, "find_claude", lambda *a, **k: Path("/fake/claude"))
+    for name in ("update_claude", "update_headroom", "update_self", "update_plugins"):
+        comp = name.split("_", 1)[1]
+        monkeypatch.setattr(updater.Updater, name, lambda self, comp=comp: updater.Result(comp))
+    assert ctl._run(["job", "update"]) == 0
+    line = (paths.logs_dir() / "job-update.log").read_text(encoding="utf-8")
+    assert "rc=0" in line and line.index("baseline") < line.index("claude ")
+    assert claude_setup.baseline_is_stale()[0] is False
+    # auto_apply = false only reports: nothing may be written
+    (paths.state_dir() / "applied-version.json").unlink()
+    paths.claude_settings().unlink()
+    monkeypatch.setenv("CLAUDE_HR_UPDATES__AUTO_APPLY", "false")
+    assert ctl._run(["job", "update"]) in (0, 1)
+    assert not paths.claude_settings().exists()

@@ -11,6 +11,11 @@ Rules for what may appear here (learned the hard way):
 
 from __future__ import annotations
 
+import os
+import re
+from pathlib import Path
+
+from . import paths
 from .config import Config
 
 # Secret-bearing paths Claude should never read through its file tools. `.env.example` stays readable.
@@ -48,8 +53,72 @@ TAMPER_ASK = [
     "Bash(claude-hr-ctl verify trust*)",
     "Bash(claude-hr ctl verify trust*)",
 ]
-# claude-hr's own state holds the verify trust record and the gate counters: Claude never needs to edit it.
-STATE_DENY = ["Edit(~/.claude-hr/state/**)", "Write(~/.claude-hr/state/**)"]
+
+# claude-hr's own files: state/ holds the verify trust record and the gate counters (Claude never needs to edit it: denied)
+# and config.toml can switch the gates, the repo-tool trust and the launch flags (a person edits it: Claude asks first).
+# The rules are built from the home that is in use (CLAUDE_HR_HOME), plus the default ~/.claude-hr, so a relocated home is
+# protected and an install whose runtime falls back to the default one still is.
+DEFAULT_HOME_RULE = "~/.claude-hr"
+
+
+def _relative_to_home(path: str) -> str | None:
+    """`path` below the user's home directory as a forward-slash relative path ("" for the home itself), else None."""
+    home = os.path.abspath(paths.home())
+    a, h = os.path.normcase(path), os.path.normcase(home)
+    if a == h:
+        return ""
+    prefix = h.rstrip("\\/") + os.sep
+    if a.startswith(prefix):
+        return path[len(prefix) :].replace("\\", "/").rstrip("/")
+    return None
+
+
+def rule_path(p: Path | str) -> str:
+    """How a Claude Code permission rule spells the absolute path `p`: `~/rel` below the user's home, otherwise
+    `//abs/path` (Windows: `//c/rest`, the POSIX form Claude matches against), always with forward slashes."""
+    ap = os.path.abspath(p)
+    rel = _relative_to_home(ap)
+    if rel is not None:
+        return f"~/{rel}" if rel else "~"
+    posix = ap.replace("\\", "/")
+    drive = re.match(r"([A-Za-z]):/(.*)", posix)
+    if drive:
+        return f"//{drive.group(1).lower()}/{drive.group(2).rstrip('/')}"
+    return "//" + posix.lstrip("/").rstrip("/")
+
+
+def _home_bases() -> list[str]:
+    bases = [rule_path(paths.hr_home())]
+    if DEFAULT_HOME_RULE not in bases:
+        bases.append(DEFAULT_HOME_RULE)
+    return bases
+
+
+def state_deny() -> list[str]:
+    """Edit/Write of claude-hr's state directory is denied."""
+    return [f"{tool}({b}/state/**)" for b in _home_bases() for tool in ("Edit", "Write")]
+
+
+def config_ask() -> list[str]:
+    """Edit/Write of claude-hr's config.toml asks first."""
+    return [f"{tool}({b}/config.toml)" for b in _home_bases() for tool in ("Edit", "Write")]
+
+
+# security.stop_review: what counts as "off". The value comes from TOML or `config set`, so `false` arrives as a bool and `0` as
+# an int; compare case-insensitively on the text. Anything else that is not a known "leave the plugin as shipped" word is
+# reported by doctor (a typo must not silently keep a per-turn model review running).
+STOP_REVIEW_OFF = frozenset({"off", "false", "0", "no", "disabled"})
+STOP_REVIEW_PLUGIN_DEFAULT = frozenset({"plugin-default", "on", "true", "1", "yes", "enabled"})
+
+
+def stop_review_mode(cfg: Config) -> str:
+    """How security.stop_review reads: 'off', 'plugin-default' or 'unknown' (not a word we know)."""
+    value = str(cfg.get("security.stop_review", "off")).strip().lower()
+    if value in STOP_REVIEW_OFF:
+        return "off"
+    return "plugin-default" if value in STOP_REVIEW_PLUGIN_DEFAULT else "unknown"
+
+
 # Read-only GitHub CLI calls used by the hr-gh skill. Pre-approving reads only; anything that writes still prompts.
 GH_READONLY_ALLOW = [
     "Bash(gh issue view *)",
@@ -85,7 +154,7 @@ def build(
     if process_wrapper:
         # Caps the agent-view background service and its sessions (Linux; ignored on Windows).
         env["CLAUDE_CODE_PROCESS_WRAPPER"] = process_wrapper
-    if str(cfg.get("security.stop_review", "off")) == "off":
+    if stop_review_mode(cfg) == "off":
         # security-guidance's end-of-turn model review (Opus, once per file-changing turn) is the one hidden recurring
         # spend in the standard profile. Its regex layer and its commit/push review stay on; audit before merging with
         # /security-review or `claude-hr-ctl audit`. "plugin-default" leaves the plugin untouched.
@@ -101,9 +170,9 @@ def build(
     if bool(cfg.get("credentials.block_secret_reads", True)):
         doc["permissions"] = {"deny": SECRET_READ_DENY + SECRET_BASH_DENY}
     if bool(cfg.get("gates.protect_config", True)):
-        doc.setdefault("permissions", {})["ask"] = list(TAMPER_ASK)
+        doc.setdefault("permissions", {})["ask"] = [*TAMPER_ASK, *config_ask()]
         deny = doc.setdefault("permissions", {}).setdefault("deny", [])
-        deny.extend(r for r in STATE_DENY if r not in deny)
+        deny.extend(r for r in state_deny() if r not in deny)
     if bool(cfg.get("github.readonly_allow", True)):
         doc.setdefault("permissions", {})["allow"] = list(GH_READONLY_ALLOW)
 

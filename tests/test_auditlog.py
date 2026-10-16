@@ -82,3 +82,95 @@ def test_repo_id_is_stable_and_hides_the_remote(sandbox, tmp_path):
 
 def test_audit_dir_lives_under_the_claude_hr_home(sandbox):
     assert auditlog.audit_dir() == paths.hr_home() / "audit"
+
+
+# ---- concurrent appends --------------------------------------------------------------------------------------------
+_APPENDER = (
+    "import sys, time\n"
+    "from claude_hr import auditlog\n"
+    "start, n, tag = float(sys.argv[1]), int(sys.argv[2]), sys.argv[3]\n"
+    "while time.time() < start:\n"
+    "    pass\n"
+    "bad = 0\n"
+    "for i in range(n):\n"
+    "    if not auditlog.record('gate', tag=tag, i=i, pad='x' * 200):\n"
+    "        bad += 1\n"
+    "sys.exit(1 if bad else 0)\n"
+)
+
+
+def test_concurrent_appends_from_several_processes_lose_nothing(sandbox):
+    """On Windows O_APPEND is emulated (seek, then write), so unserialised appenders overwrote each other: 2-4% of the
+    records of two busy processes were silently lost and a few lines were cut in half."""
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    n_procs, per_proc = 4, 150
+    env = dict(os.environ, PYTHONPATH=str(Path(__file__).resolve().parents[1] / "src"))
+    start = time.time() + 3.0  # every child spins until this instant, so they all append at once
+    procs = [
+        subprocess.Popen(
+            [sys.executable, "-c", _APPENDER, str(start), str(per_proc), f"p{k}"], env=env
+        )
+        for k in range(n_procs)
+    ]
+    assert [p.wait(timeout=180) for p in procs] == [0] * n_procs
+    lines = next(auditlog.audit_dir().glob("*.jsonl")).read_text(encoding="utf-8").splitlines()
+    rows = [json.loads(ln) for ln in lines]  # a torn line would raise here
+    assert len(rows) == n_procs * per_proc
+    for k in range(n_procs):
+        assert sorted(r["i"] for r in rows if r["tag"] == f"p{k}") == list(range(per_proc))
+
+
+def test_the_append_lock_is_released_after_each_record(sandbox):
+    assert auditlog.record("gate", n=1)
+    f = next(auditlog.audit_dir().glob("*.jsonl"))
+    with auditlog._append_lock(f) as held:
+        assert held  # nothing keeps the lock after record() returned
+    assert auditlog.record("gate", n=2)
+
+
+def test_a_lock_that_cannot_be_taken_never_costs_the_record(sandbox, monkeypatch):
+    """Fail open: another process holding the lock for longer than LOCK_WAIT_S must not drop or delay the record forever."""
+    auditlog.record("gate", n=1)
+    f = next(auditlog.audit_dir().glob("*.jsonl"))
+    monkeypatch.setattr(auditlog, "LOCK_WAIT_S", 0.05)
+    with auditlog._append_lock(f) as held:
+        assert held
+        t0 = time.monotonic()
+        assert (
+            auditlog.record("gate", n=2) is True
+        )  # the lock is busy: it waits briefly, then appends anyway
+        assert time.monotonic() - t0 < 5
+    assert [r["n"] for r in auditlog.tail(5)] == [1, 2]
+
+
+def test_an_unusable_lock_file_never_costs_the_record(sandbox, monkeypatch):
+    monkeypatch.setattr(
+        auditlog, "_try_lock", lambda fd: (_ for _ in ()).throw(OSError("no locks here"))
+    )
+    # the failure is inside the helper's own guard path: the record still goes through
+    assert auditlog.record("gate", n=1) is True
+    assert auditlog.tail(1)[0]["n"] == 1
+
+
+def test_prune_removes_the_lock_of_a_pruned_month_but_not_a_live_one(sandbox):
+    auditlog.record("gate", n=1)
+    live = next(auditlog.audit_dir().glob("*.lock"))
+    old_lock = auditlog.audit_dir() / "2020-01.lock"
+    old_lock.write_text("", encoding="utf-8")
+    t = time.time() - 400 * 86400
+    os.utime(old_lock, (t, t))
+    old_log = auditlog.audit_dir() / "2020-02.jsonl"
+    old_log.write_text('{"event":"x"}\n', encoding="utf-8")
+    os.utime(old_log, (t, t))
+    orphaned = auditlog.audit_dir() / "2020-02.lock"
+    orphaned.write_text("", encoding="utf-8")
+    os.utime(orphaned, (t, t))
+    assert auditlog.prune(90) == 1  # only month files are counted
+    assert not old_lock.exists() and not old_log.exists()
+    assert live.exists()
+    assert (
+        not orphaned.exists()
+    )  # its month file was pruned in the same run: the lock is orphaned and old

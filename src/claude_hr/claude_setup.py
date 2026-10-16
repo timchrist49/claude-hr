@@ -7,6 +7,7 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -18,6 +19,50 @@ from .jsonio import JsonFileError, atomic_write_text, backup_file, read_json, wr
 
 BEGIN = "<!-- CLAUDE-HR:BEGIN (managed by claude-hr-ctl; do not edit inside this block) -->"
 END = "<!-- CLAUDE-HR:END -->"
+
+# `setup` writes the version whose managed baseline (settings.json, CLAUDE.md block, plugins) it last applied here. A release
+# that changes the baseline reaches a machine through the unattended self-update only as code: nothing re-applies it, so
+# doctor and the daily update job compare this file with the running version.
+APPLIED_VERSION_FILE = "applied-version.json"
+BASELINE_STEPS = ("settings", "claude-md", "plugins")
+
+
+def applied_version() -> str | None:
+    """The claude-hr version whose baseline was last applied, or None (never recorded: set up by a release before 0.2.0)."""
+    try:
+        data = read_json(paths.state_dir() / APPLIED_VERSION_FILE, {}) or {}
+        value = data.get("version") if isinstance(data, dict) else None
+    except (JsonFileError, OSError):
+        return None
+    return str(value) if value else None
+
+
+def running_version() -> str:
+    # read at call time: the package attribute is what a reinstall (and a test simulating one) changes
+    from . import __version__
+
+    return __version__
+
+
+def record_applied_version() -> None:
+    write_json(
+        paths.state_dir() / APPLIED_VERSION_FILE,
+        {"version": running_version(), "ts": time.time()},
+    )
+
+
+def was_set_up() -> bool:
+    """True once `setup` has run on this machine (it leaves install.json and the settings ownership record)."""
+    d = paths.state_dir()
+    return (d / "install.json").exists() or (d / "settings-merge.json").exists()
+
+
+def baseline_is_stale() -> tuple[bool, str | None]:
+    """(True, version last applied or None) when this machine was set up but not by the claude-hr that is running now."""
+    if not was_set_up():
+        return False, None
+    applied = applied_version()
+    return applied != running_version(), applied
 
 
 @dataclass
@@ -66,22 +111,32 @@ class ClaudeSetup:
         return str(dest)
 
     # ---- settings.json --------------------------------------------------------------------
+    def plan_settings(self, force: bool = False) -> tuple[dict, dict, dict, settings_merge.Report]:
+        """(current settings.json, merged document, new ownership state, report). Raises JsonFileError when settings.json or
+        the ownership state is unparsable. Writes nothing (except the process-wrapper script on a real, non-dry run), so
+        doctor can ask what `setup` would change."""
+        current = read_json(paths.claude_settings(), {}) or {}
+        state = read_json(paths.state_dir() / "settings-merge.json", None)
+        wrapper = self.install_process_wrapper()
+        want, atomic = baseline.build(self.cfg, self.statusline_command(), wrapper)
+        new_doc, new_state, rep = settings_merge.apply_baseline(
+            current, want, state, atomic=atomic, force=force
+        )
+        return current, new_doc, new_state, rep
+
     def apply_settings(self, force: bool = False) -> Step:
         step = Step("settings")
         target = paths.claude_settings()
         state_file = paths.state_dir() / "settings-merge.json"
         try:
-            current = read_json(target, {}) or {}
+            current, new_doc, new_state, rep = self.plan_settings(force)
         except JsonFileError as exc:
             step.ok = False
             step.add(str(exc))
+            step.add(
+                "fix the JSON by hand (claude-hr never overwrites an unparsable file), then re-run setup"
+            )
             return step
-        wrapper = self.install_process_wrapper()
-        want, atomic = baseline.build(self.cfg, self.statusline_command(), wrapper)
-        state = read_json(state_file, None)
-        new_doc, new_state, rep = settings_merge.apply_baseline(
-            current, want, state, atomic=atomic, force=force
-        )
         step.changed = new_doc != current
         step.add(f"{target}: {rep.summary()}")
         for item in rep.kept:
@@ -99,11 +154,21 @@ class ClaudeSetup:
         step = Step("settings-revert")
         target = paths.claude_settings()
         state_file = paths.state_dir() / "settings-merge.json"
-        state = read_json(state_file, None)
-        if not state:
-            step.add("no managed settings recorded")
+        try:
+            state = read_json(state_file, None)
+            if not state:
+                step.add("no managed settings recorded")
+                return step
+            current = read_json(target, {}) or {}
+        except JsonFileError as exc:
+            # never abort the uninstall over this: report it, leave both files exactly as they are, let the rest run
+            step.ok = False
+            step.add(str(exc))
+            step.add(
+                "the managed settings were NOT reverted and the ownership record was kept: fix the JSON by hand, "
+                "then run `claude-hr-ctl uninstall` again (or remove the keys claude-hr added yourself)"
+            )
             return step
-        current = read_json(target, {}) or {}
         new_doc, rep = settings_merge.revert(current, state)
         step.changed = new_doc != current
         step.add(f"reverted: {rep.summary()}")
@@ -111,6 +176,7 @@ class ClaudeSetup:
             if step.changed:
                 write_json(target, new_doc, backup_dir=paths.backups_dir() / "settings")
             state_file.unlink(missing_ok=True)
+            (paths.state_dir() / APPLIED_VERSION_FILE).unlink(missing_ok=True)
         return step
 
     # ---- CLAUDE.md ------------------------------------------------------------------------
@@ -194,8 +260,28 @@ class ClaudeSetup:
         data = read_json(paths.claude_global_json(), {}) or {}
         return data.get("mcpServers", {}) or {}
 
+    def _mcp_records(self, step: Step) -> tuple[dict, dict, Path] | None:
+        """(servers Claude has, servers claude-hr registered, path of the latter), or None after marking `step` failed
+        because ~/.claude.json or our own record is unparsable (neither is ever overwritten)."""
+        managed_file = paths.state_dir() / "mcp-managed.json"
+        try:
+            have = self._registered_mcp()
+            managed = read_json(managed_file, {}) or {}
+        except JsonFileError as exc:
+            step.ok = False
+            step.add(str(exc))
+            step.add(
+                "fix the JSON by hand (claude-hr never overwrites an unparsable file), then re-run"
+            )
+            return None
+        return have, managed, managed_file
+
     def register_mcp(self) -> Step:
         step = Step("mcp")
+        records = self._mcp_records(step)
+        if records is None:
+            return step
+        have, managed, managed_file = records
         h = self.hr.h
         wanted: dict[str, dict] = {}
         if bool(h.get("enabled", True)) and bool(h.get("mcp", True)) and self.hr.binary():
@@ -213,9 +299,6 @@ class ClaudeSetup:
                     else "serena left unpinned (PyPI unreachable): set headroom.serena_version"
                 )
             wanted["serena"] = self.hr.serena_spec()
-        have = self._registered_mcp()
-        managed_file = paths.state_dir() / "mcp-managed.json"
-        managed = read_json(managed_file, {}) or {}
         for name, spec in wanted.items():
             if have.get(name) == spec:
                 step.add(f"{name}: already registered")
@@ -245,9 +328,10 @@ class ClaudeSetup:
     def unregister_mcp(self) -> Step:
         """Remove only servers claude-hr registered itself; a same-named server the user added is left alone."""
         step = Step("mcp-remove")
-        have = self._registered_mcp()
-        managed_file = paths.state_dir() / "mcp-managed.json"
-        managed = read_json(managed_file, {}) or {}
+        records = self._mcp_records(step)
+        if records is None:
+            return step
+        have, managed, managed_file = records
         for name in list(managed):
             if name in have:
                 step.changed = True
@@ -279,12 +363,32 @@ class ClaudeSetup:
                 out.append(p)
         return out
 
+    def effective_plugins(self, plan: dict, profile: str) -> list[str]:
+        """The profile's plugins that `plugins sync` really installs: those from a marketplace whose `requires` flag is off
+        (headroom-snip with headroom.install_plugins = false) are left out. doctor uses the same list, so it never asks
+        for something sync will not do."""
+        gates = {n: m.get("requires") for n, m in plan.get("marketplaces", {}).items()}
+        out = []
+        for spec in self.profile_plugins(plan, profile):
+            req = gates.get(spec.partition("@")[2])
+            if req and not self.cfg.flag(req):
+                continue
+            out.append(spec)
+        return out
+
     def _installed_plugins(self) -> list[dict]:
         r = self._claude("plugin", "list", "--json")
         try:
-            return json.loads(r.stdout) if r.returncode == 0 else []
+            data = json.loads(r.stdout) if r.returncode == 0 else []
         except json.JSONDecodeError:
             return []
+        if isinstance(data, dict):  # some builds wrap the list: {"plugins": [...]}
+            data = data.get("plugins", [])
+        return (
+            [p for p in data if isinstance(p, dict) and isinstance(p.get("id"), str)]
+            if isinstance(data, list)
+            else []
+        )
 
     def _known_marketplaces(self) -> set[str]:
         r = self._claude("plugin", "marketplace", "list", "--json")
@@ -310,6 +414,7 @@ class ClaudeSetup:
         profile = profile or str(self.cfg.get("plugins.profile", "standard"))
         try:
             wanted = self.profile_plugins(plan, profile)
+            effective = self.effective_plugins(plan, profile)
         except KeyError as exc:
             step.ok = False
             step.add(str(exc))
@@ -337,10 +442,8 @@ class ClaudeSetup:
             self._claude("plugin", "marketplace", "update", "claude-hr", timeout=120)
         installed = self._installed_plugins()
         have_names = {p["id"].split("@")[0] for p in installed if p.get("scope") == "user"}
-        for spec in wanted:
-            pname, _, mkt = spec.partition("@")
-            if mkt == "headroom-marketplace" and not self.cfg.flag("headroom.install_plugins"):
-                continue
+        for spec in effective:
+            pname = spec.partition("@")[0]
             if pname in have_names:
                 step.add(f"{pname}: installed")
                 continue

@@ -122,22 +122,29 @@ op_env_file = ""             # 1Password: launch as `op run --env-file=<file> --
 profile = "standard"         # strict: also disableBypassPermissionsMode + CLAUDE_CODE_SUBPROCESS_ENV_SCRUB + risky git commands are refused (not just confirmed)
 stop_review = "off"          # off: ENABLE_STOP_REVIEW=0, i.e. security-guidance's per-turn Opus review is skipped (its regex layer and commit/push review stay on);
                              #   plugin-default: leave the plugin as shipped. Audit with /security-review or `claude-hr-ctl audit` instead (cheaper, on demand).
+                             #   "off" also accepts false / 0 / no / disabled in any case (`config set security.stop_review false` stores a boolean);
+                             #   plugin-default also accepts on / true / 1 / yes / enabled. Any other value leaves the review on, and doctor says so.
 
 [gates]
 # The end-of-turn hook of plugin hr-gates (`claude-hr-hook stop`): format changed files, run the repo's trusted fast checks, audit trail.
 enabled = true               # false: the hook exits immediately (also CLAUDE_HR_GATES=off in the environment)
-protect_config = true        # settings baseline asks before Claude edits .claude/hr-verify.toml or .claude/settings*.json
+protect_config = true        # settings baseline: Claude asks before editing .claude/hr-verify.toml, .claude/settings*.json and claude-hr's config.toml,
+                             #   asks before `verify trust`, and may not edit claude-hr's state/ (the trust record); false = none of those rules are written.
+                             #   The rules name the real claude-hr home (CLAUDE_HR_HOME), so run `claude-hr-ctl setup --only settings` after moving it
 trail = true                 # metadata-only audit trail in ~/.claude-hr/audit (what ran, when, pass/fail; never code or output)
 trail_days = 90              # `claude-hr-ctl trail --prune` and the weekly maintain job drop older month files
+# The Stop hook of hr-gates is killed by Claude Code after 170 s (plugins/hr-gates/hooks/hooks.json) and the gate keeps an overall
+# budget of 150 s per turn for format + checks together: format.timeout_s + verify.gate_timeout_s above ~150 s buys nothing, the
+# gate stops itself first (and reports the time budget) instead of being killed with no report. Slow suites belong in the `full` tier.
 
 [format]
 # Consistency without imposing a tool: only a formatter the repo ALREADY configures is used (ruff/black, prettier/biome, gofmt, rustfmt).
 enabled = true
-timeout_s = 30               # total time budget per turn
-max_files = 40
-max_file_kb = 512
+timeout_s = 30               # total time budget per turn (counts against the 150 s hook budget described under [gates])
+max_files = 40               # at most this many changed files are formatted per turn (more are skipped and reported)
+max_file_kb = 512            # a file larger than this is never formatted
 skip_globs = []              # extra fnmatch patterns (posix-style relative paths) never to format
-allow = []                   # restrict to these formatter names; empty = any detected
+allow = []                   # restrict to these formatter names (ruff, black, prettier, biome, gofmt, rustfmt); empty = any detected
 clean_gate = true            # only rewrite a tracked file whose HEAD version is already formatted (no whole-file drift diffs)
 repo_tools = "trusted"       # trusted: a formatter that lives inside the repo (.venv, node_modules/.bin) and prettier (its config can load code)
                              #   are used only for a repo whose verify recipe you trusted; always: use them in every repo (the gate then runs code the repo or Claude wrote)
@@ -146,16 +153,16 @@ repo_tools = "trusted"       # trusted: a formatter that lives inside the repo (
 # The end-of-turn test gate runs ONLY the commands in a repo's .claude/hr-verify.toml that you trusted (claude-hr-ctl verify trust).
 gate = true                  # false: never run the gate (the commands stay available through `claude-hr-ctl verify run`)
 gate_max_blocks = 2          # at most this many times per unchanged working tree (Claude Code's own cap is 8)
-gate_timeout_s = 120         # per turn
+gate_timeout_s = 120         # per turn, for all checks together (a recipe check's own timeout_s is cut to what is left); see the 150 s hook budget under [gates]
 tier = "fast"                # which tier of the recipe the gate runs: fast | full
 test_guard = true            # mention possibly weakened tests (removed asserts, new skip markers) in a failing gate's message; advisory
 
 [audit]
 tools = true                 # `claude-hr-ctl audit --tools` also runs gitleaks / pip-audit / npm audit / osv-scanner when they are installed
-timeout_s = 60
+timeout_s = 60               # per scanner (gitleaks / pip-audit / npm audit / osv-scanner) when `audit --tools` runs them
 
 [github]
-readonly_allow = true        # settings baseline pre-approves read-only gh calls (issue/pr view+list, pr diff/checks, run list/view)
+readonly_allow = true        # settings baseline pre-approves read-only gh calls (issue/pr view+list, pr diff/checks, run list/view); false = no allow rules written
 
 [footprint]
-budget_standard_tokens = 1500  # `claude-hr-ctl footprint` and doctor warn when the standard profile's estimated always-on tokens exceed this
+budget_standard_tokens = 1500  # `claude-hr-ctl footprint` (exit 1 with --strict) and doctor warn when the standard profile's estimated always-on tokens exceed this
