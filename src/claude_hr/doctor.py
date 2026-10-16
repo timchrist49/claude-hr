@@ -110,6 +110,26 @@ def _verify_state(cwd: Path) -> str | None:
         return None
 
 
+def state_inside_repo(cwd: Path) -> bool:
+    """Is `cwd` in a git work tree that contains the state folder? The end-of-turn hook then ignores the trust record (see
+    paths.state_inside), whatever `verify status` would otherwise say. False outside a git work tree and when that cannot
+    be told: doctor and `verify` must never fail on it."""
+    try:
+        from . import worktree
+
+        top = worktree.repo_root(cwd)
+        return top is not None and paths.state_inside(top, cwd)
+    except Exception:  # noqa: BLE001 - an optional check must never break doctor
+        return False
+
+
+def state_inside_warning() -> str:
+    return (
+        f"the state folder {paths.state_dir()} is inside this repository, so the end-of-turn hook ignores its trust "
+        "record (set CLAUDE_HR_HOME outside the repository)"
+    )
+
+
 def _footprint_check(cfg: Config, listing: list[dict]) -> Check | None:
     """Estimated always-on tokens of the installed plugins against footprint.budget_standard_tokens (standard profile only).
 
@@ -318,6 +338,17 @@ def run(cfg: Config, cwd: Path, deep: bool = False) -> list[Check]:
         )
     if cfg.flag("gates.enabled", True) and cfg.flag("verify.gate", True):
         state = _verify_state(cwd)
+        if state_inside_repo(cwd):
+            out.append(
+                Check(
+                    "verify state folder",
+                    WARN,
+                    state_inside_warning(),
+                    "set CLAUDE_HR_HOME to a folder outside the repository, or unset it",
+                )
+            )
+            if state == "trusted":
+                state = None  # the hook does not run this recipe: no "the gate runs it" for it
         if state == "trusted":
             out.append(
                 Check(

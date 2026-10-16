@@ -4,7 +4,7 @@ import time
 
 import pytest
 
-from claude_hr import hooks
+from claude_hr import hooks, paths
 
 BLOCK = [
     "cat .env",
@@ -215,16 +215,16 @@ def test_statusline_survives_a_headroom_cache_of_the_wrong_shape(monkeypatch, ca
     port = 8787
     monkeypatch.setenv("ANTHROPIC_BASE_URL", f"http://127.0.0.1:{port}")
     monkeypatch.setattr(
-        hooks, "_headroom_summary", lambda p: {"saved": "lots", "pct": "x", "five_hour": [3]}
+        hooks, "_headroom_summary", lambda p, *_: {"saved": "lots", "pct": "x", "five_hour": [3]}
     )
     monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps({"model": {"display_name": "Opus"}})))
     assert hooks.statusline() == 0
     assert capsys.readouterr().out.strip() == "Opus"
-    monkeypatch.setattr(hooks, "_headroom_summary", lambda p: ["not", "a", "dict"])
+    monkeypatch.setattr(hooks, "_headroom_summary", lambda p, *_: ["not", "a", "dict"])
     monkeypatch.setattr("sys.stdin", io.StringIO("{}"))
     assert hooks.statusline() == 0
     monkeypatch.setattr(
-        hooks, "_headroom_summary", lambda p: {"saved": 183000, "pct": 40.0, "five_hour": "3"}
+        hooks, "_headroom_summary", lambda p, *_: {"saved": 183000, "pct": 40.0, "five_hour": "3"}
     )
     monkeypatch.setattr("sys.stdin", io.StringIO("{}"))
     capsys.readouterr()
@@ -273,6 +273,75 @@ def test_statusline_entry_exits_zero_with_a_clean_stderr_on_bad_fields():
             timeout=60,
         )
         assert r.returncode == 0 and r.stderr == b"" and r.stdout.strip() == b"", (payload, r)
+
+
+class Headroom:
+    """A stand-in for Headroom's /stats: the answer, and how many times it was asked."""
+
+    def __init__(self, monkeypatch):
+        self.asked = 0
+        monkeypatch.setattr(hooks.procutil, "http_json", self.http_json)
+
+    def http_json(self, url, timeout=0.6, loopback=True):
+        self.asked += 1
+        return 200, {"savings": {"total_tokens": 1234}, "display_session": {}}
+
+
+def refresh_statusline(monkeypatch, capsys, payload=None):
+    monkeypatch.setenv("ANTHROPIC_BASE_URL", "http://127.0.0.1:8787")
+    monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(payload or {})))
+    assert hooks.statusline() == 0
+    return capsys.readouterr().out.strip()
+
+
+def test_the_statusline_cache_is_written_to_the_users_state_folder(monkeypatch, capsys, sandbox):
+    headroom = Headroom(monkeypatch)
+    assert refresh_statusline(monkeypatch, capsys) == "✂ 1k saved"
+    cache = paths.state_dir() / "statusline-headroom.json"
+    assert json.loads(cache.read_text(encoding="utf-8"))["saved"] == 1234
+    assert refresh_statusline(monkeypatch, capsys) == "✂ 1k saved"
+    assert headroom.asked == 1, "the second refresh came from the cache"
+
+
+@pytest.mark.parametrize("named", [None, "cwd", "current_dir", "project_dir"])
+def test_a_statusline_refresh_writes_nothing_into_a_state_folder_inside_the_working_folder(
+    monkeypatch, capsys, tmp_path, named
+):
+    """CLAUDE_HR_HOME can come from the repository's own .claude/settings.json: the refresh must not create folders or
+    write the cache there (the cache file may be a link the repository ships to a file of the user's)."""
+    project = tmp_path / "project"
+    project.mkdir()
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    monkeypatch.setenv("CLAUDE_HR_HOME", str(project / ".hr"))
+    payload = {}
+    if named is None:
+        monkeypatch.chdir(project)  # the process runs in the project
+    else:
+        monkeypatch.chdir(elsewhere)  # the payload says where the project is
+        folder = str(project)
+        payload = {"cwd": folder} if named == "cwd" else {"workspace": {named: folder}}
+    headroom = Headroom(monkeypatch)
+    assert (
+        refresh_statusline(monkeypatch, capsys, payload) == "✂ 1k saved"
+    )  # the line is still printed
+    assert not (project / ".hr").exists(), "nothing was created there"
+    assert refresh_statusline(monkeypatch, capsys, payload) == "✂ 1k saved"
+    assert headroom.asked == 2, "and a cache that is not trusted is not read either"
+
+
+def test_a_statusline_cache_in_a_state_folder_inside_the_working_folder_is_not_read(
+    monkeypatch, capsys, tmp_path
+):
+    project = tmp_path / "project"
+    (project / ".hr" / "state").mkdir(parents=True)
+    (project / ".hr" / "state" / "statusline-headroom.json").write_text(
+        json.dumps({"saved": 99_000_000}), encoding="utf-8"
+    )
+    monkeypatch.chdir(project)
+    monkeypatch.setenv("CLAUDE_HR_HOME", str(project / ".hr"))
+    Headroom(monkeypatch)
+    assert refresh_statusline(monkeypatch, capsys) == "✂ 1k saved"
 
 
 def test_hook_entry_point_dispatch(monkeypatch):
@@ -384,6 +453,7 @@ TRUST_BLOCK = [
     # the launcher's one-time offer and its record: enabling is approving, and the record is the user's answer
     "claude-hr-ctl verify enable",
     "claude-hr ctl verify enable",
+    "CLAUDE-HR-CTL VERIFY ENABLE",  # the keyword pre-filter is as case-blind as the patterns
     "cd repo && claude-hr-ctl.exe verify enable --yes",
     "claude-hr-ctl verify disable",
     "echo '{}' > ~/.claude-hr/state/verify-offer.json",
@@ -426,13 +496,18 @@ TRUST_BURIED = [
     'python -c "from claude_hr import verify; verify.trust(root, state)"',
     'python -c "from claude_hr import gate_offer; gate_offer.enable(root, proposal, cfg, print)"',
 ]
-# Padding that makes an open-ended gap between the words cost the most: the keywords the patterns look for, repeated
+# Padding that makes the gaps between the words cost the most: the keywords the patterns look for, repeated, and the
+# program name run into its own prefix and suffix characters (the runs of word characters that follow it)
 PADDINGS = [
     "claude_hr verify ",
     "claude_hr gate_offer ",
     "claude-hr-ctl verify ",
     "claude_hr ",
     "curl ",
+    ".claude-hr",
+    "claude-hr-",
+    "claude_hr",
+    "claude-hr.verify.",
 ]
 
 
@@ -443,19 +518,39 @@ def padded(pad: str, size: int) -> str:
 @pytest.mark.parametrize("pad", PADDINGS)
 def test_a_one_megabyte_command_is_scanned_in_bounded_time(monkeypatch, capsys, pad):
     """A comment line of padded keywords made the patterns cost the cube of its length: the hook ran past its 10 s timeout,
-    and a hook that is killed lets the command through."""
+    and a hook that is killed lets the command through. Then `.claude-hr` x 1 MB still took 3 s (4 s as a process) and a
+    machine three times slower lost the race: the whole check is now a few hundredths of a second."""
     command = padded(pad, 1_000_000) + "\nclaude-hr-ctl verify enable"
     started = time.perf_counter()
     assert run_guard(monkeypatch, command) == 2
-    assert (
-        time.perf_counter() - started < 2.0
-    )  # a few tenths of a second on a slow machine; unbounded was minutes
+    assert time.perf_counter() - started < 0.5
     assert "only the user does it" in capsys.readouterr().err
     started = time.perf_counter()
     assert (
         hooks.trust_attempt(padded(pad, 1_000_000)) is False
     )  # the padding alone asks for nothing
-    assert time.perf_counter() - started < 2.0
+    assert time.perf_counter() - started < 0.5
+
+
+@pytest.mark.parametrize("pad", PADDINGS)
+def test_padding_that_names_verify_is_scanned_in_bounded_time_too(pad):
+    """The keyword pre-filter lets padding without `verify` or `gate_offer` skip the patterns; this padding names one (once
+    in the window, and as part of every unit), so the patterns themselves run."""
+    for window in (padded(pad, 16_384) + " verify", padded(pad + "verify ", 1_000_000)):
+        started = time.perf_counter()
+        assert hooks.trust_attempt(window) is False
+        assert time.perf_counter() - started < 0.5
+
+
+def test_the_scan_windows_are_sixteen_kib_from_each_end():
+    attempt = "\nclaude-hr-ctl verify enable\n"
+    assert hooks._SCAN == 16_384
+    assert hooks.trust_attempt(attempt + "x" * 100_000)  # the first window
+    assert hooks.trust_attempt("x" * 100_000 + attempt)  # the last window
+    # a command of up to two windows is scanned whole, its middle included
+    assert hooks.trust_attempt("x" * 16_000 + attempt + "x" * 16_000)
+    # the documented limit: in the middle of a longer command a trust attempt is not seen
+    assert not hooks.trust_attempt("x" * 20_000 + attempt + "x" * 20_000)
 
 
 @pytest.mark.parametrize("cmd", TRUST_BURIED)

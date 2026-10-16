@@ -91,6 +91,73 @@ def user_config_file() -> Path:
     return hr_home() / "config.toml"
 
 
+def _fold(path: Path | str) -> str:
+    """The real location of `path`, compared without regard to case on Windows."""
+    return os.path.normcase(os.path.realpath(path))
+
+
+def _within(path: str, tree: str) -> bool:
+    try:
+        return os.path.commonpath([path, tree]) == tree
+    except ValueError:  # another drive: not inside
+        return False
+
+
+def state_inside(root: Path | str, cwd: Path | str | None = None) -> bool:
+    """Is the state directory (it holds the trust record) inside the repository `root` or the folder `cwd` (default: the
+    folder this process runs in), the folder Claude works in?
+
+    CLAUDE_HR_HOME decides where it is, and a hook inherits the environment Claude Code built from the project's own
+    .claude/settings.json: a repository could point it at a folder it ships, with a trust record already in it, and have
+    its own recipe run unprompted. The hooks trust only a record the repository cannot have written, so they do nothing
+    here (and write nothing: the audit directory moves with the home, so it would be a folder the repository chose). The CLI
+    keeps honouring CLAUDE_HR_HOME. Not being able to tell counts as inside."""
+    try:
+        state = _fold(state_dir())
+        trees = (_fold(root), _fold(os.getcwd() if cwd is None else cwd))
+    except (OSError, ValueError):
+        return True
+    return any(_within(state, tree) for tree in trees)
+
+
+def inside_cwd(path: Path | str, *cwds: Path | str) -> bool:
+    """Is `path` inside the folder this process runs in, or inside one of `cwds` (the folders a hook payload names)?
+
+    A hook never writes there: the folder is the repository's, and the environment that placed `path` in it may be the
+    repository's too. Not being able to tell counts as inside."""
+    try:
+        target = _fold(path)
+        trees = [_fold(os.getcwd())] + [_fold(c) for c in cwds if c]
+    except (OSError, ValueError):
+        return True
+    return any(_within(target, tree) for tree in trees)
+
+
+def hook_write(path: Path, text: str, *cwds: Path | str, append: bool = False) -> bool:
+    """Write `text` to `path`, a file directly below a folder of claude-hr's home (a crash log, the status line's cache),
+    for a hook process; True when it was written. Hooks run on the project's environment, which can move the home, so:
+
+    * nothing is written when `path` is inside the working folder or one of `cwds` (see inside_cwd);
+    * a link at `path` is never followed (O_NOFOLLOW where the platform has it, a look at the file where it has not);
+    * only the home and the one folder below it are created, never the parents above the home.
+
+    Best effort: any failure is False, never an exception."""
+    try:
+        if inside_cwd(path, *cwds) or os.path.islink(path):
+            return False
+        # not parents=True: a missing parent means this is not a home claude-hr made
+        for d in (hr_home(), path.parent):
+            d.mkdir(exist_ok=True)
+        flags = os.O_WRONLY | os.O_CREAT | (os.O_APPEND if append else os.O_TRUNC)
+        flags |= getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_BINARY", 0)
+        fd = os.open(path, flags, 0o600)
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(text.encode("utf-8", errors="replace"))
+        return True
+    except (OSError, ValueError):
+        return False
+
+
 def ensure_dirs() -> None:
     for d in (state_dir(), logs_dir(), backups_dir(), cache_dir(), bin_dir()):
         d.mkdir(parents=True, exist_ok=True)

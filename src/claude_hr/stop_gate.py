@@ -31,15 +31,18 @@ _GIT_ROOT_S = 8.0  # the longest `git rev-parse` may take
 
 def run() -> int:
     """Entry point used by hooks.main. Prints the block decision (JSON) only when a trusted check failed."""
+    named: list[str] = []  # the folder the payload names: _crash must not write into it
     try:
         from .hooks import read_stdin_json
 
         payload = read_stdin_json()
+        if isinstance(payload.get("cwd"), str):
+            named.append(payload["cwd"])
         result = handle(payload)
         if result:
             sys.stdout.write(json.dumps(result))
     except Exception:
-        _crash()
+        _crash(*named)
     return 0
 
 
@@ -54,16 +57,20 @@ def handle(payload: dict) -> dict | None:
     # Claude Code's cap of 8 consecutive blocks), so a fix attempt is verified instead of waved through.
     if payload.get("agent_id") or payload.get("permission_mode") == "plan":
         return None
-    from . import config
-
-    cfg = config.load()
-    if not cfg.flag("gates.enabled", True):
-        return None
     cwd = str(payload.get("cwd") or os.getcwd())
     root = _git_root(cwd, timeout=min(_GIT_ROOT_S, deadline - time.monotonic()))
     if root is None:
         return None
-    if _state_inside(root, cwd):
+    # Before anything is read from or written to the state folder, the configuration included: CLAUDE_HR_HOME can come from
+    # the repository's own .claude/settings.json (Claude Code hands the hook the environment it built from it). A
+    # repository could ship a trust record for its own recipe in a folder it chose and have the recipe run unprompted, and
+    # a broken config.toml there would make this hook write its crash log into that folder (see paths.state_inside).
+    if paths.state_inside(root, cwd):
+        return None
+    from . import config
+
+    cfg = config.load()
+    if not cfg.flag("gates.enabled", True):
         return None
 
     from . import verify
@@ -227,33 +234,6 @@ def _signature(verify, root: Path, deadline: float | None = None) -> str:
     return f"{fp}|{verify.trust_state(root, paths.state_dir())}"
 
 
-def _state_inside(root: Path, cwd: str) -> bool:
-    """Is the state directory (it holds the trust record) inside the repository being gated or the folder Claude works in?
-
-    CLAUDE_HR_HOME decides where it is, and the hook inherits the environment Claude Code built from the project's own
-    .claude/settings.json: a repository could point it at a folder it ships, with a trust record already in it, and have
-    its own recipe run unprompted. The hook trusts only a record the repository cannot have written, so it does nothing
-    here (and writes nothing: the audit directory moves with the home, so it would be a folder the repository chose). The CLI keeps
-    honouring CLAUDE_HR_HOME. Not being able to tell counts as inside."""
-    try:
-        state = _fold(paths.state_dir())
-        trees = (_fold(root), _fold(cwd))
-    except (OSError, ValueError):
-        return True
-    for tree in trees:
-        try:
-            if os.path.commonpath([state, tree]) == tree:
-                return True
-        except ValueError:  # another drive: not inside
-            continue
-    return False
-
-
-def _fold(path: Path | str) -> str:
-    """The real location of `path`, compared without regard to case on Windows."""
-    return os.path.normcase(os.path.realpath(path))
-
-
 def _git_root(cwd: str, timeout: float = _GIT_ROOT_S) -> Path | None:
     if timeout <= 0.25:  # the hook's budget is already spent
         return None
@@ -349,15 +329,14 @@ def _best_effort_lock(path: Path):
             lock.__exit__(None, None, None)
 
 
-def _crash() -> None:
-    """Hooks run windowless: leave a trace for `doctor` / the user, never raise."""
+def _crash(*named: str) -> None:
+    """Hooks run windowless: leave a trace for `doctor` / the user, never raise. `named`: the folders the payload names (see
+    paths.hook_write: nothing is written into a folder the repository works in)."""
     import traceback
 
     try:
-        paths.logs_dir().mkdir(parents=True, exist_ok=True)
-        with open(paths.logs_dir() / "crash.log", "a", encoding="utf-8") as fh:
-            fh.write(
-                f"--- {time.strftime('%Y-%m-%dT%H:%M:%S')} claude-hr-hook stop\n{traceback.format_exc()}\n"
-            )
-    except OSError:
+        stamp = time.strftime("%Y-%m-%dT%H:%M:%S")
+        text = f"--- {stamp} claude-hr-hook stop\n{traceback.format_exc()}\n"
+        paths.hook_write(paths.logs_dir() / "crash.log", text, *named, append=True)
+    except Exception:  # noqa: BLE001 - the trace of a failure must not become one
         pass

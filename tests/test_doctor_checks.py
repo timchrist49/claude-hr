@@ -164,6 +164,85 @@ def test_verify_recipe_check_uses_the_repository_root_not_the_cwd(sandbox, fake_
         assert got.status == "warn" and "has not been trusted" in got.detail, cwd
 
 
+def git_project(tmp_path, name="proj"):
+    repo = tmp_path / name
+    (repo / ".claude").mkdir(parents=True)
+    subprocess.run(["git", "init", "-q"], cwd=repo, check=True, capture_output=True)
+    (repo / ".claude" / "hr-verify.toml").write_text(
+        '[[fast]]\nname = "t"\nargv = ["pytest", "-q"]\n', encoding="utf-8"
+    )
+    return repo
+
+
+def test_a_state_folder_inside_the_repository_is_reported_not_called_trusted(
+    sandbox, fake_claude, monkeypatch, tmp_path
+):
+    """The end-of-turn hook ignores a trust record that lies inside the repository (the repository could have written it):
+    doctor said "trusted: the end-of-turn test gate runs it" while the hook did nothing, and nothing said why."""
+    from claude_hr import verify
+
+    repo = git_project(tmp_path)
+    monkeypatch.setenv("CLAUDE_HR_HOME", str(repo / ".hr"))
+    verify.trust(repo, paths.state_dir())
+    assert verify.trust_state(repo, paths.state_dir()) == "trusted"
+    for cwd in (repo, repo / ".claude"):
+        got = checks(cwd)
+        warn = got["verify state folder"]
+        assert warn.status == "warn"
+        assert warn.detail == (
+            f"the state folder {paths.state_dir()} is inside this repository, so the end-of-turn hook "
+            "ignores its trust record (set CLAUDE_HR_HOME outside the repository)"
+        )
+        assert "outside the repository" in warn.fix
+        assert "verify recipe" not in got, (
+            "no 'the gate runs it' for a recipe the hook will not run"
+        )
+    verify.untrust(repo, paths.state_dir())  # the recipe's own state is still reported next to it
+    got = checks(repo)
+    assert got["verify state folder"].status == "warn"
+    assert "has not been trusted" in got["verify recipe"].detail
+
+
+def test_a_state_folder_outside_the_repository_is_not_reported(
+    sandbox, fake_claude, monkeypatch, tmp_path
+):
+    from claude_hr import verify
+
+    repo = git_project(tmp_path)
+    verify.trust(repo, paths.state_dir())
+    got = checks(repo)
+    assert "verify state folder" not in got and got["verify recipe"].status == "ok"
+    # a twin whose name merely starts with the repository's is not inside it
+    monkeypatch.setenv("CLAUDE_HR_HOME", str(repo) + "-home")
+    verify.trust(repo, paths.state_dir())
+    assert "verify state folder" not in checks(repo)
+
+
+def test_a_state_folder_in_a_folder_without_git_or_with_the_gate_off_is_not_reported(
+    sandbox, fake_claude, monkeypatch, tmp_path
+):
+    plain = tmp_path / "plain"
+    plain.mkdir()
+    monkeypatch.setenv("CLAUDE_HR_HOME", str(plain / ".hr"))
+    assert "verify state folder" not in checks(plain), "the hook only runs in a git work tree"
+    repo = git_project(tmp_path)
+    monkeypatch.setenv("CLAUDE_HR_HOME", str(repo / ".hr"))
+    assert "verify state folder" in checks(repo)
+    monkeypatch.setenv("CLAUDE_HR_VERIFY__GATE", "false")
+    assert "verify state folder" not in checks(repo)
+
+
+def test_the_state_folder_check_never_breaks_doctor(sandbox, fake_claude, monkeypatch, tmp_path):
+    repo = git_project(tmp_path)
+
+    def boom(cwd):
+        raise OSError("no git here")
+
+    monkeypatch.setattr("claude_hr.worktree.repo_root", boom)
+    assert doctor.state_inside_repo(repo) is False
+    assert "platform" in checks(repo)
+
+
 # ---- unparsable files: reported as failed checks, never a traceback -------------------------------------------------
 def test_an_unparsable_claude_json_is_a_failed_check_not_a_crash(sandbox, fake_claude):
     paths.claude_global_json().write_text(

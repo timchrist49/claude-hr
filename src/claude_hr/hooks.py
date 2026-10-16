@@ -107,13 +107,15 @@ GIT_RISKS: list[tuple[re.Pattern, str]] = [
 #
 # The gaps between the words are BOUNDED and trust_attempt() scans a bounded amount of text: with an open-ended gap the
 # match time grows with the cube of the line, so one comment line of padded keywords ran the hook past its timeout, and a
-# hook that is killed lets the command through. The bounds are far longer than any typed command.
+# hook that is killed lets the command through. The bounds are far longer than any typed command. Every alternative
+# needs the word `verify` or `gate_offer`: text without either is not looked at by a pattern at all.
 _GAP = 256  # `claude-hr ... verify trust`: other words between the program name and the verb
 _GAP_PY = 128  # `claude_hr ... verify` / `claude_hr ... gate_offer` inside python -c
 _GAP_CALL = 64  # `verify ... trust(`
-_SCAN = 65_536  # characters scanned from the start and from the end of an over-long command
+_SCAN = 16_384  # characters scanned from the start and from the end of an over-long command
+_KEYWORDS = ("verify", "gate_offer")
 _VERIFY_TRUST = re.compile(
-    rf"(?ism)claude[-_]hr[\w.-]{{0,32}}\b[^\n;&|]{{0,{_GAP}}}?\bverify\s+(?:(?:un)?trust|enable|disable)\b"
+    rf"(?ism)claude[-_]hr[^\n;&|]{{0,{_GAP}}}?\bverify\s+(?:(?:un)?trust|enable|disable)\b"
     r"|\bverify-(?:trust|offer)\.json\b"
     rf"|\bclaude_hr\b[^\n]{{0,{_GAP_PY}}}\bverify\b[^\n]{{0,{_GAP_CALL}}}\b(?:un)?trust\s*\("
     rf"|\bclaude_hr\b[^\n]{{0,{_GAP_PY}}}\bgate_offer\b[^\n]{{0,{_GAP_CALL}}}"
@@ -121,14 +123,21 @@ _VERIFY_TRUST = re.compile(
 )
 
 
+def _scan(text: str) -> bool:
+    lowered = text.lower()
+    if not any(word in lowered for word in _KEYWORDS):
+        return False
+    return bool(_VERIFY_TRUST.search(text))
+
+
 def trust_attempt(command: str) -> bool:
     """Does `command` try to trust, enable or disable a verify recipe, or touch the trust or the offer record?
 
     A command longer than 2 * _SCAN is looked at from its first and its last _SCAN characters only, so the time this takes
-    has a ceiling however the command is padded."""
+    has a ceiling however the command is padded (a trust attempt only in the middle of such a command is not seen)."""
     if len(command) > 2 * _SCAN:
-        return bool(_VERIFY_TRUST.search(command[:_SCAN]) or _VERIFY_TRUST.search(command[-_SCAN:]))
-    return bool(_VERIFY_TRUST.search(command))
+        return _scan(command[:_SCAN]) or _scan(command[-_SCAN:])
+    return _scan(command)
 
 
 def git_risk(command: str) -> str | None:
@@ -186,8 +195,8 @@ def bash_guard() -> int:
 
 
 def _judge(command: str) -> int:
-    # The trust check goes first: it is the one with a ceiling on its time (see _VERIFY_TRUST), so padding aimed at the
-    # slower patterns below cannot keep it from running before the hook is killed.
+    # The trust check goes first: it is the one with a ceiling on its time (see _VERIFY_TRUST, a few hundredths of a second
+    # for any command), so padding aimed at the slower patterns below cannot keep it from running before the hook is killed.
     if trust_attempt(command):
         sys.stderr.write(
             "Blocked by the claude-hr guard: trusting or enabling (or editing the trust record of) a verify recipe lets "
@@ -234,10 +243,14 @@ def _fmt_tokens(n: float) -> str:
     return str(int(n))
 
 
-def _headroom_summary(port: int) -> dict | None:
+def _headroom_summary(port: int, named: tuple[str, ...] = ()) -> dict | None:
+    """Headroom's numbers for the status line, cached for 20 s in the state folder. `named`: the folders the payload names;
+    a state folder inside one of them (or inside the working folder) is the repository's to have chosen, so the cache is
+    neither read nor written (paths.hook_write)."""
     cache = paths.state_dir() / "statusline-headroom.json"
+    usable = not paths.inside_cwd(cache, *named)
     try:
-        if time.time() - cache.stat().st_mtime < 20:
+        if usable and time.time() - cache.stat().st_mtime < 20:
             return json.loads(cache.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         pass
@@ -253,11 +266,8 @@ def _headroom_summary(port: int) -> dict | None:
             ((body.get("subscription_window") or {}).get("latest") or {}).get("five_hour") or {}
         ).get("utilization_pct"),
     }
-    try:
-        paths.state_dir().mkdir(parents=True, exist_ok=True)
-        cache.write_text(json.dumps(out), encoding="utf-8")
-    except OSError:
-        pass
+    if usable:
+        paths.hook_write(cache, json.dumps(out), *named)
     return out
 
 
@@ -281,6 +291,16 @@ def _field(data, *keys):
     return data
 
 
+def _named_folders(data) -> tuple[str, ...]:
+    """The folders a status line payload names (`cwd`, `workspace.current_dir`, `workspace.project_dir`)."""
+    found = (
+        _field(data, "cwd"),
+        _field(data, "workspace", "current_dir"),
+        _field(data, "workspace", "project_dir"),
+    )
+    return tuple(f for f in found if isinstance(f, str) and f)
+
+
 def _statusline_parts(data, parts: list[str]) -> None:
     """Append the segments of the status line to `parts` one at a time, so a failure only loses the segments after it."""
     model = _field(data, "model", "display_name")
@@ -296,7 +316,7 @@ def _statusline_parts(data, parts: list[str]) -> None:
 
     port = int(config.load().get("headroom.port", 8787))
     if os.environ.get("ANTHROPIC_BASE_URL", "").endswith(f":{port}"):
-        hs = _headroom_summary(port)
+        hs = _headroom_summary(port, _named_folders(data))
         saved = _num(_field(hs, "saved"))
         if saved:
             pct = _num(_field(hs, "pct"))

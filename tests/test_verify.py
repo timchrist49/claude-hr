@@ -2923,3 +2923,83 @@ def test_the_termination_handlers_are_put_back_and_never_replace_someone_elses(t
 def test_the_termination_handlers_fail_open_off_the_main_thread(tmp_path):
     res = within(60, verify.run, tmp_path, [pycheck("quick", "pass")])
     assert res.ok
+
+
+# ---- `verify status` / `verify trust` when the end-of-turn hook ignores the trust record ------------------------------
+@pytest.fixture
+def work_repo(tmp_path, monkeypatch, sandbox):
+    repo = make_repo(
+        tmp_path,
+        "work repo",
+        {".claude/hr-verify.toml": '[[fast]]\nname = "t"\nargv = ["pytest"]\n'},
+    )
+    monkeypatch.chdir(repo)
+    return repo
+
+
+def test_status_says_not_running_when_the_state_folder_is_inside_the_repository(
+    work_repo, monkeypatch, capsys
+):
+    """The hook refuses a state folder inside the repository (the repository could have written the record): the record
+    was valid, `verify status` said TRUSTED, and the gate did nothing."""
+    from claude_hr import ctl
+
+    monkeypatch.setenv("CLAUDE_HR_HOME", str(work_repo / ".hr"))
+    verify.trust(work_repo, paths.state_dir())
+    assert ctl.main(["verify", "status"]) == 0
+    text = capsys.readouterr().out
+    assert "NOT RUNNING: the state folder is inside this repository" in text
+    assert "so the end-of-turn hook ignores its trust record" in text
+    assert "set CLAUDE_HR_HOME outside the repository" in text and str(paths.state_dir()) in text
+    assert "TRUSTED" not in text
+    (work_repo / "sub").mkdir()
+    monkeypatch.chdir(work_repo / "sub")  # from a subfolder, too
+    assert ctl.main(["verify", "status"]) == 0
+    assert "NOT RUNNING" in capsys.readouterr().out
+
+
+def test_status_still_says_trusted_when_the_hook_will_run_it(work_repo, capsys):
+    from claude_hr import ctl
+
+    verify.trust(work_repo, paths.state_dir())
+    assert ctl.main(["verify", "status"]) == 0
+    text = capsys.readouterr().out
+    assert "TRUSTED: the end-of-turn gate runs these checks" in text and "NOT RUNNING" not in text
+
+
+def test_status_of_a_recipe_that_is_not_trusted_is_unchanged_inside_the_repository(
+    work_repo, monkeypatch, capsys
+):
+    from claude_hr import ctl
+
+    monkeypatch.setenv("CLAUDE_HR_HOME", str(work_repo / ".hr"))
+    assert ctl.main(["verify", "status"]) == 0
+    text = capsys.readouterr().out
+    assert "NOT trusted: the gate does nothing until a person approves it" in text
+    assert "NOT RUNNING" not in text
+
+
+@pytest.mark.parametrize("inside", [True, False])
+def test_trust_warns_before_it_asks_when_the_state_folder_is_inside_the_repository(
+    work_repo, monkeypatch, capsys, inside
+):
+    from claude_hr import ctl
+
+    if inside:
+        monkeypatch.setenv("CLAUDE_HR_HOME", str(work_repo / ".hr"))
+    monkeypatch.setattr(ctl, "_not_a_person", lambda: None)
+    shown = []
+
+    def confirm(question):
+        shown.append(capsys.readouterr().out)  # everything printed up to the question
+        return False
+
+    monkeypatch.setattr(ctl, "_confirm", confirm)
+    assert ctl.main(["verify", "trust"]) == 1  # declined: nothing is trusted
+    assert len(shown) == 1 and "file sha256" in shown[0]
+    warning = (
+        f"warning: the state folder {paths.state_dir()} is inside this repository, so the end-of-turn "
+        "hook ignores its trust record (set CLAUDE_HR_HOME outside the repository)"
+    )
+    assert (warning in shown[0]) is inside
+    assert verify.trust_state(work_repo, paths.state_dir()) == "untrusted"
