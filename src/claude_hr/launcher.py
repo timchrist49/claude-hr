@@ -15,7 +15,8 @@ Management lives in `claude-hr ctl ...` (same as the `claude-hr-ctl` command).
 
 All claude-hr chatter goes to stderr so `-p --output-format json` pipelines stay clean. The one thing that ever asks a
 question is the one-time offer of the end-of-turn test gate (gate_offer.py): only for a plain interactive session with a
-terminal, once per git folder, never in -p / agents / subcommands / --hr-dry-run; Ctrl-C or any error just starts Claude.
+terminal, once per git folder, never in -p / agents / subcommands / --hr-dry-run; Ctrl-C, no answer within five minutes
+or any error just starts Claude.
 
 Design rule: nothing in here may stop `claude` from starting. Bookkeeping (session registry, launch ring, caches) is
 best-effort and every failure degrades to "launch anyway".
@@ -462,11 +463,13 @@ def main(argv: list[str] | None = None) -> int:
     from . import resources
     from .headroom import Headroom
 
+    user_config_ok = True
     try:
         cfg = config_mod.load()
     except ValueError as exc:  # broken user config must not lock the user out of claude
         _say(f"ignoring unreadable config: {exc}")
         cfg = config_mod.load(with_user=False)
+        user_config_ok = False  # the defaults stand in for what the person set: whether they switched the offer off is unknown
     configured = str(cfg.get("claude.binary", "") or "")
     claude = (_absolute(procutil.find_claude(configured)) if configured else None) or real
 
@@ -607,10 +610,11 @@ def main(argv: list[str] | None = None) -> int:
             _say("command: " + " ".join(cmd))
             return 0
 
-    if kind == "session":
+    if kind == "session" and user_config_ok:
         # The one-time offer of the end-of-turn test gate: only a plain interactive session, only in a normal terminal,
-        # once per folder. Imported here (it pulls in nothing heavy unless a question is really due) and wrapped:
-        # whatever happens in there, Claude starts.
+        # once per folder, and not while the user's config file cannot be read (it may be where the offer was switched
+        # off). Imported here (it pulls in nothing heavy unless a question is really due) and wrapped: whatever happens
+        # in there, Claude starts.
         try:
             from . import gate_offer
 

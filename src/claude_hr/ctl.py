@@ -941,7 +941,7 @@ def cmd_verify(a, cfg) -> int:
             else "this folder's checks were not on"
         )
         out(
-            f"{cp} was kept (if there is one). claude-hr will not ask again here. "
+            f"{cp} was kept (if there is one). claude-hr will not ask again in this folder unless its check list changes. "
             "Turn it on again: claude-hr-ctl verify enable"
         )
         return 0

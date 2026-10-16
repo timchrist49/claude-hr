@@ -412,7 +412,7 @@ class _OfferWorld:
 
 
 @pytest.fixture
-def offer_world(tmp_path, monkeypatch):
+def offer_world(tmp_path, monkeypatch, request):
     """A real git repository as the current directory, a person at a terminal (scripted), a fake claude whose start is
     only recorded, and a discovery that proposes two real checks (`python -c pass`)."""
     import json
@@ -462,15 +462,25 @@ def offer_world(tmp_path, monkeypatch):
 
     prompts: list[str] = []
     answers: list[str] = []
+    unscripted: list[str] = []
 
     def fake_input(prompt=""):
         prompts.append(prompt)
         if not answers:
+            unscripted.append(prompt)
             raise AssertionError(f"nobody was supposed to be asked: {prompt!r}")
         return answers.pop(0)
 
+    def nobody_unexpected_was_asked():
+        # the launcher swallows every error from the offer (Claude must start): the question that raised is kept here
+        assert unscripted == [], f"a question nobody scripted was asked: {unscripted!r}"
+
+    request.addfinalizer(nobody_unexpected_was_asked)
     monkeypatch.setattr("builtins.input", fake_input)
     monkeypatch.setattr(human, "not_a_person", lambda: None)
+    monkeypatch.setattr(
+        human, "_live_console", lambda: False
+    )  # input() is scripted: no console to flush or wait on
     monkeypatch.setattr(gate_offer, "_can_see_the_question", lambda: True)
     py = sys.executable
     prop = verify.Recipe(
@@ -526,6 +536,19 @@ def test_ctrl_c_at_the_offer_launches_claude_and_asks_again_next_time(offer_worl
     launcher.main(["--hr-no-limits"])
     launcher.main(["--hr-no-limits"])
     assert len(offer_world.prompts) == 2 and len(offer_world.launched) == 2
+
+
+def test_nobody_at_the_terminal_does_not_hold_claude_back(offer_world, monkeypatch, capsys):
+    from claude_hr import gate_offer, human
+
+    monkeypatch.setattr(human, "_live_console", lambda: True)
+    monkeypatch.setattr(human, "_discard_pending_input", lambda: None)
+    monkeypatch.setattr(human, "_wait_for_answer", lambda limit_s: False)  # the wait ran out
+    launcher.main(["--hr-no-limits"])
+    err = capsys.readouterr().err
+    assert human.TIMEOUT_NOTE in err and offer_world.prompts == []
+    assert len(offer_world.launched) == 1  # claude started
+    assert gate_offer.decision_for(offer_world.repo) is None  # and nothing was decided
 
 
 def test_dry_run_never_asks(offer_world, capsys):
@@ -602,6 +625,24 @@ def test_the_offer_can_be_switched_off_in_the_config(offer_world, monkeypatch):
     monkeypatch.setenv("CLAUDE_HR_VERIFY__OFFER", "off")
     launcher.main(["--hr-no-limits"])
     assert offer_world.prompts == [] and len(offer_world.launched) == 1
+
+
+def test_a_config_file_that_cannot_be_read_does_not_bring_the_offer_back(offer_world, capsys):
+    """The person switched the offer off in config.toml and then broke the file: the defaults must not stand in for it."""
+    from claude_hr import paths
+
+    cfg_file = paths.user_config_file()
+    cfg_file.parent.mkdir(parents=True, exist_ok=True)
+    cfg_file.write_text('[verify]\noffer = "off"\n[broken', encoding="utf-8")
+    launcher.main(["--hr-no-limits"])
+    assert "ignoring unreadable config" in capsys.readouterr().err
+    assert offer_world.prompts == [] and len(offer_world.launched) == 1  # claude still starts
+    cfg_file.write_text(
+        '[verify]\noffer = "ask"\n', encoding="utf-8"
+    )  # the same launch, config fixed
+    offer_world.answers.append("n")
+    launcher.main(["--hr-no-limits"])
+    assert len(offer_world.prompts) == 1
 
 
 def test_a_crash_inside_the_offer_never_stops_claude(offer_world, monkeypatch):

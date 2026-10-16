@@ -13,11 +13,14 @@ session in a normal terminal: the question is short, the answer is one keystroke
 
 What may happen, and when (every one of these has a test):
   * nothing is asked in -p, agents, subcommands, a Claude Code shell, piped stdin, outside a git work tree, in a home
-    directory, or for a repository that is trusted / invalid / already answered;
+    directory, or for a repository that is trusted / invalid / already answered (or one that was turned on and then had
+    its file removed, or has nothing to propose);
   * a "yes" is only ever read from a terminal (human.not_a_person) - there is no flag or variable that answers;
+  * Enter means yes only when the audit preflight is clean and no script the screen shows looks like it fetches or
+    sends data; the screen shows what a task-runner check (npm run, make, just) will run;
   * the generated recipe holds only the argv commands that were shown, written without following a symlink, hashed from
     the exact bytes and trusted with that hash;
-  * the only things written into the repository are `.claude/hr-verify.toml` and one line in `.git/info/exclude`.
+  * the only things written into the repository are `.claude/hr-verify.toml` and one line in the git `info/exclude`.
 
 The launcher runs on every `claude` call, so this module imports nothing heavy at the top and the common "nothing to
 ask" answer (trusted, declined, no project files) is found WITHOUT importing verify or audit (see _quick_verdict).
@@ -34,12 +37,17 @@ from pathlib import Path
 
 from . import human, paths
 
-OFFER_FILE = "verify-offer.json"  # state/: {repo_key: {decision, ts, recipe_sha?, reason?}}
+# state/: {repo_key: {decision, ts, recipe_sha?, reason?, marker_mtime?}}
+OFFER_FILE = "verify-offer.json"
 MAX_ENTRIES = 200
 CHECK_CAP_S = 60  # the longest one check may take while the person watches it run once
 TOTAL_CAP_S = 120  # ... and all of them together
 EXCLUDE_LINE = ".claude/hr-verify.toml"
-DECISIONS = ("enabled", "declined")
+DECISIONS = ("enabled", "declined")  # what the person answered
+# Not an answer: "discovery found nothing to propose when the project files looked like this" (marker_mtime). It keeps
+# a folder with a pyproject.toml and no tests from costing a discovery on every launch; older code ignores it
+# (decision_for only knows DECISIONS).
+_NOTHING = "nothing"
 
 # Mirrors of verify.py constants, so the "nothing to ask" answer needs no import of verify (tests/test_gate_offer.py
 # asserts they have not drifted).
@@ -114,19 +122,30 @@ def _json_dict(path: Path) -> dict:
     return data if isinstance(data, dict) else {}
 
 
+def _entry_for(root: str | Path) -> dict | None:
+    """Whatever is recorded for this repository, a "nothing to propose" memo included."""
+    entry = _json_dict(offer_path()).get(_repo_key(root))
+    return entry if isinstance(entry, dict) else None
+
+
 def decision_for(root: str | Path) -> dict | None:
     """The recorded answer for this repository ({decision, ts, recipe_sha?, reason?}) or None."""
-    entry = _json_dict(offer_path()).get(_repo_key(root))
-    if isinstance(entry, dict) and entry.get("decision") in DECISIONS:
+    entry = _entry_for(root)
+    if entry is not None and entry.get("decision") in DECISIONS:
         return entry
     return None
 
 
 def record(
-    root: str | Path, decision: str, *, recipe_sha: str | None = None, reason: str | None = None
+    root: str | Path,
+    decision: str,
+    *,
+    recipe_sha: str | None = None,
+    reason: str | None = None,
+    marker_mtime: int | None = None,
 ) -> bool:
     """Remember the answer (replacing an earlier one). At most MAX_ENTRIES repositories, oldest dropped. True if written."""
-    if decision not in DECISIONS:
+    if decision not in (*DECISIONS, _NOTHING):
         raise ValueError(f"unknown decision {decision!r}")
     try:
         import json
@@ -142,9 +161,20 @@ def record(
             entry["recipe_sha"] = recipe_sha
         if reason:
             entry["reason"] = reason[:200]
+        if isinstance(marker_mtime, int):
+            entry["marker_mtime"] = marker_mtime
         state[key] = entry
         while len(state) > MAX_ENTRIES:
-            state.pop(next(iter(state)))
+            # an answer outlives a "nothing to propose" memo (which only saves a discovery): memos go first
+            memo = next(
+                (
+                    k
+                    for k, v in state.items()
+                    if isinstance(v, dict) and v.get("decision") == _NOTHING
+                ),
+                None,
+            )
+            state.pop(memo if memo is not None else next(iter(state)))
         atomic_write_text(path, json.dumps(state, indent=1) + "\n", follow_symlinks=False)
         paths.tighten_existing()  # a state dir this write just created is owner-only like the others
         return True
@@ -195,11 +225,9 @@ def _wanted(cfg) -> bool:
 
 def _can_see_the_question() -> bool:
     """The offer is written to stderr (stdout belongs to Claude): with stderr redirected to a file or a pipe the person
-    would never see the question while the launch waited for a key. No terminal on stderr, no question."""
-    try:
-        return bool(sys.stderr and sys.stderr.isatty())
-    except (OSError, ValueError, AttributeError):
-        return False
+    would never see the question while the launch waited for a key. No terminal on stderr, no question. (A real console:
+    on Windows the NUL device also reports isatty.)"""
+    return human.is_terminal(sys.stderr)
 
 
 def _plain_session(args) -> bool:
@@ -254,8 +282,39 @@ def _sha256_hex(data: bytes) -> str:
     return sha256(data).hexdigest()
 
 
+# What else decides whether discovery proposes anything once a marker file exists (a tests/ folder, a tool's own config
+# file): part of the "nothing to propose" memo's signature, not of the marker filter.
+_MEMO_EXTRAS = (
+    "tests",
+    "test",
+    "ruff.toml",
+    ".ruff.toml",
+    "mypy.ini",
+    ".mypy.ini",
+    "pyrightconfig.json",
+)
+
+
 def _might_have_checks(root: Path) -> bool:
     return any(os.path.exists(os.path.join(root, m)) for m in _DISCOVER_MARKERS)
+
+
+def _marker_signature(root: Path) -> int | None:
+    """The newest modification time (ns) among the project files discovery looks at, None when there are none: only
+    stat calls, so a folder with nothing to propose costs a few of them per launch. Any edit to one of those files (or
+    a file added to the tests folder) moves it."""
+    newest: int | None = None
+    has_marker = False
+    for name in (*_DISCOVER_MARKERS, *_MEMO_EXTRAS):
+        try:
+            mtime = os.stat(os.path.join(root, name)).st_mtime_ns
+        except OSError:
+            continue
+        has_marker = has_marker or name in _DISCOVER_MARKERS
+        if newest is None or mtime > newest:
+            newest = mtime
+    # the extras alone propose nothing: discovery needs a marker file
+    return newest if has_marker else None
 
 
 def _recipe_bytes(root: Path) -> tuple[str, bytes | None]:
@@ -291,18 +350,23 @@ def _quick_verdict(root: Path) -> str:
     """'quiet' when there is certainly nothing to ask, else 'look'. Imports neither verify nor audit.
 
     Quiet: the recipe is the one that was trusted (the trust record holds its sha256); the person said no to this
-    folder (and the recipe, if any, is the one they said no to); there is no recipe and nothing in the folder that
-    verify.discover could propose from; the recipe is not a readable regular file or is over the size limit (verify
-    calls those invalid and nothing in them is ever run). Everything else - including every doubt - is "look", and
-    offer_now then asks verify itself."""
+    folder (and the recipe, if any, is the one they said no to); there is no recipe because the person removed the
+    file they had turned on; there is no recipe and nothing in the folder that verify.discover could propose from (or
+    it found nothing last time and the project files have not changed since); the recipe is not a readable regular
+    file or is over the size limit (verify calls those invalid and nothing in them is ever run). Everything else -
+    including every doubt - is "look", and offer_now then asks verify itself."""
     state, data = _recipe_bytes(root)
     if state == "odd":
         return "quiet"
     if state == "missing":
-        entry = decision_for(root)
-        if (entry is not None and entry.get("decision") == "declined") or not _might_have_checks(
-            root
-        ):
+        entry = _entry_for(root)
+        decision = entry.get("decision") if entry is not None else None
+        if decision in DECISIONS:  # said no, or turned it on and then deleted the file
+            return "quiet"
+        signature = _marker_signature(root)
+        if signature is None:
+            return "quiet"
+        if decision == _NOTHING and entry.get("marker_mtime") == signature:
             return "quiet"
         return "look"
     if len(data) > _MAX_CONFIG_BYTES:
@@ -328,10 +392,14 @@ def _folder_key(p: str | Path) -> str:
     return s.casefold() if os.name == "nt" else s
 
 
-def claude_trusts(root: Path, cwd: str | Path) -> bool:
-    """Has the person already answered Claude Code's own "do you trust this folder?" question with yes, for the folder they
-    launched in or for the repository's top level? Claude Code records that as projects[<folder>].hasTrustDialogAccepted in its
-    global state file (paths.claude_global_json: ~/.claude.json, or inside CLAUDE_CONFIG_DIR).
+def claude_trusts(root: Path) -> bool:
+    """Has the person already answered Claude Code's own "do you trust this folder?" question with yes, for the
+    repository's top folder? Claude Code records that as projects[<folder>].hasTrustDialogAccepted in its global state
+    file (paths.claude_global_json: ~/.claude.json, or inside CLAUDE_CONFIG_DIR).
+
+    Only the top folder counts: the checks run there, so it is the folder the person has to have vouched for. Trust given
+    to a subfolder one happened to launch in vouches for nothing above it, and a trusted parent of the repository
+    vouches for nothing inside it.
 
     Only a regular file up to a sane size is read, once, and only on the rare path where a question would otherwise be
     asked; anything unexpected (no file, bad JSON, another layout in a future Claude Code) answers False, which means
@@ -348,7 +416,7 @@ def claude_trusts(root: Path, cwd: str | Path) -> bool:
         projects = data.get("projects") if isinstance(data, dict) else None
         if not isinstance(projects, dict):
             return False
-        wanted = {_folder_key(x) for x in (cwd, os.path.realpath(cwd), root)}
+        wanted = {_folder_key(x) for x in (root, os.path.realpath(root))}
         return any(
             isinstance(value, dict)
             and value.get("hasTrustDialogAccepted") is True
@@ -376,8 +444,6 @@ def maybe_offer(args, cfg) -> None:
 def _maybe_offer(args, cfg) -> None:
     if not _wanted(cfg):
         return
-    if human.not_a_person() is not None or not _can_see_the_question():
-        return
     if not _plain_session(args):
         return
     root = work_tree(os.getcwd())
@@ -385,7 +451,11 @@ def _maybe_offer(args, cfg) -> None:
         return
     if _quick_verdict(root) == "quiet":
         return
-    if not claude_trusts(root, os.getcwd()):
+    # the terminal checks come after the file checks: on Windows telling a console from NUL loads ctypes (~10 ms), which
+    # a launch that has nothing to ask must not pay
+    if human.not_a_person() is not None or not _can_see_the_question():
+        return
+    if not claude_trusts(root):
         # Claude Code has not been told to trust this folder yet (it asks on the first launch). A freshly cloned repository
         # must not be offered "run its checks after every turn" before its owner has vouched for it even once: the offer
         # comes on a later launch, after that answer. `claude-hr-ctl verify enable` works at any time.
@@ -408,7 +478,235 @@ def gate_limits(cfg) -> tuple[float, str]:
     return budget, str(cfg.get("verify.tier", "fast"))
 
 
-def recipe_lines(recipe, gate_timeout_s: float | None = None, gate_tier: str = "fast") -> list[str]:
+# ---- what a task-runner check really runs -------------------------------------------------------------------------
+# `npm run lint` or `make test` is only a name: the code is in package.json or the Makefile, which the repository
+# controls and the audit preflight does not read. The screens show it (a few lines, cut short), and the default answer
+# turns to No when it looks like it fetches or sends data.
+_BODY_LINES_SHOWN = 3  # script lines printed under one check
+_BODY_LINES_SCANNED = 30  # script lines looked at for the default answer
+_BODY_CHARS_SHOWN = 100
+_SCAN_CHARS = 20_000  # a script line longer than this is not scanned: it is called what it is (very long) instead
+_RUNNER_FILE_BYTES = 1_000_000
+_NODE_TOOLS = frozenset({"npm", "pnpm", "yarn", "bun"})
+_TASK_FILES = {
+    "make": ("Makefile", "makefile", "GNUmakefile"),
+    "just": ("justfile", "Justfile", ".justfile"),
+}
+RUNNER_NOTE = (
+    "This also runs the project's own scripts and test code (package.json scripts, Makefile targets, conftest.py) "
+    "and lets the end-of-turn formatter use tools and config from this folder (.venv, node_modules, prettier "
+    "configuration)."
+)
+
+
+def _tool_name(arg0: str) -> str:
+    base = str(arg0).replace("\\", "/").rsplit("/", 1)[-1].lower()
+    for ext in (".exe", ".cmd", ".bat", ".ps1"):
+        if base.endswith(ext):
+            return base[: -len(ext)]
+    return base
+
+
+def _runner_target(argv) -> tuple[str, str] | None:
+    """('npm', 'lint') for `npm run lint`, ('npm', 'test') for `npm test`, ('make', 'test') for `make test`; None for
+    anything else (a tool called directly runs no script of the project's that could be shown)."""
+    if not argv:
+        return None
+    tool = _tool_name(argv[0])
+    words = [str(a) for a in argv[1:] if not str(a).startswith("-")]
+    if tool in _NODE_TOOLS and words:
+        if words[0] in ("run", "run-script"):
+            return (tool, words[1]) if len(words) > 1 else None
+        if words[0] == "test":
+            return tool, "test"
+        return (tool, words[0]) if tool != "npm" else None  # `yarn lint`: shorthand for the script
+    if tool in _TASK_FILES and len(argv) == 2 and words:
+        return tool, words[0]
+    return None
+
+
+def _read_small(path: Path) -> str | None:
+    """A regular file up to _RUNNER_FILE_BYTES as text (a prefix is enough for a Makefile; a cut-off package.json does
+    not parse and shows nothing). None for anything else; never blocks on a FIFO."""
+    from . import verify
+
+    try:
+        data, _more = verify._read_file(path, _RUNNER_FILE_BYTES)
+    except OSError:
+        return None
+    return data.decode("utf-8", errors="replace")
+
+
+def _clean(text: str) -> str:
+    """One line with whitespace runs collapsed to one space (padding cannot push the rest of a line out of view)."""
+    return " ".join(text.split())[
+        : _SCAN_CHARS + 1
+    ]  # one more than is scanned, so "too long" can be told
+
+
+def _node_lines(base: Path, name: str) -> list[tuple[str, str]]:
+    import json
+
+    text = _read_small(base / "package.json")
+    pkg = json.loads(text) if text else None
+    scripts = pkg.get("scripts") if isinstance(pkg, dict) else None
+    if not isinstance(scripts, dict):
+        return []
+    out = []
+    # npm runs the pre and post scripts of a script along with it
+    for script in (f"pre{name}", name, f"post{name}"):
+        body = scripts.get(script)
+        if isinstance(body, str) and body.strip():
+            out.append((f'package.json "{script}"', _clean(body)))
+    return out
+
+
+def _task_lines(base: Path, tool: str, target: str) -> list[tuple[str, str]]:
+    import re
+
+    path = next((base / n for n in _TASK_FILES[tool] if (base / n).is_file()), None)
+    text = _read_small(path) if path is not None else None
+    if not text:
+        return []
+    lines = text.splitlines()
+    head = re.compile(r"^" + re.escape(target) + r"[ \t]*:(?![=:])(.*)$")
+    start = next((i for i, ln in enumerate(lines) if head.match(ln)), None)
+    if start is None:
+        return []
+    # make allows `test: deps ; recipe` on one line
+    needs, _, inline = head.match(lines[start]).group(1).partition(";")
+    needs = needs.split("#", 1)[0].split()
+    where = f"{path.name} {target}" + (f" (after {' '.join(needs[:6])})" if needs else "")
+    out = [(where, _clean(inline))] if inline.strip() else []
+    for ln in lines[start + 1 :]:
+        if len(out) >= _BODY_LINES_SCANNED:
+            break
+        if not ln.strip() or ln.startswith("#"):
+            continue
+        if ln[0] not in " \t":
+            break  # the next rule
+        out.append((where, _clean(ln)))
+    return out
+
+
+def _runner_lines(root: Path, chk) -> list[tuple[str, str]]:
+    """What a task-runner check will run, as (where, text) pairs (text whitespace-collapsed and bounded), at most
+    _BODY_LINES_SCANNED of them; [] for a check that is no such call or whose text cannot be found. Reads one small
+    regular file. Never raises."""
+    try:
+        target = _runner_target(chk.argv)
+        if target is None:
+            return []
+        from . import verify
+
+        tool, name = target
+        base = verify._resolve_cwd(Path(root), chk.cwd)
+        return _node_lines(base, name) if tool in _NODE_TOOLS else _task_lines(base, tool, name)
+    except Exception:  # noqa: BLE001 - what cannot be shown is not shown
+        return []
+
+
+def _body_lines(view: list[tuple[str, str]], indent: str) -> list[str]:
+    """The first lines of a check's script as screen lines (through safe_text, each cut to 100 characters)."""
+    from . import verify
+
+    lines = []
+    for where, text in view[:_BODY_LINES_SHOWN]:
+        shown = verify.safe_text(text)
+        if len(shown) > _BODY_CHARS_SHOWN:
+            shown = shown[: _BODY_CHARS_SHOWN - 3] + "..."
+        lines.append(f"{indent}{verify.safe_text(where)}: {shown}")
+    if lines and len(view) > _BODY_LINES_SHOWN:
+        lines[-1] += f"   (+{len(view) - _BODY_LINES_SHOWN} more lines in the file)"
+    return lines
+
+
+_SUSPICIOUS: list = []  # (compiled pattern, what it means), built on first use
+
+
+def _suspicious_patterns() -> list:
+    if not _SUSPICIOUS:
+        import re
+
+        tail = r"""(?=[\s;&|'"]|$)"""
+        for what, pattern in (
+            (
+                "fetches or sends data",
+                r"\b(?:curl|wget|invoke-webrequest|invoke-restmethod|iwr|irm|certutil|bitsadmin|nc|ncat|netcat)\b",
+            ),
+            (
+                "fetches or sends data",
+                r"""https?://(?!(?:localhost|127\.0\.0\.1)(?::\d+)?(?:[/?#\s'"]|$))[^\s'"]+""",
+            ),
+            (
+                "downloads or decodes code and runs it",
+                r"\|\s*(?:sh|bash|zsh|powershell|pwsh|iex)\b|\b(?:iex|invoke-expression|eval|base64)\b"
+                r"|\s-(?:enc|encodedcommand)\b",
+            ),
+            (
+                "reaches for credentials or keys",
+                r"\.(?:ssh|aws|gnupg|netrc|npmrc)\b|\bcredentials\b|\bid_(?:rsa|ed25519)\b|(?<!\w)\.env\b",
+            ),
+            (
+                "deletes everything under / or your home folder",
+                r"""\brm\s+(?:-[a-z-]+\s+)*?(?:-[a-z]*r[a-z]*|--recursive)\s+(?:-[a-z-]+\s+)*["']?"""
+                r"""(?:/|~|\$HOME|\$\{HOME\})/?\*?""" + tail,
+            ),
+        ):
+            _SUSPICIOUS.append((re.compile(pattern, re.IGNORECASE), what))
+    return _SUSPICIOUS
+
+
+def _suspicion(texts) -> str | None:
+    """A plain clause ("A script below fetches or sends data (curl ...)") when one of the texts (script lines, command
+    lines) looks like it fetches or sends data, runs what it decodes or downloads, reaches for credentials or deletes
+    broadly, or is too long to look through; else None. Conservative on purpose: a match only turns the default answer
+    to No. Bounded (each text is looked at up to _SCAN_CHARS characters, and a longer one is itself the finding, so
+    padding cannot hide a command), never raises."""
+    try:
+        from . import verify
+
+        unique = list(dict.fromkeys(str(t) for t in list(texts)[:1000]))
+        bounded = [t[:_SCAN_CHARS] for t in unique]
+        for rx, what in _suspicious_patterns():
+            for text in bounded:
+                m = rx.search(text)
+                if m:
+                    snippet = text[m.start() : m.start() + 60]
+                    more = "..." if len(text) > m.start() + 60 else ""
+                    return f"A script below {what} ({verify.safe_text(snippet)}{more})"
+        if any(len(t) > _SCAN_CHARS for t in unique):
+            return f"A script below is very long (over {_SCAN_CHARS} characters, more than can be read here)"
+    except Exception:  # noqa: BLE001 - cannot tell is handled by the caller's other checks
+        return None
+    return None
+
+
+def _scan_texts(checks, views) -> list[str]:
+    """Everything a person is shown for these checks, as text to look at: the command lines and the script lines."""
+    # the program by its bare name: the folder it was found in says nothing about what the check does
+    texts = [" ".join([_tool_name(c.argv[0]), *map(str, c.argv[1:])]) for c in checks if c.argv]
+    for view in views:
+        texts += [text for _where, text in view]
+    return texts
+
+
+def recipe_views(root: Path, recipe) -> dict:
+    """{(tier, n): script lines} for every check of both tiers (see _runner_lines)."""
+    return {
+        (tier, n): _runner_lines(root, c)
+        for tier in ("fast", "full")
+        for n, c in enumerate(getattr(recipe, tier), 1)
+    }
+
+
+def recipe_lines(
+    recipe,
+    gate_timeout_s: float | None = None,
+    gate_tier: str = "fast",
+    root: Path | None = None,
+    views: dict | None = None,
+) -> list[str]:
     """Every check of both tiers, in full, exactly as the gate would run it.
 
     This is what a person reads before approving the file, so nothing is left out and nothing is printed raw: name,
@@ -420,12 +718,17 @@ def recipe_lines(recipe, gate_timeout_s: float | None = None, gate_tier: str = "
     `gate_timeout_s` (verify.gate_timeout_s) is what ALL the checks of one end-of-turn run get together. A check of the
     tier the gate runs whose own timeout_s is above it is shown with the limit that really applies there, and what
     happens at that limit: the gate stops it, tells the user and does not block (`verify run` honours timeout_s).
+
+    With `root`, a check that goes through a task runner (npm run, make, just) is followed by the first lines of what
+    it runs (`views`, from recipe_views, when the caller already has them).
     """
     from . import verify
 
     lines: list[str] = []
     fast = list(recipe.fast)
     gate_tier = "full" if gate_tier == "full" and recipe.full else "fast"
+    if root is not None and views is None:
+        views = recipe_views(root, recipe)
     for tier in ("fast", "full"):
         for n, c in enumerate(getattr(recipe, tier), 1):
             same = (
@@ -442,22 +745,50 @@ def recipe_lines(recipe, gate_timeout_s: float | None = None, gate_tier: str = "
                 f"  [{tier} {n}] {verify.safe_text(c.name)}: {verify.command_line(c)}"
                 f"   ({limit}, cwd {verify.safe_text(c.cwd)}){repeat}"
             )
+            if views and not same:
+                lines += _body_lines(views.get((tier, n), []), "      ")
     for note in getattr(recipe, "notes", None) or []:
         lines.append(f"  note: {verify.safe_text(str(note)[:300])}")
     return lines
 
 
-def offer_lines(recipe) -> list[str]:
-    """The plain-language offer for a folder that has no recipe yet (the fast checks discovery found)."""
+def _start_differs(start, root) -> bool:
+    try:
+        return os.path.normcase(os.path.realpath(start)) != os.path.normcase(os.path.realpath(root))
+    except (OSError, ValueError, TypeError):
+        return False
+
+
+def offer_lines(
+    recipe, root: Path | None = None, start=None, views: list | None = None
+) -> list[str]:
+    """The plain-language offer for a folder that has no recipe yet (the fast checks discovery found).
+
+    With `root` (the repository's top folder), a check that goes through a task runner is followed by what it will run
+    (`views`: one _runner_lines result per check, when the caller already has them), and `start` (where Claude was
+    started) is named when the checks will run somewhere else."""
     from . import verify
 
     lines = [
         "",
         "claude-hr can double-check Claude's work in this folder (optional; asked once per folder).",
-        "After each turn it would run this project's own checks and send any failure back to Claude to fix:",
     ]
-    lines += [f"    {n}. {verify.command_line(c)}" for n, c in enumerate(recipe.fast, 1)]
+    if root is not None and start is not None and _start_differs(start, root):
+        lines.append(
+            f"Started in {verify.safe_text(str(start))}; the checks run in the repository's top folder "
+            f"{verify.safe_text(str(root))}."
+        )
+    lines.append(
+        "After each turn it would run this project's own checks and send any failure back to Claude to fix:"
+    )
+    if root is not None and views is None:
+        views = [_runner_lines(root, c) for c in recipe.fast]
+    for n, c in enumerate(recipe.fast, 1):
+        lines.append(f"    {n}. {verify.command_line(c)}")
+        if views and n - 1 < len(views):
+            lines += _body_lines(views[n - 1], "         ")
     lines += [
+        RUNNER_NOTE,
         "Nothing runs unless you say yes now. If you do, they run once, here, to see which pass today.",
         "These checks run code from this folder, so say no if you do not trust it.",
     ]
@@ -544,12 +875,69 @@ def _last_line(text: str) -> str:
     return ""
 
 
+# Why a proposed check was left out. enable() and the messages tell them apart by these prefixes: a tool that is not
+# installed or a check that ran out of time says something different about the person's setup than a check that fails.
+WHY_NOT_RUN = "not run: the time limit for this step was used up"
+WHY_NOT_START = "could not start (is the tool installed and on PATH?)"
+WHY_TIMEOUT = "did not finish within"
+WHY_FAILING = "failing today"
+WHY_EDITS = "it edits tracked files (a check that rewrites files cannot run after every turn)"
+_SIGNATURE_PATHS = 200
+_SIGNATURE_TIMEOUT_S = 5.0
+
+
+def _why_kind(why: str) -> str:
+    """'failing' | 'start' | 'timeout' | 'edits' | 'skipped' for one left-out reason."""
+    for kind, prefix in (
+        ("failing", WHY_FAILING),
+        ("start", "could not start"),
+        ("timeout", WHY_TIMEOUT),
+        ("edits", "it edits tracked files"),
+    ):
+        if why.startswith(prefix):
+            return kind
+    return "skipped"
+
+
+def _tracked_signature(root: Path):
+    """What the tracked part of the work tree looks like right now: `git status` without untracked files, plus the
+    (mtime, size) of the first _SIGNATURE_PATHS paths it lists. A rewritten tracked file moves it, whether it was clean
+    or already modified; a new untracked or ignored file (a cache, __pycache__) does not. None when it cannot be told
+    (no git, git failed or timed out, too much output): then nothing is detected. Never raises."""
+    try:
+        from . import verify
+
+        got = verify._git(
+            Path(root),
+            "status",
+            "--porcelain=v1",
+            "-z",
+            "--untracked-files=no",
+            cap=1_000_000,
+            timeout=_SIGNATURE_TIMEOUT_S,
+        )
+        if got is None or got[1]:
+            return None
+        stats = []
+        for _code, rel in verify._status_entries(got[0])[:_SIGNATURE_PATHS]:
+            try:
+                st = os.lstat(os.path.join(root, rel))
+                stats.append((rel, st.st_mtime_ns, st.st_size))
+            except OSError:
+                stats.append((rel, None, None))  # a deleted file is part of the picture
+        return got[0], tuple(stats)
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def _try_checks(root: Path, candidates: list, cfg, say) -> tuple[list, list]:
     """Run each proposed check once, with the person watching, and split them into (kept, left_out).
 
     Same runner as the gate (verify.run: no shell, scrubbed environment, the process tree is killed on a timeout, stdin
     closed). A check gets min(its own timeout_s, CHECK_CAP_S), the whole step TOTAL_CAP_S. Only a check that exits 0 today
-    is kept: a gate that blocks Claude on failures that were there before it touched anything just wastes tokens."""
+    is kept: a gate that blocks Claude on failures that were there before it touched anything just wastes tokens. A
+    check that rewrites tracked files (`eslint --fix`, `prettier --write`) is left out as well: it would do that to the
+    person's work after every turn, and it has just done it once to their uncommitted work."""
     from . import verify
 
     allowed_env = cfg.get("verify.env_allow", []) or []
@@ -558,31 +946,39 @@ def _try_checks(root: Path, candidates: list, cfg, say) -> tuple[list, list]:
     started = time.monotonic()
     say("")
     say("Running each check once, here, to see which pass today (this can take a minute) ...")
+    signature = _tracked_signature(root)
     for chk in candidates:
         label = verify.safe_text(chk.name)
         remaining = TOTAL_CAP_S - (time.monotonic() - started)
         if remaining < 1:
-            left_out.append((chk, "not run: the time limit for this step was used up"))
+            left_out.append((chk, WHY_NOT_RUN))
             say(f"  [skip] {label}: not run (time limit for this step)")
             continue
         probe = replace(chk, timeout_s=max(1, min(int(chk.timeout_s), CHECK_CAP_S)))
         say(f"  running {label} ...")
         ran = verify.run(root, [probe], total_timeout_s=remaining, env_allow=allowed_env)
         if not ran.results:
-            left_out.append((chk, "not run: the time limit for this step was used up"))
+            left_out.append((chk, WHY_NOT_RUN))
             say(f"  [skip] {label}: not run (time limit for this step)")
             continue
         res = ran.results[0]
+        after = _tracked_signature(root)  # also the starting point of the next check
+        edited = signature is not None and after is not None and after != signature
+        signature = after
+        if edited:
+            left_out.append((chk, WHY_EDITS))
+            say(f"  [FAIL] {label}: {WHY_EDITS}")
+            continue
         if res.ok:
             kept.append(chk)
             say(f"  [ok]   {label} ({res.seconds:.1f}s)")
             continue
         if res.launch_failed:
-            why = "could not start (is the tool installed and on PATH?)"
+            why = WHY_NOT_START
         elif res.timed_out:
-            why = f"did not finish within {min(probe.timeout_s, remaining):.0f}s"
+            why = f"{WHY_TIMEOUT} {min(probe.timeout_s, remaining):.0f}s"
         else:
-            why = f"failing today (exit {res.rc})"
+            why = f"{WHY_FAILING} (exit {res.rc})"
         left_out.append((chk, why))
         say(f"  [FAIL] {label}: {why}")
         tail = _last_line(res.output)
@@ -591,26 +987,65 @@ def _try_checks(root: Path, candidates: list, cfg, say) -> tuple[list, list]:
     return kept, left_out
 
 
-def exclude_locally(root: Path) -> str:
-    """Add `.claude/hr-verify.toml` to `.git/info/exclude` so the generated file never shows up in `git status` or gets
-    committed by accident. Local to this clone; idempotent. 'added' | 'already' | 'skipped' (when .git is a file - a
-    worktree or submodule - or anything about .git/info/exclude is not a plain directory/file, or on any error).
-    Never raises, and never writes through a link."""
+def _plain_dir(path: Path) -> bool:
+    """A directory that is not a link (a junction counts as one)."""
     from . import verify
 
-    git = Path(root) / ".git"
     try:
-        if verify._is_link(git) or not stat.S_ISDIR(os.lstat(git).st_mode):
-            return "skipped"
+        return not verify._is_link(path) and stat.S_ISDIR(os.lstat(path).st_mode)
+    except OSError:
+        return False
+
+
+def _exclude_file(root: Path) -> Path | None:
+    """The `info/exclude` file that applies to this work tree, or None when there is any doubt.
+
+    A normal clone has a .git directory: `.git/info/exclude`, whose `info` folder is created when it is missing. In a
+    linked worktree or a submodule .git is a FILE and the exclude file lives elsewhere (the main repository's common
+    directory, or .git/modules/...): git says where, and that path gets the same rules, except that nothing is created
+    outside the git directory of this tree: `info` and the directory around it must already be real directories."""
+    from . import procutil, verify
+
+    git = Path(root) / ".git"
+    gst = os.lstat(git)
+    if verify._is_link(git):
+        return None
+    if stat.S_ISDIR(gst.st_mode):
         info = git / "info"
         try:
-            ist = os.lstat(info)
+            os.lstat(info)
         except FileNotFoundError:
             os.mkdir(info)
-            ist = os.lstat(info)
-        if verify._is_link(info) or not stat.S_ISDIR(ist.st_mode):
+        return info / "exclude" if _plain_dir(info) else None
+    if not stat.S_ISREG(gst.st_mode):
+        return None
+    done = procutil.run(
+        ["git", "-C", str(root), "rev-parse", "--git-path", "info/exclude"], timeout=5
+    )
+    lines = (done.stdout or "")[:4096].splitlines() if done.returncode == 0 else []
+    if len(lines) != 1 or not lines[0].strip() or "\0" in lines[0]:
+        return None
+    exclude = Path(lines[0].strip())
+    if not exclude.is_absolute():
+        exclude = Path(root) / exclude
+    info = exclude.parent
+    if exclude.name != "exclude" or info.name != "info":
+        return None
+    return exclude if _plain_dir(info) and _plain_dir(info.parent) else None
+
+
+def exclude_locally(root: Path) -> str:
+    """Add `.claude/hr-verify.toml` to the git `info/exclude` file so the generated file never shows up in `git status` or
+    gets committed by accident. Local to this clone (in a linked worktree that file is shared with the main checkout and
+    its other worktrees); idempotent. 'added' | 'already' | 'skipped' (when anything about that file or the folders
+    around it is not a plain directory/regular file, git cannot say where it is, or on any error). Never raises, and
+    never writes through a link."""
+    from . import verify
+
+    try:
+        exclude = _exclude_file(root)
+        if exclude is None:
             return "skipped"
-        exclude = info / "exclude"
         existing = b""
         try:
             est = os.lstat(exclude)
@@ -628,8 +1063,41 @@ def exclude_locally(root: Path) -> str:
         with open(exclude, "ab") as fh:
             fh.write(sep + EXCLUDE_LINE.encode("ascii") + b"\n")
         return "added"
-    except OSError:
+    except Exception:  # noqa: BLE001 - bookkeeping that must never stop the enable
         return "skipped"
+
+
+HR_GATES_NOTE = (
+    "Note: the hr-gates plugin is not enabled, so nothing runs yet. "
+    "Enable it: claude-hr-ctl setup --only plugins"
+)
+_MAX_SETTINGS_BYTES = 2_000_000
+
+
+def _hr_gates_note() -> str | None:
+    """HR_GATES_NOTE when the user's Claude settings.json is readable and none of its enabledPlugins entries named
+    hr-gates@... is true (the end-of-turn hook lives in that plugin, so without it a turned-on gate never runs); None
+    when it is on, and None when the file cannot be read (then nothing is known). Never raises."""
+    try:
+        import json
+
+        path = paths.claude_settings()
+        st = os.stat(path)
+        if not stat.S_ISREG(st.st_mode) or st.st_size > _MAX_SETTINGS_BYTES:
+            return None
+        with open(path, "rb") as fh:
+            data = json.loads(fh.read().decode("utf-8-sig"))
+        if not isinstance(data, dict):
+            return None
+        plugins = data.get("enabledPlugins")
+        if isinstance(plugins, dict) and any(
+            isinstance(key, str) and key.startswith("hr-gates@") and value is True
+            for key, value in plugins.items()
+        ):
+            return None
+        return HR_GATES_NOTE
+    except Exception:  # noqa: BLE001 - cannot tell: say nothing
+        return None
 
 
 def enable(root: Path, proposal, cfg, say) -> EnableResult:
@@ -656,9 +1124,14 @@ def enable(root: Path, proposal, cfg, say) -> EnableResult:
     kept, left_out = _try_checks(root, candidates, cfg, say)
     if left_out:
         say("")
-        say(
-            "Failing today, not turned on (fix them, or add them to .claude/hr-verify.toml yourself):"
-        )
+        if all(_why_kind(reason) == "failing" for _chk, reason in left_out):
+            say(
+                "Failing today, not turned on (fix them, or add them to .claude/hr-verify.toml yourself):"
+            )
+        else:
+            say(
+                "Not turned on (fix or install them, or add them to .claude/hr-verify.toml yourself):"
+            )
         for chk, reason in left_out:
             say(f"    {verify.command_line(chk)}   [{reason}]")
     if not kept:
@@ -709,6 +1182,9 @@ def enable(root: Path, proposal, cfg, say) -> EnableResult:
             else "."
         )
     )
+    note = _hr_gates_note()
+    if note:
+        say(note)
     say("See it: claude-hr-ctl verify status      Turn it off: claude-hr-ctl verify disable")
     return EnableResult("enabled", kept=kept, left_out=left_out, sha256=digest)
 
@@ -736,8 +1212,9 @@ def disable(root: Path) -> bool:
 def offer_now(root: Path, cfg, say, *, explicit: bool = False) -> str:
     """Look at this repository's state, show the right screen, ask, act. Returns what happened:
 
-    enabled | declined | not-now (EOF / Ctrl-C) | already-on | nothing-to-offer | declined-before (silent) |
-    none-pass | unavailable (invalid recipe) | failed | refused.
+    enabled | declined | not-now (EOF / Ctrl-C / nobody answered) | already-on | nothing-to-offer |
+    declined-before (silent) | removed-before (silent: it was turned on and the file was deleted) | none-pass |
+    unavailable (invalid recipe) | failed | refused.
 
     `explicit` is `claude-hr-ctl verify enable`: the person asked, so an earlier "no" does not silence it and every
     outcome is explained; the launcher passes False and stays quiet unless it really asks."""
@@ -766,13 +1243,50 @@ def offer_now(root: Path, cfg, say, *, explicit: bool = False) -> str:
         return "unavailable"
     entry = decision_for(root)
     declined = entry is not None and entry.get("decision") == "declined"
+    removed = entry is not None and entry.get("decision") == "enabled"
     if state == "no-config":
-        if declined and not explicit:
-            return "declined-before"
+        if (declined or removed) and not explicit:
+            # a person who turned it on and then deleted the file (the README's way to remove it) is not asked again
+            return "declined-before" if declined else "removed-before"
         return _offer_new(root, cfg, say, explicit)
     if declined and not explicit and entry.get("recipe_sha") == loaded.sha256:
         return "declined-before"
     return _offer_existing(root, cfg, say, loaded, state)
+
+
+def _start_folder() -> str | None:
+    try:
+        return os.getcwd()
+    except OSError:
+        return None
+
+
+_KIND_TEXT = (
+    ("failing", "{n} failing today"),
+    ("start", "{n} could not start (is the tool installed and on PATH?)"),
+    ("timeout", "{n} did not finish in time"),
+    ("edits", "{n} would rewrite tracked files"),
+    ("skipped", "{n} not run (time limit for this step)"),
+)
+
+
+def _none_pass_text(left_out: list) -> tuple[str, str]:
+    """(what to tell the person, the reason to record) when no proposed check could be turned on. Checks that simply fail
+    are 'failing today'; a tool that is not installed, a check that ran out of time or one that rewrites files is
+    said as what it is."""
+    kinds = [_why_kind(why) for _chk, why in left_out]
+    if all(k == "failing" for k in kinds):
+        return (
+            "None of these checks pass today, so none were turned on (a gate that fails on problems that were "
+            "already there only wastes Claude's time). Run claude-hr-ctl verify enable after fixing them.",
+            "none of the checks pass today",
+        )
+    parts = [text.format(n=kinds.count(kind)) for kind, text in _KIND_TEXT if kind in kinds]
+    return (
+        f"None of these checks could be turned on: {', '.join(parts)}. "
+        "Run claude-hr-ctl verify enable after fixing them.",
+        "none of the checks could be turned on today",
+    )
 
 
 def _offer_new(root: Path, cfg, say, explicit: bool) -> str:
@@ -785,12 +1299,24 @@ def _offer_new(root: Path, cfg, say, explicit: bool) -> str:
                 "claude-hr found no lint or test commands it recognises in this folder, so there is nothing to "
                 "turn on. You can write .claude/hr-verify.toml yourself (claude-hr-ctl verify init shows the format)."
             )
+        else:
+            # remember it against the project files as they are now: the next launch costs a few stat calls, and an
+            # edit to one of them lets this look again
+            signature = _marker_signature(root)
+            if signature is not None:
+                record(root, _NOTHING, marker_mtime=signature)
         return "nothing-to-offer"
     extra, default_yes = _preflight(root)
-    for ln in offer_lines(proposal):
+    views = [_runner_lines(root, c) for c in proposal.fast]
+    alarm = _suspicion(_scan_texts(proposal.fast, views))
+    for ln in offer_lines(proposal, root, _start_folder(), views):
         say(ln)
     for ln in extra:
         say(ln)
+    if alarm:
+        default_yes = False
+        say("")
+        say(f"{alarm}, so the default answer is No.")
     answer = human.ask_yes_no("Turn it on?", default_yes, tell=say)
     if answer is None:
         say("")
@@ -803,12 +1329,10 @@ def _offer_new(root: Path, cfg, say, explicit: bool) -> str:
     if result.status == "enabled":
         return "enabled"
     if result.status == "none-pass":
+        text, reason = _none_pass_text(result.left_out)
         say("")
-        say(
-            "None of these checks pass today, so none were turned on (a gate that fails on problems that were "
-            "already there only wastes Claude's time). Fix them, then run: claude-hr-ctl verify enable"
-        )
-        record(root, "declined", reason="none of the checks pass today")
+        say(text)
+        record(root, "declined", reason=reason)
         return "none-pass"
     if result.status == "failed":
         if verify.trust_state(root, paths.state_dir()) == "trusted":
@@ -836,13 +1360,29 @@ def _offer_existing(root: Path, cfg, say, loaded, state: str) -> str:
         f"If you approve it, claude-hr runs these commands after every Claude turn, without asking, in "
         f"{verify.safe_text(str(root))}:"
     )
-    for ln in recipe_lines(loaded.recipe, budget, tier):
+    views = recipe_views(root, loaded.recipe)
+    for ln in recipe_lines(loaded.recipe, budget, tier, root, views):
         say(ln)
+    say(RUNNER_NOTE)
     extra, _default = _preflight(root)
     for ln in extra:
         say(ln)
+    alarm = _suspicion(
+        _scan_texts([*loaded.recipe.fast, *loaded.recipe.full], list(views.values()))
+    )
+    if alarm:
+        say("")
+        say(f"{alarm}.")
     say(f"file sha256: {loaded.sha256}")
-    answer = human.ask_yes_no("Run these checks after every turn?", False, tell=say)
+    # nothing is cut from the list above (a hidden command is worse than a long screen): with many checks the question
+    # says how many there are, so the length of what was printed is not a surprise
+    count = len(loaded.recipe.fast) + len(loaded.recipe.full)
+    question = (
+        f"Run these {count} checks after every turn?"
+        if count > 12
+        else "Run these checks after every turn?"
+    )
+    answer = human.ask_yes_no(question, False, tell=say)
     if answer is None:
         say("")
         return "not-now"
@@ -861,6 +1401,9 @@ def _offer_existing(root: Path, cfg, say, loaded, state: str) -> str:
         return "failed"
     record(root, "enabled", recipe_sha=digest)
     say(f"Approved ({digest[:12]}...): claude-hr will run these checks after each turn.")
+    note = _hr_gates_note()
+    if note:
+        say(note)
     say("See it: claude-hr-ctl verify status      Turn it off: claude-hr-ctl verify disable")
     return "enabled"
 
@@ -878,6 +1421,8 @@ def status_hint(root: Path, state: str, cfg=None) -> str | None:
         reason = f" ({entry['reason']})" if entry.get("reason") else ""
         return f"declined on {_when(entry)}{reason}: run claude-hr-ctl verify enable to turn the checks on"
     if state == "no-config":
+        if entry is not None and entry.get("decision") == "enabled":
+            return "turned on earlier, the file was removed: claude-hr-ctl verify enable turns it on again"
         if cfg is not None and str(cfg.get("verify.offer", "ask")).strip().lower() != "ask":
             return "never offered here (verify.offer is off): run claude-hr-ctl verify enable to turn the checks on"
         return (

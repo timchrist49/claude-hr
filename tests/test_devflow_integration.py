@@ -768,6 +768,9 @@ def typed(monkeypatch):
     """A person at a normal terminal who types the queued answers; an unscripted question fails the test."""
     monkeypatch.setattr(ctl, "_not_a_person", lambda: None)
     monkeypatch.setattr(human, "not_a_person", lambda: None)
+    monkeypatch.setattr(
+        human, "_live_console", lambda: False
+    )  # input() is scripted: no console to flush or wait on
     answers: list = []
     asked: list[str] = []
 
@@ -832,6 +835,7 @@ def test_enable_keeps_only_what_passes_today_and_disable_undoes_it(
 
     rc, text = run(capsys, "verify", "disable")
     assert rc == 0 and "turned off" in text and verify.config_path(repo).exists()
+    assert "will not ask again in this folder unless its check list changes" in text
     assert verify.trust_state(repo, paths.state_dir()) == "untrusted"
     status = run(capsys, "verify", "status")[1]
     assert "declined on " in status and "claude-hr-ctl verify enable" in status
