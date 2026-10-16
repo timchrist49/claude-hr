@@ -156,8 +156,8 @@ Plan: `docs/plans/2026-10-16-dev-workflow.md`; evidence and rejected options: `d
 | No user D-Bus (minimal Linux/WSL) | Uncapped launch; doctor/e2e print how to enable caps |
 | Daemon started without the route | Restarted if idle, loud warning otherwise |
 | Update smoke test fails | Previous version reinstalled, logged to `logs/update.jsonl` |
-| claude-hr itself uninstalled | Plain `claude` unaffected (no global base URL); hook commands exit 0 if `claude-hr-hook` is missing |
-| Formatter missing, slow or failing; check times out or cannot start; state file unwritable; any bug in the gate | The turn ends normally, the reason is in `trail` / `logs/crash.log`; a timed-out or inconclusive check never blocks |
+| claude-hr itself uninstalled | Plain `claude` unaffected (no global base URL); `hr-core` hook commands exit 0 if `claude-hr-hook` is missing; the `hr-gates` Stop hook (exec form, no shell) shows a non-blocking notice each turn until `claude-hr-ctl uninstall` removes the plugin |
+| Formatter missing, slow or failing; check times out or cannot start; state file unwritable; any bug in the gate | The turn ends normally; the reason is in `trail` / `logs/crash.log`. Running out of the overall time budget, or a check that cannot start, never blocks; a check that exceeds its own `timeout_s` is a failed check and does block (capped by `verify.gate_max_blocks`) |
 
 ## Decisions confirmed with the owner (2026-10-15)
 MIT license (switched from all-rights-reserved when the repo went public); default plugin profile `standard` including Superpowers; `claude.privacy = standard` (error reporting off, telemetry left on so flag-gated features work); two saved Workflows, `hr-review-changes` and `hr-plan-execute`, installed per project on request and never run automatically (both validated offline by stubbed drivers, not by spawning agents). 2026-10-16, owner delegated all decisions for 0.2.0 ("I trust your judgement"): lean `standard` profile (Superpowers and feature-dev to `process`), `hr-gates`, manual-only workflow skills, trusted verify recipes, per-turn security review off.

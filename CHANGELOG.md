@@ -2,15 +2,15 @@
 
 ## 0.2.0 (2026-10-16)
 A verified development loop with no always-on token cost, for sessions run at Ultracode effort on `opusplan` (claude-hr still sets
-no model, effort or thinking value). Plan: `docs/plans/2026-10-16-dev-workflow.md`; reasons: `docs/DESIGN.md` section 13.
+no model, effort or thinking setting; Headroom's own output shaper stays a separate switch). Plan: `docs/plans/2026-10-16-dev-workflow.md`; reasons: `docs/DESIGN.md` section 13.
 - **New plugin `hr-gates`** (in the `standard` profile): one `Stop` hook, `claude-hr-hook stop`, once per turn. It formats the files
-  Claude changed with the formatter the repo already configures (ruff/black, prettier/biome, gofmt, rustfmt), runs the repo's trusted
+  git reports as changed in the working tree with the formatter the repo already configures (ruff/black, prettier/biome, gofmt, rustfmt), runs the repo's trusted
   fast checks and returns a failure to Claude, and appends a metadata-only audit trail. It adds no context unless a trusted check
   failed, skips plan mode and subagents, and fails open on every error.
 - **New commands:** `fmt`, `verify init|status|trust|untrust|run`, `audit`, `init-repo`, `footprint`, `trail`. `verify` runs only a
   recipe (`.claude/hr-verify.toml`) whose exact bytes a person trusted; `audit` is a read-only, zero-token audit of a repository's
   agent surface, workflows and secrets; `init-repo` scaffolds CI (job `verify`), Dependabot, issue forms, a PR template,
-  CODEOWNERS, `docs/plans`, `REVIEW.md` and `.editorconfig` (dry run by default, never overwrites); `footprint` estimates each
+  CODEOWNERS, `docs/plans`, `docs/decisions`, `REVIEW.md`, `.editorconfig` and `.gitattributes` (dry run by default, never overwrites); `footprint` estimates each
   plugin's always-on tokens including the costs `claude plugin details` does not count.
 - **New skills in `hr-core`, all manual-only (no always-on tokens):** `hr-plan`, `hr-done`, `hr-gh` (the `gh` CLI, no MCP server),
   `hr-audit`. New opt-in workflow `hr-plan-execute` (independent plan steps in parallel git worktrees, merged one by one).

@@ -25,7 +25,7 @@ claude-hr-ctl verify init --write      # propose .claude/hr-verify.toml from wha
 claude-hr-ctl verify trust             # in a normal terminal, never inside Claude Code
 claude-hr-ctl trail --tail 20          # what the end-of-turn gate did (metadata only)
 claude-hr-ctl audit [--strict]         # read-only repository audit, zero tokens
-claude-hr-ctl init-repo [--apply]      # scaffold CI, Dependabot, issue/PR templates, docs/plans, REVIEW.md
+claude-hr-ctl init-repo [--apply]      # scaffold CI, Dependabot, issue/PR templates, docs/plans + decisions, REVIEW.md, .editorconfig, .gitattributes
 claude-hr-ctl footprint                # always-on token cost of the plugins, against footprint.budget_standard_tokens
 ```
 The gate runs once per turn, only for a git repository, and not at all in plan mode or for subagents. It skips a working
@@ -110,7 +110,7 @@ CPU quotas on Linux need the `cpu` controller delegated to user managers (one-ti
 | The gate never runs the tests | `verify status`: no recipe, not trusted, or changed since trusted. `verify init --write`, read it, `verify trust` in a terminal. `trail` shows what the last turns did. |
 | The gate blocks again and again | After `verify.gate_max_blocks` blocks for the same tree it stops and names the failure; fix it or `verify untrust`. A check that is flaky or slow belongs in the `full` tier, not `fast`. |
 | A file was not formatted | `fmt` lists the formatter the repo configures and marks one as `NOT USED` with the reason. A formatter inside the repo (`.venv`, `node_modules/.bin`) or prettier (its configuration can load code) is used only after `verify trust` for that repository (or `format.repo_tools = always`). A tracked file whose committed version was never formatted is left alone on purpose (`format.clean_gate = false` to change that); `trail` records skips. |
-| Hook errors after uninstalling claude-hr | None expected: hook commands exit 0 when `claude-hr-hook` is absent. |
+| Hook errors after uninstalling claude-hr | `hr-core` hook commands exit 0 when `claude-hr-hook` is absent. The `hr-gates` Stop hook (exec form, no shell) shows a non-blocking notice each turn until the plugin is removed: `claude-hr-ctl uninstall` does that, or `claude plugin uninstall hr-gates@claude-hr`. |
 | Windows: long-path clone failures in plugin install | `git config --system core.longpaths true`, or shorten `CLAUDE_CONFIG_DIR`. |
 
 ## Moving to a new VM

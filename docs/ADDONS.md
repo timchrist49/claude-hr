@@ -11,7 +11,7 @@ quality*, not popularity.
 | **Native statusLine** | Model, context %, cost, Headroom savings, 5-hour plan usage; no third-party package |
 | **Native usage ledger** (`usage`) | Replaces `ccusage` without an npm dependency; daily snapshot survives Claude's transcript pruning |
 | **Anthropic catalog plugins** | `standard`: `claude-md-management`, `security-guidance`, `context7`. `process`: + `superpowers`, `feature-dev`. `audit`: + `claude-security`. `full`: all of those + `skill-creator`. Measured and trimmed 2026-10-16 (see Admission rule) |
-| **hr-gates** (plugin, one Stop hook) | Format the files Claude changed with the repo's own formatter, run the repo's trusted fast checks, keep a metadata-only audit trail. One process per turn, no context cost, fails open |
+| **hr-gates** (plugin, one Stop hook) | Format the files git reports as changed with the repo's own formatter, run the repo's trusted fast checks, keep a metadata-only audit trail. One process per turn, no context cost, fails open |
 | **hr-core skills** | `hr-plan`, `hr-done`, `hr-gh`, `hr-audit`, `hr-status`, `hr-parallel-worktrees` are manual-only (`disable-model-invocation`: not in the skill listing, 0 always-on tokens); `hr-claudemd-hygiene` is the only listed skill |
 | **Git-safety asks** | The bash guard asks before `--no-verify`, force-push of a protected branch, `reset --hard`, `clean -f`; `gh auth status --show-token` is blocked. The settings baseline asks before Claude edits `.claude/hr-verify.toml` or `.claude/settings*.json`, and before `verify trust` |
 | **Git worktree helper** | Built-in isolation is `--worktree`; the helper adds a predictable path and exclude rule for scripted parallel runs |
@@ -53,7 +53,7 @@ quality*, not popularity.
 | **Unattended LLM routines** (scheduled `claude -p` maintenance) | Deferred, not rejected: needs a stored credential, shares the subscription window with interactive work, and no public per-run cost exists. Deterministic maintenance (Dependabot through `init-repo`, the existing weekly `maintain` job) ships; revisit after a measured pilot |
 
 ## Workflows (opt-in)
-`claude-hr-ctl workflows install` copies `hr-review-changes` into the project's `.claude/workflows/`. It reviews the diff on up to five dimensions, then has skeptics try to refute every finding (majority-refute drops it) and reports what survives; anything it could not check is logged, never silently dropped. Cost is roughly 10-25 agents per run, so it is not part of any default flow. Plugins cannot ship workflows, hence the separate installer.
+`claude-hr-ctl workflows install` copies `hr-review-changes` and `hr-plan-execute` into the project's `.claude/workflows/`. It reviews the diff on up to five dimensions, then has skeptics try to refute every finding (majority-refute drops it) and reports what survives; anything it could not check is logged, never silently dropped. Cost is roughly 10-25 agents per run, so it is not part of any default flow. Plugins cannot ship workflows, hence the separate installer.
 
 ## Enabling an optional piece
 Most are one-liners in `~/.claude-hr/config.toml`, e.g.

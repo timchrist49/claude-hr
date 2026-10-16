@@ -103,13 +103,13 @@ someone is logged in.
 
 Built for one way of working: you plan with `opusplan` and run at Ultracode effort, and you want code that is consistent,
 tested, verified and security-checked without paying tokens for the machinery. Everything in this table is deterministic:
-it costs **no model tokens** unless something fails or you ask for a review. claude-hr never sets a model, effort or thinking value.
+it costs **no model tokens** unless something fails or you ask for a review. claude-hr never writes a model, effort or thinking setting (Headroom's output shaper, on by default, steers output verbosity and effort inside the proxy: set `headroom.output_shaper = false` if your own effort level should be the only one).
 
 | Step | What happens | Cost |
 |---|---|---|
-| **Format** | At the end of each turn the files Claude changed are formatted with a formatter the repo already configures (ruff/black, prettier/biome, gofmt, rustfmt; never one it does not set up). A formatter that lives inside the repo (`.venv`, `node_modules/.bin`) and prettier (its configuration can load code) are used only for a repository you trusted (see below) or with `format.repo_tools = "always"`. A tracked file is rewritten only if its committed version was already clean, so you never get a whole-file drift diff. | none; one process per turn |
+| **Format** | At the end of each turn the files git reports as changed in the working tree (Claude's, and any uncommitted or untracked file of yours) are formatted with a formatter the repo already configures (ruff/black, prettier/biome, gofmt, rustfmt; never one it does not set up). A formatter that lives inside the repo (`.venv`, `node_modules/.bin`) and prettier (its configuration can load code) are used only for a repository you trusted (see below) or with `format.repo_tools = "always"`. A tracked file is rewritten only if its committed version was already clean, so you never get a whole-file drift diff. | none; one process per turn |
 | **Verify** | The same hook runs the repo's trusted fast checks. A failure goes back to Claude as the reason it cannot stop yet, at most twice per unchanged working tree. Possibly weakened tests (removed asserts, new skip markers) are named in that message. A tree that did not change since the last green run is not checked again. | tokens only when a check fails |
-| **Audit trail** | `claude-hr-ctl trail`: one metadata-only record per turn (what ran, when, pass or fail). Never code or output. Kept 90 days. | none |
+| **Audit trail** | `claude-hr-ctl trail`: one metadata-only record for each turn on which the gate ran (a git repository, not plan mode or a subagent, working tree changed since the last pass): what ran, when, pass or fail. Never code or output. Kept 90 days. | none |
 | **Plan, build, prove** | `/hr-core:hr-plan` (a plan file with a verify command per step, your approval, one step at a time), `/hr-core:hr-done` (evidence instead of "it works"), `/hr-core:hr-gh` (issue and PR recipes with the `gh` CLI, no MCP server). For independent steps the opt-in `hr-plan-execute` workflow runs them in parallel git worktrees and merges the passing ones one by one. | manual-only skills: nothing until you call them |
 | **Review ladder** | `/hr-core:hr-audit`: the free `claude-hr-ctl audit` first, then the bundled `/code-review`, `/security-review` only for changes at a trust boundary, and the opt-in `hr-review-changes` workflow for a risky release. LLM reviews are advisory; the repo's checks and CI are the gate. | on request |
 
@@ -131,13 +131,13 @@ whole process tree. A repo without a recipe is simply not gated; formatting stil
 The rest of the toolbox, all read-only or dry-run by default: `claude-hr-ctl audit` (hooks, MCP servers and skills that run or
 fetch code, hidden Unicode and prompt-injection text in CLAUDE.md and READMEs, GitHub workflow risks, masked secrets; `--tools` also
 runs gitleaks, pip-audit, npm audit and osv-scanner when installed), `claude-hr-ctl init-repo` (issue forms with an agent-task form,
-PR template, CODEOWNERS, Dependabot, `docs/plans`, `REVIEW.md`, `.editorconfig`, a hardened CI skeleton; never overwrites),
+PR template, CODEOWNERS, Dependabot, `docs/plans` and `docs/decisions`, `REVIEW.md`, `.editorconfig`, `.gitattributes`, a hardened CI skeleton; never overwrites; `--only` picks groups, e.g. leave out `editor` to keep your line endings),
 `claude-hr-ctl footprint` (what each plugin costs in always-on context, including what `claude plugin details` does not count),
 `claude-hr-ctl fmt`.
 
 Switches: `CLAUDE_HR_GATES=off` in the environment (or `gates.enabled = false`) disables the hook, `format.enabled`,
 `verify.gate`, `gates.trail` switch single steps, `security.profile = "strict"` makes the git confirmations refusals. Everything fails
-open: a missing tool, a timeout or an error exits quietly and never blocks `claude`.
+open: a missing tool, an error or running out of the overall time budget exits quietly and never blocks `claude`. A trusted check that fails, or exceeds its own `timeout_s`, is a failed check and does block (at most `verify.gate_max_blocks` times for the same tree).
 
 ## Commands
 
@@ -159,7 +159,7 @@ They change routing and limits only, not the managed settings or plugins. `claud
 | `cleanup [--apply]` | reclaim `~/.claude` scratch, MCP logs, oversized daemon log |
 | `creds doctor\|scan` | credential hygiene, secrets in transcripts |
 | `wt new <name> [--base ref]\|list\|rm <name> [--force] [--delete-branch]` | git worktrees for parallel agents (`.claude/worktrees/<name>` on branch `hr/<name>`; `rm` keeps the branch; `--delete-branch` deletes it only if it is fully merged, otherwise it is kept and the command says so) |
-| `workflows list\|install` | copies the opt-in Workflows `hr-review-changes` (parallel review + adversarial verification, ~10-25 agents) and `hr-plan-execute` (independent plan steps in parallel worktrees, up to ~25 agents, `dryRun` first) into a project's `.claude/workflows/`; they only run when you ask Claude to |
+| `workflows list\|install` | copies the opt-in Workflows `hr-review-changes` (parallel review + adversarial verification, typically 10-40 agents and up to about 85 with the defaults; `votes` and `maxPerDimension` raise it) and `hr-plan-execute` (independent plan steps in parallel worktrees, up to ~25 agents, `dryRun` first) into a project's `.claude/workflows/`; they only run when you ask Claude to |
 | `fmt [paths] [--changed] [--check]` | no arguments: which formatter this repo configures. With paths or `--changed`: format them (`--check` only reports and exits 1 if something needs formatting) |
 | `verify init [--write] [--force]\|status\|trust\|untrust\|run [--tier fast\|full]` | the repo's verify recipe `.claude/hr-verify.toml`: propose it from what the repo declares, trust its exact bytes (a person in a terminal only), run it |
 | `audit [path] [--json] [--strict] [--tools]` | read-only, zero-token audit of a repository (agent-config attack surface, hidden Unicode, workflow lint, masked secrets); `--strict` exits 1 on any high or medium finding |
@@ -215,8 +215,9 @@ if you want it gone), any PATH line you added for the shim, and Headroom's downl
   workspace, so it also wrote `ccr_store.db` and `session_stats.jsonl` to `~/.headroom` (Headroom's default workspace, which also
   holds `memory.db` and your Headroom config if you use Headroom on its own): delete those two files, or the whole folder only if
   you never used Headroom outside claude-hr, then run `claude-hr-ctl setup` to re-register the tool.
-- The end-of-turn gate is best-effort: a hook can be disabled (`disableAllHooks`), and it runs while Claude Code waits (up to
-  `verify.gate_timeout_s`, 120 s, on a turn that changed something). CI is the authoritative gate; `init-repo` scaffolds one.
+- The end-of-turn gate is best-effort: a hook can be disabled (`disableAllHooks`), and it runs while Claude Code waits (on a turn that changed something: up to
+  `format.timeout_s` 30 s plus `verify.gate_timeout_s` 120 s plus git overhead, held under one overall budget of 150 s inside the hook's
+  170 s timeout). CI is the authoritative gate; `init-repo` scaffolds one.
   The hook calls `claude-hr-hook` by name, so it must be on PATH (`doctor` warns when it is not).
 - Pattern checks are not proof: the bash guard, `audit` and the trust-refusal checks catch the common cases and raise the
   cost of the rest (a determined agent can allocate a pty or obfuscate a command). They sit on top of Claude Code's own
@@ -230,10 +231,10 @@ if you want it gone), any PATH line you added for the shim, and Headroom's downl
 
 - **A team skill or subagent**: fork this repo and install your machines from the fork (`CLAUDE_HR_REPO_URL=<your fork> ./install.sh`,
   or `-Repo <url>` on Windows; machines installed with `--local` never self-update). Add `plugins/hr-core/skills/<name>/SKILL.md`
-  (or `agents/<name>.md`), bump the version in `plugins/hr-core/.claude-plugin/plugin.json` *and* `.claude-plugin/marketplace.json`,
+  (or `agents/<name>.md`), bump the version in all four places together (`src/claude_hr/__init__.py`, `pyproject.toml`, `plugins/hr-core/.claude-plugin/plugin.json`, `.claude-plugin/marketplace.json`),
   then push a tag named `vX.Y.Z` in the fork (`git tag vX.Y.Z && git push --tags`). Machines installed from the fork pick it up on
-  their next `claude-hr-ctl update`. Keep `description` short and specific (under ~400 characters) and mark side-effecting
-  workflows `disable-model-invocation: true`. Before tagging run `uv run --with pytest pytest -q tests/test_repo_hygiene.py`
+  their next `claude-hr-ctl update`. Keep `description` short and specific (at most 300 characters, no ALWAYS/MUST/CRITICAL) and mark every new skill
+  `disable-model-invocation: true` (unless you also add its name to `MODEL_INVOKED_SKILLS` in `tests/test_repo_hygiene.py`). Before tagging run `uv run --with pytest pytest -q tests/test_repo_hygiene.py`
   (every skill and agent needs `name` and `description`; versions must agree) and `claude plugin validate plugins/hr-core`
   (validates `plugin.json` only; `claude-hr-ctl skills` audits installed skills, not the checkout).
 - **A third-party plugin**: if it is in Anthropic's SHA-pinned catalog, add `<name>@claude-plugins-official` to a profile in
