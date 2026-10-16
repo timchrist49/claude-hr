@@ -1,9 +1,9 @@
 """Resource governor: session registry, admission control, and hard limits per Claude session.
 
-  * Admission: refuse (or warn) when too many claude-hr sessions run or free RAM is low.
-  * Limits: Linux -> systemd-run scope (MemoryMax/CPUQuota/TasksMax) when available;
-            Windows -> Job Object (memory cap + KILL_ON_JOB_CLOSE so orphaned children die);
-            macOS -> nice only (the OS offers no per-process memory cap).
+* Admission: refuse (or warn) when too many claude-hr sessions run or free RAM is low.
+* Limits: Linux -> systemd-run scope (MemoryMax/CPUQuota/TasksMax) when available;
+          Windows -> Job Object (memory cap + KILL_ON_JOB_CLOSE so orphaned children die);
+          macOS -> nice only (the OS offers no per-process memory cap).
 """
 
 from __future__ import annotations
@@ -31,7 +31,9 @@ def _sessions_dir() -> Path:
 
 def register_session(pid: int, cwd: str, kind: str = "interactive") -> Path:
     f = _sessions_dir() / f"{pid}.json"
-    atomic_write_text(f, json.dumps({"pid": pid, "cwd": cwd, "kind": kind, "started": time.time()}) + "\n")
+    atomic_write_text(
+        f, json.dumps({"pid": pid, "cwd": cwd, "kind": kind, "started": time.time()}) + "\n"
+    )
     return f
 
 
@@ -123,9 +125,23 @@ def admit(cfg: Config) -> Admission:
     if not bool(r.get("enabled", True)):
         return Admission(True, limit, running, avail)
     if running >= limit:
-        return Admission(False, limit, running, avail, f"{running} sessions already running (limit {limit})", "sessions")
+        return Admission(
+            False,
+            limit,
+            running,
+            avail,
+            f"{running} sessions already running (limit {limit})",
+            "sessions",
+        )
     if 0 < avail < min_free:
-        return Admission(False, limit, running, avail, f"only {avail:.1f} GB RAM free (minimum {min_free:.1f} GB)", "ram")
+        return Admission(
+            False,
+            limit,
+            running,
+            avail,
+            f"only {avail:.1f} GB RAM free (minimum {min_free:.1f} GB)",
+            "ram",
+        )
     return Admission(True, limit, running, avail)
 
 
@@ -138,7 +154,10 @@ def child_env(cfg: Config, env: dict[str, str], kind: str = "session") -> dict[s
     env.setdefault("CLAUDE_CODE_MAX_TOOL_USE_CONCURRENCY", str(max(2, min(10, cores))))
     if kind in {"headless", "daemon", "agents"} and bool(r.get("unattended_retry", True)):
         env.setdefault("CLAUDE_CODE_RETRY_WATCHDOG", "1")
-        env.setdefault("CLAUDE_CODE_RETRY_WATCHDOG_MAX_WAIT_MS", str(int(r.get("retry_max_wait_min", 30)) * 60_000))
+        env.setdefault(
+            "CLAUDE_CODE_RETRY_WATCHDOG_MAX_WAIT_MS",
+            str(int(r.get("retry_max_wait_min", 30)) * 60_000),
+        )
     return env
 
 
@@ -161,7 +180,12 @@ def _systemd_scope_available() -> bool:
     c = read_json(cache, {}) or {}
     if time.time() - float(c.get("ts", 0)) < 3600 and "ok" in c:
         return bool(c["ok"])
-    ok = procutil.run(["systemd-run", "--user", "--scope", "--quiet", "--collect", "true"], timeout=10).returncode == 0
+    ok = (
+        procutil.run(
+            ["systemd-run", "--user", "--scope", "--quiet", "--collect", "true"], timeout=10
+        ).returncode
+        == 0
+    )
     try:
         paths.state_dir().mkdir(parents=True, exist_ok=True)
         atomic_write_text(cache, json.dumps({"ts": time.time(), "ok": ok}))
@@ -246,7 +270,12 @@ class WindowsJob:
         k32 = ctypes.WinDLL("kernel32", use_last_error=True)
         k32.CreateJobObjectW.restype = wintypes.HANDLE
         k32.CreateJobObjectW.argtypes = [wintypes.LPVOID, wintypes.LPCWSTR]
-        k32.SetInformationJobObject.argtypes = [wintypes.HANDLE, ctypes.c_int, wintypes.LPVOID, wintypes.DWORD]
+        k32.SetInformationJobObject.argtypes = [
+            wintypes.HANDLE,
+            ctypes.c_int,
+            wintypes.LPVOID,
+            wintypes.DWORD,
+        ]
         k32.AssignProcessToJobObject.argtypes = [wintypes.HANDLE, wintypes.HANDLE]
         k32.OpenProcess.restype = wintypes.HANDLE
         k32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
@@ -267,9 +296,17 @@ class WindowsJob:
             ]
 
         class IOC(ctypes.Structure):
-            _fields_ = [(n, ctypes.c_uint64) for n in (
-                "ReadOperationCount", "WriteOperationCount", "OtherOperationCount",
-                "ReadTransferCount", "WriteTransferCount", "OtherTransferCount")]
+            _fields_ = [
+                (n, ctypes.c_uint64)
+                for n in (
+                    "ReadOperationCount",
+                    "WriteOperationCount",
+                    "OtherOperationCount",
+                    "ReadTransferCount",
+                    "WriteTransferCount",
+                    "OtherTransferCount",
+                )
+            ]
 
         class EXT(ctypes.Structure):
             _fields_ = [
@@ -292,7 +329,9 @@ class WindowsJob:
             flags |= 0x0200  # JOB_OBJECT_LIMIT_JOB_MEMORY
             info.JobMemoryLimit = int(memory_gb * 1024**3)
         info.BasicLimitInformation.LimitFlags = flags
-        if not k32.SetInformationJobObject(self._handle, 9, ctypes.byref(info), ctypes.sizeof(info)):
+        if not k32.SetInformationJobObject(
+            self._handle, 9, ctypes.byref(info), ctypes.sizeof(info)
+        ):
             raise OSError(f"SetInformationJobObject failed ({ctypes.get_last_error()})")
 
     def assign(self, pid: int) -> bool:

@@ -39,6 +39,7 @@ def _color() -> bool:
     """Evaluated lazily: under pythonw.exe (scheduled jobs) sys.stdout is None at import time."""
     return bool(sys.stdout) and sys.stdout.isatty() and os.environ.get("NO_COLOR") is None
 
+
 ALL_STEPS = ["headroom", "settings", "claude-md", "mcp", "plugins", "schedule"]
 
 
@@ -83,13 +84,17 @@ def cmd_setup(a, cfg) -> int:
         if not a.dry_run:
             # a profile chosen at install time must stick: doctor, `plugins sync` and every later `setup` read the config
             ok, msg = _persist_config("plugins.profile", a.profile)
-            out(f"[{'ok ' if ok else 'ERR'}] plugin profile: {msg if not ok else f'{a.profile} saved to {paths.user_config_file()}'}")
+            out(
+                f"[{'ok ' if ok else 'ERR'}] plugin profile: {msg if not ok else f'{a.profile} saved to {paths.user_config_file()}'}"
+            )
             failed += 0 if ok else 1
     if not a.dry_run and str(cfg.get("headroom.footprint", "auto")) == "lite":
         # the lite choice (often made with an environment variable for the installer) decides which Headroom extras later
         # reinstalls and upgrades use, so it must outlive this process
         ok, msg = _persist_config("headroom.footprint", "lite")
-        out(f"[{'ok ' if ok else 'ERR'}] headroom footprint: {msg if not ok else 'lite saved to ' + str(paths.user_config_file())}")
+        out(
+            f"[{'ok ' if ok else 'ERR'}] headroom footprint: {msg if not ok else 'lite saved to ' + str(paths.user_config_file())}"
+        )
         failed += 0 if ok else 1
     if "headroom" in steps and cfg.flag("headroom.enabled", True):
         st = Step("headroom")
@@ -103,7 +108,9 @@ def cmd_setup(a, cfg) -> int:
             st.add("skipped install (--no-headroom-install)")
         else:
             st.changed = True
-            st.add(f"installing {hr.install_spec()} (large download; first start prefetches models)")
+            st.add(
+                f"installing {hr.install_spec()} (large download; first start prefetches models)"
+            )
             r = hr.install(want or None)
             if r.returncode != 0:
                 st.ok = False
@@ -112,7 +119,9 @@ def cmd_setup(a, cfg) -> int:
                 st.add(f"installed {hr.version()}")
         if st.ok and not a.dry_run and hr.binary():
             h = hr.ensure(wait_s=0, announce=lambda m: st.add(m))
-            st.add("proxy healthy" if h.ok else "proxy starting in the background (cold start ~1 min)")
+            st.add(
+                "proxy healthy" if h.ok else "proxy starting in the background (cold start ~1 min)"
+            )
         _print_step(st)
         failed += 0 if st.ok else 1
     for name, fn in (
@@ -136,8 +145,15 @@ def cmd_setup(a, cfg) -> int:
             failed += 1 if bad else 0
     st_file = paths.state_dir() / "install.json"
     if not a.dry_run:
-        write_json(st_file, {"version": __version__, "ts": time.time(), "profile": cfg.get("plugins.profile")})
-    out("\nDone. Open a NEW terminal, then run: claude-hr" if not failed else f"\n{failed} step(s) failed - see above; re-run after fixing.")
+        write_json(
+            st_file,
+            {"version": __version__, "ts": time.time(), "profile": cfg.get("plugins.profile")},
+        )
+    out(
+        "\nDone. Open a NEW terminal, then run: claude-hr"
+        if not failed
+        else f"\n{failed} step(s) failed - see above; re-run after fixing."
+    )
     return 1 if failed else 0
 
 
@@ -170,7 +186,9 @@ def cmd_uninstall(a, cfg) -> int:
     _print_step(setup.unregister_mcp())
     if claude and not a.dry_run:
         for pid in ("hr-core@claude-hr",):
-            procutil.run([str(claude), "plugin", "uninstall", pid, "--scope", "user", "-y"], timeout=120)
+            procutil.run(
+                [str(claude), "plugin", "uninstall", pid, "--scope", "user", "-y"], timeout=120
+            )
         procutil.run([str(claude), "plugin", "marketplace", "remove", "claude-hr"], timeout=120)
     if not a.dry_run:
         hr.stop()
@@ -180,12 +198,18 @@ def cmd_uninstall(a, cfg) -> int:
             procutil.run(["uv", "tool", "uninstall", "headroom-ai"], timeout=300)
             _rmtree_force(paths.hr_home())
             if paths.hr_home().exists():
-                out(f"[warn] could not delete everything under {paths.hr_home()} (files in use?); remove it by hand")
+                out(
+                    f"[warn] could not delete everything under {paths.hr_home()} (files in use?); remove it by hand"
+                )
             else:
                 out("[ok ] purged ~/.claude-hr and uninstalled Headroom")
-    out("Uninstalled managed configuration. Your own settings, plugins and CLAUDE.md content were left untouched.")
+    out(
+        "Uninstalled managed configuration. Your own settings, plugins and CLAUDE.md content were left untouched."
+    )
     if sched_failed:
-        out("[warn] the scheduled jobs could not be removed (see above); remove them with `claude-hr-ctl schedule remove` or in Task Scheduler / systemd")
+        out(
+            "[warn] the scheduled jobs could not be removed (see above); remove them with `claude-hr-ctl schedule remove` or in Task Scheduler / systemd"
+        )
         return 1
     return 0
 
@@ -208,22 +232,34 @@ def cmd_status(a, cfg) -> int:
     snap = monitor.snapshot(cfg)
     h = hr.health()
     out(f"claude-hr {__version__}")
-    out(f"  Headroom   : {'healthy' if h.ok else h.status} {('v' + h.version) if h.version else ''} @ {hr.url}  (mode={cfg.get('headroom.mode')}, profile={cfg.get('headroom.savings_profile')})")
+    out(
+        f"  Headroom   : {'healthy' if h.ok else h.status} {('v' + h.version) if h.version else ''} @ {hr.url}  (mode={cfg.get('headroom.mode')}, profile={cfg.get('headroom.savings_profile')})"
+    )
     if h.ok:
         _, body = procutil.http_json(f"{hr.url}/stats?cached=1", timeout=2.0)
         if isinstance(body, dict):
             life = (body.get("persistent_savings") or {}).get("lifetime") or {}
-            sw = ((body.get("subscription_window") or {}).get("latest") or {})
-            out(f"  Savings    : {life.get('tokens_saved', 0):,} prompt tokens + {life.get('tool_tokens_saved', 0):,} tool-schema tokens "
-                f"over {life.get('requests', 0)} requests (lifetime)")
+            sw = (body.get("subscription_window") or {}).get("latest") or {}
+            out(
+                f"  Savings    : {life.get('tokens_saved', 0):,} prompt tokens + {life.get('tool_tokens_saved', 0):,} tool-schema tokens "
+                f"over {life.get('requests', 0)} requests (lifetime)"
+            )
             if sw.get("five_hour"):
-                out(f"  Plan usage : 5h window {sw['five_hour'].get('utilization_pct')}%  |  7d window {(sw.get('seven_day') or {}).get('utilization_pct')}%")
-    out(f"  Sessions   : {snap['sessions']} running / limit {snap['session_limit']}   RAM free {snap['ram_free_gb']} of {snap['ram_total_gb']} GB   disk free {snap['disk_free_gb']} GB")
+                out(
+                    f"  Plan usage : 5h window {sw['five_hour'].get('utilization_pct')}%  |  7d window {(sw.get('seven_day') or {}).get('utilization_pct')}%"
+                )
+    out(
+        f"  Sessions   : {snap['sessions']} running / limit {snap['session_limit']}   RAM free {snap['ram_free_gb']} of {snap['ram_total_gb']} GB   disk free {snap['disk_free_gb']} GB"
+    )
     led = usage.collect(1)
     t = led.total
-    out(f"  Last 24h   : {t.messages} model calls, {usage._n(t.output)} output tokens, cache hit {t.cache_hit * 100:.0f}%")
+    out(
+        f"  Last 24h   : {t.messages} model calls, {usage._n(t.output)} output tokens, cache hit {t.cache_hit * 100:.0f}%"
+    )
     rep = claudemd.lint(Path.cwd(), cfg)
-    out(f"  CLAUDE.md  : {rep.always_loaded_lines} always-loaded lines (~{rep.est_tokens} tokens), {len([f for f in rep.findings if f.severity == 'fail'])} fail / {len([f for f in rep.findings if f.severity == 'warn'])} warn")
+    out(
+        f"  CLAUDE.md  : {rep.always_loaded_lines} always-loaded lines (~{rep.est_tokens} tokens), {len([f for f in rep.findings if f.severity == 'fail'])} fail / {len([f for f in rep.findings if f.severity == 'warn'])} warn"
+    )
     out("  (details: claude-hr-ctl doctor | claude-hr-ctl plugins audit | claude-hr-ctl usage)")
     return 0
 
@@ -262,7 +298,10 @@ def _persist_config(key: str, raw_value: str) -> tuple[bool, str]:
         f.parent.mkdir(parents=True, exist_ok=True)
         f.write_text(_dump_toml(data), encoding="utf-8")
         return True, f"{key} = {value!r}  ({f})"
-    except (OSError, ValueError) as exc:  # ValueError covers tomllib.TOMLDecodeError and UnicodeDecodeError
+    except (
+        OSError,
+        ValueError,
+    ) as exc:  # ValueError covers tomllib.TOMLDecodeError and UnicodeDecodeError
         return False, f"cannot edit {f}: {exc}"
 
 
@@ -297,7 +336,11 @@ def _toml_val(v) -> str:
 
 
 def _dump_toml(data: dict, prefix: tuple = ()) -> str:
-    lines = ["# edited by `claude-hr-ctl config set` (comments are not preserved)"] if not prefix else []
+    lines = (
+        ["# edited by `claude-hr-ctl config set` (comments are not preserved)"]
+        if not prefix
+        else []
+    )
     for k, v in data.items():
         if not isinstance(v, dict):
             lines.append(f"{_toml_key(k)} = {_toml_val(v)}")
@@ -314,7 +357,9 @@ def cmd_headroom(a, cfg) -> int:
     hr = Headroom(cfg)
     if a.action == "status":
         h = hr.health()
-        out(f"{'healthy' if h.ok else h.status} {h.version} {hr.url}  binary={hr.binary()}  installed={hr.version()}")
+        out(
+            f"{'healthy' if h.ok else h.status} {h.version} {hr.url}  binary={hr.binary()}  installed={hr.version()}"
+        )
         return 0 if h.ok else 1
     if a.action in {"start", "warm"}:
         h = hr.ensure(wait_s=0 if a.action == "warm" else a.wait, announce=out)
@@ -334,7 +379,11 @@ def cmd_headroom(a, cfg) -> int:
         return r.returncode
     if a.action == "logs":
         f = paths.logs_dir() / "headroom-proxy.log"
-        out("\n".join(f.read_text(encoding="utf-8", errors="replace").splitlines()[-a.lines:]) if f.exists() else "no log yet")
+        out(
+            "\n".join(f.read_text(encoding="utf-8", errors="replace").splitlines()[-a.lines :])
+            if f.exists()
+            else "no log yet"
+        )
         return 0
     if a.action == "bench":
         ok = updater.Updater(cfg).smoke_headroom(wait_s=a.wait)
@@ -363,7 +412,9 @@ def cmd_plugins(a, cfg) -> int:
         return 0
     if a.action == "list":
         for p in setup._installed_plugins():
-            out(f"{p['id']:<56} {p.get('scope', ''):<8} {'on ' if p.get('enabled') else 'off'} {p.get('version', '')}")
+            out(
+                f"{p['id']:<56} {p.get('scope', ''):<8} {'on ' if p.get('enabled') else 'off'} {p.get('version', '')}"
+            )
         return 0
     if a.action == "suggest":
         import tomllib as _t
@@ -375,7 +426,9 @@ def cmd_plugins(a, cfg) -> int:
         for pid, meta in plan.get("project_scoped", {}).items():
             if any((cwd / m).exists() for m in meta["markers"]):
                 shown = True
-                out(f"{pid}: this looks like a matching project -> `claude plugin install {pid} --scope project`\n    {meta['why']}")
+                out(
+                    f"{pid}: this looks like a matching project -> `claude plugin install {pid} --scope project`\n    {meta['why']}"
+                )
         if not shown:
             out("no project-scoped plugin suggestions for this directory")
         return 0
@@ -386,11 +439,15 @@ def cmd_skills(a, cfg) -> int:
     msgs, stats = plugins_audit.audit_skills(cfg, Path.cwd())
     for m in msgs:
         out(m)
-    out(f"skills: {stats['user_project_skills']} user/project, {stats['plugin_skills']} from plugins; "
-        f"description text that loads every session: {stats['description_chars']:,} chars (~{stats['description_chars'] // 4:,} tokens)")
+    out(
+        f"skills: {stats['user_project_skills']} user/project, {stats['plugin_skills']} from plugins; "
+        f"description text that loads every session: {stats['description_chars']:,} chars (~{stats['description_chars'] // 4:,} tokens)"
+    )
     if stats["description_chars"] > 12000:
-        out("WARN: large skill listing - Claude drops descriptions of the least-used skills when over budget. "
-            "Disable unused plugins/skills (disable-model-invocation: true).")
+        out(
+            "WARN: large skill listing - Claude drops descriptions of the least-used skills when over budget. "
+            "Disable unused plugins/skills (disable-model-invocation: true)."
+        )
     return 1 if any(m.startswith("FAIL") for m in msgs) else 0
 
 
@@ -406,7 +463,10 @@ def cmd_claudemd(a, cfg) -> int:
             out("headroom not installed")
             return 1
         cmd = [str(b), "learn", *(["--apply"] if a.apply else [])]
-        out("Running `headroom learn` " + ("(writing to CLAUDE.local.md)" if a.apply else "(dry run: nothing written)"))
+        out(
+            "Running `headroom learn` "
+            + ("(writing to CLAUDE.local.md)" if a.apply else "(dry run: nothing written)")
+        )
         r = procutil.run(cmd, timeout=600, env=hr.server_env())
         out((r.stdout + r.stderr).strip()[-3000:])
         if a.apply:
@@ -429,7 +489,13 @@ def cmd_usage(a, cfg) -> int:
         f = d / f"{time.strftime('%Y-%m')}.json"
         cur = read_json(f, {}) or {}
         for day, b in led.by_day.items():
-            cur[day] = {"input": b.input, "output": b.output, "cache_write": b.cache_write, "cache_read": b.cache_read, "messages": b.messages}
+            cur[day] = {
+                "input": b.input,
+                "output": b.output,
+                "cache_write": b.cache_write,
+                "cache_read": b.cache_read,
+                "messages": b.messages,
+            }
         write_json(f, cur)
         out(f"snapshot written: {f}")
         return 0
@@ -446,7 +512,11 @@ def cmd_update(a, cfg) -> int:
 
 
 def cmd_schedule(a, cfg) -> int:
-    msgs = {"install": lambda: schedule.install(cfg), "remove": schedule.remove, "status": schedule.status}[a.action]()
+    msgs = {
+        "install": lambda: schedule.install(cfg),
+        "remove": schedule.remove,
+        "status": schedule.status,
+    }[a.action]()
     for m in msgs:
         out(m)
     return 1 if a.action != "status" and any(_schedule_line(m)[1] for m in msgs) else 0
@@ -488,8 +558,10 @@ def cmd_creds(a, cfg) -> int:
     for f, kind, n in hits[:40]:
         out(f"  {n:4d} x {kind:<26} {f}")
     if hits:
-        out("\nSecrets in transcripts are plaintext on disk. Rotate each affected credential, then delete the file "
-            "(or `claude purge`). Values are never printed here.")
+        out(
+            "\nSecrets in transcripts are plaintext on disk. Rotate each affected credential, then delete the file "
+            "(or `claude purge`). Values are never printed here."
+        )
     else:
         out("no token-shaped secrets found")
     return 1 if hits else 0
@@ -517,14 +589,18 @@ def cmd_shim(a, cfg) -> int:
         shutil.copy2(target, b / "claude.exe")
         (b / "claude.cmd").unlink(missing_ok=True)
         out(f"created {b / 'claude.exe'} (copy of the claude-hr launcher)")
-        out(f'Put it first on PATH (user): [Environment]::SetEnvironmentVariable("Path", "{b};" + [Environment]::GetEnvironmentVariable("Path","User"), "User")')
+        out(
+            f'Put it first on PATH (user): [Environment]::SetEnvironmentVariable("Path", "{b};" + [Environment]::GetEnvironmentVariable("Path","User"), "User")'
+        )
     else:
         f = b / "claude"
         f.write_text(f'#!/bin/sh\nexec "{target}" "$@"\n', encoding="utf-8")
         f.chmod(0o755)
         out(f"created {f}")
         out(f'Put it first on PATH, e.g. add to your shell profile:  export PATH="{b}:$PATH"')
-    out("Plain `claude` now goes through claude-hr. `--hr-direct` or CLAUDE_HR_DIRECT=1 bypasses Headroom.")
+    out(
+        "Plain `claude` now goes through claude-hr. `--hr-direct` or CLAUDE_HR_DIRECT=1 bypasses Headroom."
+    )
     return 0
 
 
@@ -549,17 +625,28 @@ def cmd_workflows(a, cfg) -> int:
     scripts = sorted(src_dir.glob("*.js")) if src_dir.is_dir() else []
     if a.action == "list":
         for s in scripts:
-            first = next((ln for ln in s.read_text(encoding="utf-8").splitlines() if "description:" in ln), "")
+            first = next(
+                (ln for ln in s.read_text(encoding="utf-8").splitlines() if "description:" in ln),
+                "",
+            )
             summary = first.split("description:", 1)[-1].strip().strip(",").strip("'")
             out(f"{s.stem:<24} {summary}")
-        out("\nInstall into a project:  claude-hr-ctl workflows install    then in Claude: ask it to run the 'hr-review-changes' workflow")
+        out(
+            "\nInstall into a project:  claude-hr-ctl workflows install    then in Claude: ask it to run the 'hr-review-changes' workflow"
+        )
         return 0
-    root = worktree.repo_root(Path(a.dir) if a.dir else None) or (Path(a.dir) if a.dir else Path.cwd())
+    root = worktree.repo_root(Path(a.dir) if a.dir else None) or (
+        Path(a.dir) if a.dir else Path.cwd()
+    )
     dest = root / ".claude" / "workflows"
     dest.mkdir(parents=True, exist_ok=True)
     for s in scripts:
         target = dest / s.name
-        if target.exists() and target.read_text(encoding="utf-8") != s.read_text(encoding="utf-8") and not a.force:
+        if (
+            target.exists()
+            and target.read_text(encoding="utf-8") != s.read_text(encoding="utf-8")
+            and not a.force
+        ):
             out(f"{target}: exists and differs; kept (use --force to overwrite)")
             continue
         target.write_text(s.read_text(encoding="utf-8"), encoding="utf-8", newline="\n")
@@ -580,7 +667,9 @@ def cmd_daemon(a, cfg) -> int:
         out(json.dumps({**st, "routed_through_headroom": ours}, indent=2))
         return 0
     procutil.run([str(claude), "daemon", "stop", "--any"], timeout=30)
-    out("Claude background service stopped; the next `claude-hr agents` / `--bg` starts one routed through Headroom.")
+    out(
+        "Claude background service stopped; the next `claude-hr agents` / `--bg` starts one routed through Headroom."
+    )
     return 0
 
 
@@ -615,18 +704,42 @@ def cmd_job(a, cfg) -> int:
                 f = d / f"{time.strftime('%Y-%m')}.json"
                 cur = read_json(f, {}) or {}
                 for day, b in led.by_day.items():
-                    cur[day] = {"input": b.input, "output": b.output, "cache_write": b.cache_write, "cache_read": b.cache_read, "messages": b.messages}
+                    cur[day] = {
+                        "input": b.input,
+                        "output": b.output,
+                        "cache_write": b.cache_write,
+                        "cache_read": b.cache_read,
+                        "messages": b.messages,
+                    }
                 write_json(f, cur)
             hr_learn = Headroom(cfg)
-            if cfg.flag("headroom.enabled", True) and cfg.flag("maintenance.learn_report", True) and hr_learn.binary():
+            if (
+                cfg.flag("headroom.enabled", True)
+                and cfg.flag("maintenance.learn_report", True)
+                and hr_learn.binary()
+            ):
                 # read-only (no --apply): auto-written instructions can lower accuracy, so a human decides
-                r = procutil.run([str(hr_learn.binary()), "learn", "--all"], timeout=600, env=hr_learn.server_env())
-                atomic_write_text(paths.state_dir() / "learn-report.txt", (r.stdout or "") + (r.stderr or ""), follow_symlinks=False)
+                r = procutil.run(
+                    [str(hr_learn.binary()), "learn", "--all"],
+                    timeout=600,
+                    env=hr_learn.server_env(),
+                )
+                atomic_write_text(
+                    paths.state_dir() / "learn-report.txt",
+                    (r.stdout or "") + (r.stderr or ""),
+                    follow_symlinks=False,
+                )
                 msg += " | learn report written"
             hits, scanned = creds.scan_transcripts(7)
             if hits:
-                monitor.deliver(cfg, monitor.Alert("transcript-secrets", "Secrets found in Claude transcripts",
-                                                   f"{len(hits)} finding(s) in {scanned} files; run `claude-hr-ctl creds scan`"))
+                monitor.deliver(
+                    cfg,
+                    monitor.Alert(
+                        "transcript-secrets",
+                        "Secrets found in Claude transcripts",
+                        f"{len(hits)} finding(s) in {scanned} files; run `claude-hr-ctl creds scan`",
+                    ),
+                )
         else:
             return 2
     except Exception as exc:  # a scheduled job must never raise into the scheduler
@@ -639,7 +752,9 @@ def cmd_job(a, cfg) -> int:
 
 # ---------------------------------------------------------------------------------------------
 def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(prog="claude-hr-ctl", description="Manage the claude-hr distribution.")
+    p = argparse.ArgumentParser(
+        prog="claude-hr-ctl", description="Manage the claude-hr distribution."
+    )
     p.add_argument("--version", action="version", version=f"claude-hr {__version__}")
     sub = p.add_subparsers(dest="cmd", required=True)
 
@@ -648,14 +763,20 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--skip", nargs="+", choices=ALL_STEPS)
     s.add_argument("--profile", choices=["minimal", "standard", "full", "lean-output"])
     s.add_argument("--dry-run", action="store_true")
-    s.add_argument("--force", action="store_true", help="overwrite settings keys you changed yourself")
-    s.add_argument("--prune", action="store_true", help="uninstall user-scope plugins outside the profile")
+    s.add_argument(
+        "--force", action="store_true", help="overwrite settings keys you changed yourself"
+    )
+    s.add_argument(
+        "--prune", action="store_true", help="uninstall user-scope plugins outside the profile"
+    )
     s.add_argument("--no-headroom-install", action="store_true")
     s.set_defaults(fn=cmd_setup)
 
     s = sub.add_parser("uninstall", help="remove managed config (your own settings are kept)")
     s.add_argument("--dry-run", action="store_true")
-    s.add_argument("--purge", action="store_true", help="also uninstall Headroom and delete ~/.claude-hr")
+    s.add_argument(
+        "--purge", action="store_true", help="also uninstall Headroom and delete ~/.claude-hr"
+    )
     s.set_defaults(fn=cmd_uninstall)
 
     s = sub.add_parser("doctor", help="health check with fixes")
@@ -671,7 +792,20 @@ def build_parser() -> argparse.ArgumentParser:
     s.set_defaults(fn=cmd_config)
 
     s = sub.add_parser("headroom", help="manage the shared proxy")
-    s.add_argument("action", choices=["status", "start", "warm", "stop", "restart", "install", "upgrade", "logs", "bench"])
+    s.add_argument(
+        "action",
+        choices=[
+            "status",
+            "start",
+            "warm",
+            "stop",
+            "restart",
+            "install",
+            "upgrade",
+            "logs",
+            "bench",
+        ],
+    )
     s.add_argument("--wait", type=float, default=150.0)
     s.add_argument("--version", default="")
     s.add_argument("--lines", type=int, default=60)
@@ -696,7 +830,11 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--days", type=int, default=7)
     s.add_argument("--by", choices=["day", "model", "project"], default="day")
     s.add_argument("--snapshot", action="store_true")
-    s.add_argument("--tools", action="store_true", help="which skills / subagents / MCP servers were actually used")
+    s.add_argument(
+        "--tools",
+        action="store_true",
+        help="which skills / subagents / MCP servers were actually used",
+    )
     s.set_defaults(fn=cmd_usage)
 
     s = sub.add_parser("update", help="staged upgrades with smoke tests and rollback")
@@ -743,7 +881,9 @@ def build_parser() -> argparse.ArgumentParser:
     s = sub.add_parser("job", help=argparse.SUPPRESS)
     s.add_argument("name", choices=list(schedule.JOBS))
     s.set_defaults(fn=cmd_job)
-    sub.add_parser("statusline", help=argparse.SUPPRESS).set_defaults(fn=lambda a, c: hooks.statusline())
+    sub.add_parser("statusline", help=argparse.SUPPRESS).set_defaults(
+        fn=lambda a, c: hooks.statusline()
+    )
     s = sub.add_parser("hook", help=argparse.SUPPRESS)
     s.add_argument("name", choices=["bash-guard"])
     s.set_defaults(fn=lambda a, c: hooks.bash_guard())
@@ -757,14 +897,19 @@ def _log_crash(argv: list[str]) -> None:
     try:
         paths.ensure_dirs()
         with open(paths.logs_dir() / "crash.log", "a", encoding="utf-8") as fh:
-            fh.write(f"--- {time.strftime('%Y-%m-%dT%H:%M:%S')} claude-hr-ctl {' '.join(argv)}\n{traceback.format_exc()}\n")
+            fh.write(
+                f"--- {time.strftime('%Y-%m-%dT%H:%M:%S')} claude-hr-ctl {' '.join(argv)}\n{traceback.format_exc()}\n"
+            )
     except OSError:
         pass
 
 
 def main(argv: list[str] | None = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
-    for name in ("stdout", "stderr"):  # pythonw.exe starts with no console: print() must not blow up
+    for name in (
+        "stdout",
+        "stderr",
+    ):  # pythonw.exe starts with no console: print() must not blow up
         if getattr(sys, name) is None:
             setattr(sys, name, open(os.devnull, "w", encoding="utf-8"))  # noqa: SIM115
     _utf8_stdio()

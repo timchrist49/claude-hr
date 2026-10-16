@@ -79,7 +79,9 @@ class ClaudeSetup:
         wrapper = self.install_process_wrapper()
         want, atomic = baseline.build(self.cfg, self.statusline_command(), wrapper)
         state = read_json(state_file, None)
-        new_doc, new_state, rep = settings_merge.apply_baseline(current, want, state, atomic=atomic, force=force)
+        new_doc, new_state, rep = settings_merge.apply_baseline(
+            current, want, state, atomic=atomic, force=force
+        )
         step.changed = new_doc != current
         step.add(f"{target}: {rep.summary()}")
         for item in rep.kept:
@@ -121,14 +123,20 @@ class ClaudeSetup:
         block = f"{BEGIN}\n@claude-hr/baseline.md\n{END}"
         text, nl = self._read_md(md)
         if BEGIN in text and END in text and text.index(BEGIN) < text.index(END):
-            new = re.sub(re.escape(BEGIN) + r".*?" + re.escape(END), lambda _m: block, text, flags=re.S)
+            new = re.sub(
+                re.escape(BEGIN) + r".*?" + re.escape(END), lambda _m: block, text, flags=re.S
+            )
         else:
-            base = self._strip_managed(text).rstrip()  # also repairs a half-deleted block without touching user text
+            base = self._strip_managed(
+                text
+            ).rstrip()  # also repairs a half-deleted block without touching user text
             new = (base + "\n\n" if base else "") + block + "\n"
         content = src.read_text(encoding="utf-8")
         changed = (not dest.exists() or dest.read_text(encoding="utf-8") != content) or new != text
         step.changed = changed
-        step.add(f"{md}: {'update' if changed else 'up to date'} (import of claude-hr/baseline.md, {len(content.splitlines())} lines)")
+        step.add(
+            f"{md}: {'update' if changed else 'up to date'} (import of claude-hr/baseline.md, {len(content.splitlines())} lines)"
+        )
         if self.dry or not changed:
             return step
         dest_dir.mkdir(parents=True, exist_ok=True)
@@ -142,10 +150,18 @@ class ClaudeSetup:
     def _strip_managed(norm: str) -> str:
         """Remove the managed block; if its markers are damaged, remove only marker/import lines (never user text)."""
         if BEGIN in norm and END in norm and norm.index(BEGIN) < norm.index(END):
-            return re.sub(r"\n*" + re.escape(BEGIN) + r".*?" + re.escape(END) + r"\n*", "\n\n", norm, flags=re.S)
+            return re.sub(
+                r"\n*" + re.escape(BEGIN) + r".*?" + re.escape(END) + r"\n*",
+                "\n\n",
+                norm,
+                flags=re.S,
+            )
         keep = [
-            ln for ln in norm.split("\n")
-            if not ln.startswith("<!-- CLAUDE-HR:BEGIN") and not ln.startswith("<!-- CLAUDE-HR:END") and ln.strip() != "@claude-hr/baseline.md"
+            ln
+            for ln in norm.split("\n")
+            if not ln.startswith("<!-- CLAUDE-HR:BEGIN")
+            and not ln.startswith("<!-- CLAUDE-HR:END")
+            and ln.strip() != "@claude-hr/baseline.md"
         ]
         return "\n".join(keep)
 
@@ -184,12 +200,18 @@ class ClaudeSetup:
         wanted: dict[str, dict] = {}
         if bool(h.get("enabled", True)) and bool(h.get("mcp", True)) and self.hr.binary():
             wanted["headroom"] = self.hr.mcp_server_spec()
-        if bool(h.get("enabled", True)) and str(h.get("code_memory", "serena")) == "serena" and str(
-            h.get("code_memory_scope", "user")
-        ) == "user":
+        if (
+            bool(h.get("enabled", True))
+            and str(h.get("code_memory", "serena")) == "serena"
+            and str(h.get("code_memory_scope", "user")) == "user"
+        ):
             if not self.dry and not self.hr.serena_pin():
                 pin = self.hr.resolve_serena_pin(float(self.cfg.get("updates.cooldown_days", 5)))
-                step.add(f"serena pinned to {pin}" if pin else "serena left unpinned (PyPI unreachable): set headroom.serena_version")
+                step.add(
+                    f"serena pinned to {pin}"
+                    if pin
+                    else "serena left unpinned (PyPI unreachable): set headroom.serena_version"
+                )
             wanted["serena"] = self.hr.serena_spec()
         have = self._registered_mcp()
         managed_file = paths.state_dir() / "mcp-managed.json"
@@ -200,7 +222,9 @@ class ClaudeSetup:
                 managed[name] = spec
                 continue
             if name in have and name not in managed:
-                step.add(f"{name}: a server with this name exists and was not registered by claude-hr; leaving it alone")
+                step.add(
+                    f"{name}: a server with this name exists and was not registered by claude-hr; leaving it alone"
+                )
                 continue
             step.changed = True
             step.add(f"{name}: {'would register' if self.dry else 'register'} (user scope)")
@@ -246,7 +270,9 @@ class ClaudeSetup:
         _seen.add(profile)
         prof = plan.get("profiles", {}).get(profile)
         if prof is None:
-            raise KeyError(f"unknown plugin profile '{profile}' (have: {', '.join(plan.get('profiles', {}))})")
+            raise KeyError(
+                f"unknown plugin profile '{profile}' (have: {', '.join(plan.get('profiles', {}))})"
+            )
         out = self.profile_plugins(plan, prof["extends"], _seen) if prof.get("extends") else []
         for p in prof.get("plugins", []):
             if p not in out:
@@ -331,7 +357,9 @@ class ClaudeSetup:
             for p in installed:
                 if p.get("scope") == "user" and p["id"].split("@")[0] not in keep:
                     step.changed = True
-                    step.add(f"{p['id']}: {'would uninstall' if self.dry else 'uninstall'} (not in profile)")
+                    step.add(
+                        f"{p['id']}: {'would uninstall' if self.dry else 'uninstall'} (not in profile)"
+                    )
                     if not self.dry:
                         self._claude("plugin", "uninstall", p["id"], "--scope", "user", "-y")
         return step

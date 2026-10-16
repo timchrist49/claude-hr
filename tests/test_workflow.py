@@ -23,7 +23,9 @@ def run(scenario="normal", args=None):
 
 def test_meta_is_a_pure_literal():
     text = WF.read_text(encoding="utf-8")
-    meta = text[text.index("export const meta") : text.index("\n}\n", text.index("export const meta")) + 3]
+    meta = text[
+        text.index("export const meta") : text.index("\n}\n", text.index("export const meta")) + 3
+    ]
     assert "${" not in meta and "`" not in meta, "meta must be a pure literal (no interpolation)"
     assert "(" not in meta, "meta must not contain calls"
     name = re.search(r"name:\s*'([^']+)'", meta).group(1)
@@ -40,12 +42,16 @@ def test_survivors_are_deduped_ranked_and_the_fake_is_refuted():
     assert "fake bug" not in titles  # both skeptics refuted it (2 of 2 is a majority)
     assert titles[0] == "real bug"  # highest severity first
     a10 = [f for f in res["confirmed"] if f["file"] == "a.py" and f["line"] == 10]
-    assert len(a10) == 1 and "security" in a10[0].get("alsoFoundBy", [])  # same spot from two dimensions -> one finding
+    assert len(a10) == 1 and "security" in a10[0].get(
+        "alsoFoundBy", []
+    )  # same spot from two dimensions -> one finding
     assert "minor" in titles
     assert res["markdown"].startswith("- [high] a.py:10")
     assert out["calls"].count("scope") == 1
     assert sum(c.startswith("find:") for c in out["calls"]) == 5
-    assert sum(c.startswith("verify:") for c in out["calls"]) == (3 + 1) * 2  # 4 findings x 2 skeptics
+    assert (
+        sum(c.startswith("verify:") for c in out["calls"]) == (3 + 1) * 2
+    )  # 4 findings x 2 skeptics
 
 
 @needs_node
@@ -60,7 +66,9 @@ def test_args_select_dimensions_votes_and_cap():
     out = run(args={"dimensions": ["correctness"], "votes": 3, "maxPerDimension": 2})
     assert sum(c.startswith("find:") for c in out["calls"]) == 1
     assert sum(c.startswith("verify:") for c in out["calls"]) == 2 * 3
-    assert any("not checked" in m for m in out["logs"]), "dropping findings must be logged, not silent"
+    assert any("not checked" in m for m in out["logs"]), (
+        "dropping findings must be logged, not silent"
+    )
 
 
 @needs_node

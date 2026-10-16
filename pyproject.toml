@@ -36,6 +36,9 @@ markers = ["real_helpers: calls the real self-update helper functions (they must
 line-length = 100
 target-version = "py311"
 
+[tool.ruff.format]
+line-ending = "lf"            # the repo is LF everywhere (tests/test_repo_hygiene.py), also on Windows
+
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "UP", "B"]
 ignore = ["E501"]

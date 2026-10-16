@@ -50,7 +50,9 @@ def backup_file(path: Path, backup_dir: Path, keep: int = 20) -> Path | None:
     return dest
 
 
-def atomic_write_text(path: Path, text: str, newline: str = "\n", follow_symlinks: bool = True) -> None:
+def atomic_write_text(
+    path: Path, text: str, newline: str = "\n", follow_symlinks: bool = True
+) -> None:
     """Write text atomically (temp file in the same dir + os.replace).
 
     * A symlinked target (dotfiles repos) is written THROUGH the link, not replaced by a regular file. Pass

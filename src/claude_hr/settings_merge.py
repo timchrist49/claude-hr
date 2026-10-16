@@ -68,7 +68,9 @@ def _delete(doc: dict, path: Path) -> None:
             break
 
 
-def _flatten(doc: dict, atomic: set[Path], prefix: Path = ()) -> tuple[dict[Path, Any], dict[Path, list]]:
+def _flatten(
+    doc: dict, atomic: set[Path], prefix: Path = ()
+) -> tuple[dict[Path, Any], dict[Path, list]]:
     leaves: dict[Path, Any] = {}
     lists: dict[Path, list] = {}
     for key, value in doc.items():

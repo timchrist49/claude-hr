@@ -103,7 +103,9 @@ def plan(cfg: Config) -> Plan:
     if jobs.is_dir():
         active = _active_job_ids()
         if active is None:
-            out.skipped.append("jobs/: cannot tell which sessions are active (`claude agents --json` failed); not touching job dirs")
+            out.skipped.append(
+                "jobs/: cannot tell which sessions are active (`claude agents --json` failed); not touching job dirs"
+            )
         for d in sorted(jobs.iterdir()) if active is not None else []:
             if not d.is_dir():
                 continue
@@ -112,7 +114,14 @@ def plan(cfg: Config) -> Plan:
                 continue
             tmp = d / "tmp"
             if tmp.is_dir() and (time.time() - _last_activity(d)) > jobs_days * 86400:
-                out.items.append(Item(tmp, "job-scratch", _size_mb(tmp), f"finished session scratch older than {jobs_days:.0f}d"))
+                out.items.append(
+                    Item(
+                        tmp,
+                        "job-scratch",
+                        _size_mb(tmp),
+                        f"finished session scratch older than {jobs_days:.0f}d",
+                    )
+                )
 
     # MCP server logs (macOS ~/Library/Caches, Windows %LOCALAPPDATA%, Linux ~/.cache)
     for base in _cli_cache_dirs():
@@ -131,11 +140,20 @@ def plan(cfg: Config) -> Plan:
     daemon_log = ch / "daemon.log"
     cap = float(m.get("daemon_log_max_mb", 100))
     if daemon_log.is_file() and _size_mb(daemon_log) > cap:
-        out.items.append(Item(daemon_log, "daemon-log", _size_mb(daemon_log), f"larger than {cap:.0f} MB (rotated, not deleted)"))
+        out.items.append(
+            Item(
+                daemon_log,
+                "daemon-log",
+                _size_mb(daemon_log),
+                f"larger than {cap:.0f} MB (rotated, not deleted)",
+            )
+        )
 
     for f in paths.logs_dir().glob("*") if paths.logs_dir().is_dir() else []:
         if f.is_file() and _older_than(f, log_days) and f.suffix in {".log", ".jsonl", ".old"}:
-            out.items.append(Item(f, "hr-log", _size_mb(f), f"claude-hr log older than {log_days:.0f}d"))
+            out.items.append(
+                Item(f, "hr-log", _size_mb(f), f"claude-hr log older than {log_days:.0f}d")
+            )
     return out
 
 
@@ -146,7 +164,9 @@ def _cli_cache_dirs() -> list[Path]:
     elif paths.IS_MAC:
         cands.append(paths.home() / "Library" / "Caches" / "claude-cli-nodejs")
     else:
-        cands.append(Path(os.environ.get("XDG_CACHE_HOME", paths.home() / ".cache")) / "claude-cli-nodejs")
+        cands.append(
+            Path(os.environ.get("XDG_CACHE_HOME", paths.home() / ".cache")) / "claude-cli-nodejs"
+        )
     return [c for c in cands if c.is_dir()]
 
 

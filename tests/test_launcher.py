@@ -33,7 +33,14 @@ def test_classify(args, kind):
 
 def test_split_hr_flags_only_strips_hr_switches():
     opts, rest = launcher._split_hr_flags(
-        ["--hr-verbose", "agents", "--hr-wait", "5", "--dangerously-skip-permissions", "--hr-dry-run"]
+        [
+            "--hr-verbose",
+            "agents",
+            "--hr-wait",
+            "5",
+            "--dangerously-skip-permissions",
+            "--hr-dry-run",
+        ]
     )
     assert opts == {"verbose": True, "wait": 5.0, "dry-run": True}
     assert rest == ["agents", "--dangerously-skip-permissions"]
@@ -46,12 +53,20 @@ def test_double_dash_passes_everything_after_to_claude():
 
 
 def test_dry_run_plans_without_launching(sandbox, monkeypatch, capsys):
-    monkeypatch.setattr(launcher.procutil, "find_claude", lambda *_a, **_k: __import__("pathlib").Path("/bin/claude"))
+    monkeypatch.setattr(
+        launcher.procutil,
+        "find_claude",
+        lambda *_a, **_k: __import__("pathlib").Path("/bin/claude"),
+    )
     monkeypatch.setenv("CLAUDE_HR_HEADROOM__ENABLED", "false")
     rc = launcher.main(["--hr-dry-run", "agents", "--dangerously-skip-permissions"])
     err = capsys.readouterr().err
     assert rc == 0
-    assert "kind=agents" in err and "agents --dangerously-skip-permissions" in err and "route=direct" in err
+    assert (
+        "kind=agents" in err
+        and "agents --dangerously-skip-permissions" in err
+        and "route=direct" in err
+    )
 
 
 def test_missing_claude_returns_127(sandbox, monkeypatch, capsys):
@@ -60,7 +75,11 @@ def test_missing_claude_returns_127(sandbox, monkeypatch, capsys):
 
 
 def test_not_logged_in_goes_direct(sandbox, monkeypatch, capsys):
-    monkeypatch.setattr(launcher.procutil, "find_claude", lambda *_a, **_k: __import__("pathlib").Path("/bin/claude"))
+    monkeypatch.setattr(
+        launcher.procutil,
+        "find_claude",
+        lambda *_a, **_k: __import__("pathlib").Path("/bin/claude"),
+    )
     monkeypatch.setattr(launcher.paths, "IS_MAC", False)
     for k in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN"):
         monkeypatch.delenv(k, raising=False)
@@ -99,7 +118,10 @@ def test_launcher_import_stays_light():
         "print(loaded)\n"
         "sys.exit(1 if loaded else 0)\n"
     )
-    env = {**__import__("os").environ, "PYTHONPATH": str(Path(__file__).resolve().parents[1] / "src")}
+    env = {
+        **__import__("os").environ,
+        "PYTHONPATH": str(Path(__file__).resolve().parents[1] / "src"),
+    }
     r = subprocess.run([sys.executable, "-c", code], env=env, capture_output=True, text=True)
     assert r.returncode == 0, r.stdout + r.stderr
 
@@ -139,9 +161,13 @@ def test_classify_with_real_cli_shape():
     assert c("--model", "sonnet", "agents") == "agents"  # flag value is not the subcommand
     assert c("--model", "sonnet", "fix the tests") == "session"
     assert c("--add-dir", "agents", "other") == "session"  # `agents` is a directory name here
-    assert c("--add-dir", "a", "b", "agents") == "session"  # a variadic option swallows every token up to the next flag
+    assert (
+        c("--add-dir", "a", "b", "agents") == "session"
+    )  # a variadic option swallows every token up to the next flag
     assert c("--add-dir", "a", "--dangerously-skip-permissions", "agents") == "agents"
-    assert c("--debug", "mcp", "list") == "session"  # optional-value [filter] takes "mcp" (commander semantics)
+    assert (
+        c("--debug", "mcp", "list") == "session"
+    )  # optional-value [filter] takes "mcp" (commander semantics)
     assert c("purge", "/x") == "passthrough"  # subcommands newer than the static list
     assert c("ultrareview") == "passthrough"
     assert c("--model", "opus", "--version") == "passthrough"

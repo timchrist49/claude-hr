@@ -69,7 +69,12 @@ def _linux_memstatus() -> tuple[int, int]:
 
 
 def _mac_memstatus() -> tuple[int, int]:
-    total = int(subprocess.run(["sysctl", "-n", "hw.memsize"], capture_output=True, text=True).stdout.strip() or 0)
+    total = int(
+        subprocess.run(
+            ["sysctl", "-n", "hw.memsize"], capture_output=True, text=True
+        ).stdout.strip()
+        or 0
+    )
     out = subprocess.run(["vm_stat"], capture_output=True, text=True).stdout
     page = 4096
     free = inactive = spec = 0
@@ -155,6 +160,7 @@ def dir_size_gb(path: Path, budget_s: float = 5.0) -> float:
 # processes
 # ---------------------------------------------------------------------------------------------
 
+
 def _k32():
     """kernel32 with correct 64-bit prototypes (default ctypes int args truncate HANDLEs)."""
     import ctypes
@@ -166,6 +172,7 @@ def _k32():
     k32.GetExitCodeProcess.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
     k32.CloseHandle.argtypes = [wintypes.HANDLE]
     return k32
+
 
 def pid_alive(pid: int) -> bool:
     """Safe liveness check. NEVER uses os.kill on Windows (signal 0 there terminates the process)."""
@@ -203,7 +210,9 @@ def process_rss_mb(pid: int) -> float:
                 if line.startswith("VmRSS:"):
                     return int(line.split()[1]) / 1024
         elif paths.IS_MAC:
-            out = subprocess.run(["ps", "-o", "rss=", "-p", str(pid)], capture_output=True, text=True).stdout
+            out = subprocess.run(
+                ["ps", "-o", "rss=", "-p", str(pid)], capture_output=True, text=True
+            ).stdout
             return int(out.strip() or 0) / 1024
         else:
             import ctypes
@@ -225,7 +234,11 @@ def process_rss_mb(pid: int) -> float:
 
             k32 = _k32()
             psapi = ctypes.WinDLL("psapi", use_last_error=True)
-            psapi.GetProcessMemoryInfo.argtypes = [wintypes.HANDLE, ctypes.POINTER(PMC), wintypes.DWORD]
+            psapi.GetProcessMemoryInfo.argtypes = [
+                wintypes.HANDLE,
+                ctypes.POINTER(PMC),
+                wintypes.DWORD,
+            ]
             handle = k32.OpenProcess(0x1000 | 0x0010, False, pid)
             if not handle:
                 return 0.0

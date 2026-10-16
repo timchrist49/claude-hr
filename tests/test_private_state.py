@@ -34,7 +34,13 @@ def test_ensure_dirs_makes_state_owner_only(sandbox):
 
 
 def _loose_install():
-    for d in (paths.hr_home(), paths.state_dir(), paths.logs_dir(), paths.backups_dir(), paths.cache_dir()):
+    for d in (
+        paths.hr_home(),
+        paths.state_dir(),
+        paths.logs_dir(),
+        paths.backups_dir(),
+        paths.cache_dir(),
+    ):
         d.mkdir(parents=True, exist_ok=True)
         d.chmod(0o775)  # what an install from a release that predates owner-only folders looks like
 
@@ -54,7 +60,13 @@ def test_any_ctl_command_tightens_an_upgraded_install(sandbox):
 
     _loose_install()
     assert ctl._run(["config", "show"]) == 0
-    for d in (paths.hr_home(), paths.state_dir(), paths.logs_dir(), paths.backups_dir(), paths.cache_dir()):
+    for d in (
+        paths.hr_home(),
+        paths.state_dir(),
+        paths.logs_dir(),
+        paths.backups_dir(),
+        paths.cache_dir(),
+    ):
         assert mode(d) == 0o700, d
 
 
@@ -64,13 +76,21 @@ def test_launching_tightens_an_upgraded_install(sandbox):
 
     _loose_install()
     launcher._remember_launch(12345, None)
-    for d in (paths.hr_home(), paths.state_dir(), paths.logs_dir(), paths.backups_dir(), paths.cache_dir()):
+    for d in (
+        paths.hr_home(),
+        paths.state_dir(),
+        paths.logs_dir(),
+        paths.backups_dir(),
+        paths.cache_dir(),
+    ):
         assert mode(d) == 0o700, d
 
 
 @posix_only
 def test_ensure_dirs_never_locks_down_the_users_home(sandbox, monkeypatch):
-    monkeypatch.setenv("CLAUDE_HR_HOME", str(sandbox))  # misconfiguration: claude-hr home == user home
+    monkeypatch.setenv(
+        "CLAUDE_HR_HOME", str(sandbox)
+    )  # misconfiguration: claude-hr home == user home
     sandbox.chmod(0o755)
     paths.ensure_dirs()
     assert mode(sandbox) == 0o755

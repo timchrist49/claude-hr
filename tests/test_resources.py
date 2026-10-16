@@ -53,8 +53,12 @@ def test_child_env_caps_fanout_and_unattended_retry(sandbox, monkeypatch):
     assert env["CLAUDE_CODE_RETRY_WATCHDOG"] == "1"
     assert env["CLAUDE_CODE_RETRY_WATCHDOG_MAX_WAIT_MS"] == "1800000"
     assert "CLAUDE_CODE_RETRY_WATCHDOG" not in resources.child_env(config.load(), {}, "session")
-    keep = resources.child_env(config.load(), {"CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS": "2"}, "session")
-    assert keep["CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS"] == "2"  # a user's explicit value is never overridden
+    keep = resources.child_env(
+        config.load(), {"CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS": "2"}, "session"
+    )
+    assert (
+        keep["CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS"] == "2"
+    )  # a user's explicit value is never overridden
 
 
 def test_posix_prefix_noop_without_systemd(sandbox, monkeypatch):

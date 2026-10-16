@@ -36,7 +36,9 @@ def _never_start_real_update_helpers(request, monkeypatch):
     from claude_hr import updater
 
     def refuse(*args, **kwargs):
-        raise AssertionError("test tried to start a real self-update helper: monkeypatch it or mark the test real_helpers")
+        raise AssertionError(
+            "test tried to start a real self-update helper: monkeypatch it or mark the test real_helpers"
+        )
 
     monkeypatch.setattr(updater, "_start_helper_task", refuse)
     monkeypatch.setattr(updater, "_spawn_detached", refuse)
@@ -45,8 +47,12 @@ def _never_start_real_update_helpers(request, monkeypatch):
 
 # ---- guard: the suite must never touch the machine's real Claude / claude-hr profile ---------------------------------
 _REAL_HOME = Path(os.environ.get("USERPROFILE") or os.environ.get("HOME") or Path.home())
-_WATCHED = [_REAL_HOME / ".claude-hr", _REAL_HOME / ".claude" / "settings.json", _REAL_HOME / ".claude" / "CLAUDE.md",
-            _REAL_HOME / ".claude.json"]
+_WATCHED = [
+    _REAL_HOME / ".claude-hr",
+    _REAL_HOME / ".claude" / "settings.json",
+    _REAL_HOME / ".claude" / "CLAUDE.md",
+    _REAL_HOME / ".claude.json",
+]
 
 
 def _fingerprint():

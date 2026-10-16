@@ -36,7 +36,10 @@ class Spec:
 
 
 def specs(cfg: Config) -> list[Spec]:
-    out = [Spec("warm", "logon"), Spec("monitor", "interval", minutes=int(cfg.get("monitor.interval_minutes", 15)))]
+    out = [
+        Spec("warm", "logon"),
+        Spec("monitor", "interval", minutes=int(cfg.get("monitor.interval_minutes", 15))),
+    ]
     if cfg.flag("updates.enabled", True):
         out.append(Spec("update", "daily", at=str(cfg.get("updates.at", "03:17"))))
     out.append(Spec("maintain", "weekly", at="04:41", weekday=0))
@@ -62,7 +65,7 @@ def render_systemd(spec: Spec, argv: list[str], path_env: str) -> tuple[str, str
         # quoted: systemd splits an unquoted Environment= value on whitespace ("Program Files" in a WSL PATH would be cut)
         # KillMode=process: the daily update ends by starting its own reinstall as a child; the default (control-group) would
         # kill that child together with the job the moment the job exits
-        f"[Service]\nType=oneshot\nKillMode=process\nNice=10\nEnvironment=\"PATH={path_env.replace(chr(34), '')}\"\nExecStart={cmd}\n"
+        f'[Service]\nType=oneshot\nKillMode=process\nNice=10\nEnvironment="PATH={path_env.replace(chr(34), "")}"\nExecStart={cmd}\n'
     )
     if spec.kind == "logon":
         when = "OnBootSec=45s\nOnStartupSec=45s"
@@ -136,7 +139,9 @@ def render_windows_script(all_specs: list[Spec], argv: list[str]) -> str:
         elif s.kind == "daily":
             trig = f"New-ScheduledTaskTrigger -Daily -At '{s.at}'"
         else:
-            day = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"][s.weekday]
+            day = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"][
+                s.weekday
+            ]
             trig = f"New-ScheduledTaskTrigger -Weekly -DaysOfWeek {day} -At '{s.at}'"
         lines.append(
             f"Register-ScheduledTask -TaskName '{name}' -Force -Action ({action}) -Trigger ({trig}) "
@@ -164,8 +169,26 @@ def install(cfg: Config) -> list[str]:
     msgs: list[str] = []
     if paths.IS_WINDOWS:
         script = render_windows_script(sp, argv)
-        r = procutil.run(["powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", script], timeout=120)
-        msgs.append("Task Scheduler: " + ("registered " + ", ".join(s.name for s in sp) if r.returncode == 0 else f"FAILED {r.stderr.strip()[:300]}"))
+        r = procutil.run(
+            [
+                "powershell",
+                "-NoProfile",
+                "-NonInteractive",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-Command",
+                script,
+            ],
+            timeout=120,
+        )
+        msgs.append(
+            "Task Scheduler: "
+            + (
+                "registered " + ", ".join(s.name for s in sp)
+                if r.returncode == 0
+                else f"FAILED {r.stderr.strip()[:300]}"
+            )
+        )
     elif paths.IS_MAC:
         d = paths.home() / "Library" / "LaunchAgents"
         d.mkdir(parents=True, exist_ok=True)
@@ -175,7 +198,10 @@ def install(cfg: Config) -> list[str]:
             f.write_bytes(render_launchd(s, argv, path_env))
             procutil.run(["launchctl", "bootout", f"gui/{uid}", str(f)], timeout=20)
             r = procutil.run(["launchctl", "bootstrap", f"gui/{uid}", str(f)], timeout=20)
-            msgs.append(f"launchd {s.name}: " + ("ok" if r.returncode == 0 else f"FAILED {r.stderr.strip()[:200]}"))
+            msgs.append(
+                f"launchd {s.name}: "
+                + ("ok" if r.returncode == 0 else f"FAILED {r.stderr.strip()[:200]}")
+            )
     elif _systemd_user_ok():
         d = paths.home() / ".config" / "systemd" / "user"
         d.mkdir(parents=True, exist_ok=True)
@@ -185,19 +211,37 @@ def install(cfg: Config) -> list[str]:
             (d / f"{PREFIX}-{s.name}.timer").write_text(timer)
         procutil.run(["systemctl", "--user", "daemon-reload"], timeout=20)
         for s in sp:
-            r = procutil.run(["systemctl", "--user", "enable", "--now", f"{PREFIX}-{s.name}.timer"], timeout=20)
-            msgs.append(f"systemd timer {s.name}: " + ("ok" if r.returncode == 0 else f"FAILED {r.stderr.strip()[:200]}"))
-        msgs.append("headless VM? run once as root: loginctl enable-linger $USER  (keeps timers running without a login)")
+            r = procutil.run(
+                ["systemctl", "--user", "enable", "--now", f"{PREFIX}-{s.name}.timer"], timeout=20
+            )
+            msgs.append(
+                f"systemd timer {s.name}: "
+                + ("ok" if r.returncode == 0 else f"FAILED {r.stderr.strip()[:200]}")
+            )
+        msgs.append(
+            "headless VM? run once as root: loginctl enable-linger $USER  (keeps timers running without a login)"
+        )
     else:
         cur = procutil.run(["crontab", "-l"], timeout=10)
         if cur.returncode != 0 and "no crontab for" not in (cur.stderr + cur.stdout).lower():
             # a timeout / permission error is NOT "empty": writing back would wipe the user's whole crontab
-            return [f"cron: could not read the current crontab ({(cur.stderr or cur.stdout).strip()[:120]}); not touching it"]
+            return [
+                f"cron: could not read the current crontab ({(cur.stderr or cur.stdout).strip()[:120]}); not touching it"
+            ]
         base = cur.stdout if cur.returncode == 0 else ""
-        base = re.sub(re.escape(CRON_BEGIN) + r".*?" + re.escape(CRON_END) + r"\n?", "", base, flags=re.S)
+        base = re.sub(
+            re.escape(CRON_BEGIN) + r".*?" + re.escape(CRON_END) + r"\n?", "", base, flags=re.S
+        )
         new = base.rstrip("\n") + ("\n" if base.strip() else "") + render_cron(sp, argv, path_env)
         r = procutil.run(["crontab", "-"], timeout=10, input_text=new)
-        msgs.append("cron: " + ("installed managed block" if r.returncode == 0 else f"FAILED {r.stderr.strip()[:200]}"))
+        msgs.append(
+            "cron: "
+            + (
+                "installed managed block"
+                if r.returncode == 0
+                else f"FAILED {r.stderr.strip()[:200]}"
+            )
+        )
     return msgs
 
 
@@ -218,7 +262,9 @@ def remove() -> list[str]:
             "if ($t.Count -gt 0) { $t | Unregister-ScheduledTask -Confirm:$false }; Write-Output $t.Count } "
             "catch { [Console]::Error.WriteLine($_.Exception.Message); exit 1 }"
         )
-        r = procutil.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", script], timeout=60)
+        r = procutil.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command", script], timeout=60
+        )
         if r.returncode != 0:
             msgs.append(f"FAILED {(r.stderr or r.stdout).strip()[:200]}")
         elif (r.stdout or "").strip() in ("", "0"):
@@ -228,7 +274,12 @@ def remove() -> list[str]:
     elif paths.IS_MAC:
         uid = os.getuid()
         for s in JOBS:
-            f = paths.home() / "Library" / "LaunchAgents" / f"io.github.timchrist49.{PREFIX}.{s}.plist"
+            f = (
+                paths.home()
+                / "Library"
+                / "LaunchAgents"
+                / f"io.github.timchrist49.{PREFIX}.{s}.plist"
+            )
             if f.exists():
                 procutil.run(["launchctl", "bootout", f"gui/{uid}", str(f)], timeout=20)
                 f.unlink()
@@ -237,7 +288,9 @@ def remove() -> list[str]:
         if _systemd_user_ok():
             d = paths.home() / ".config" / "systemd" / "user"
             for s in JOBS:
-                procutil.run(["systemctl", "--user", "disable", "--now", f"{PREFIX}-{s}.timer"], timeout=20)
+                procutil.run(
+                    ["systemctl", "--user", "disable", "--now", f"{PREFIX}-{s}.timer"], timeout=20
+                )
                 for ext in ("service", "timer"):
                     (d / f"{PREFIX}-{s}.{ext}").unlink(missing_ok=True)
             procutil.run(["systemctl", "--user", "daemon-reload"], timeout=20)
@@ -245,7 +298,12 @@ def remove() -> list[str]:
         if procutil.cmd_exists("crontab"):
             cur = procutil.run(["crontab", "-l"], timeout=10)
             if cur.returncode == 0 and CRON_BEGIN in cur.stdout:
-                new = re.sub(re.escape(CRON_BEGIN) + r".*?" + re.escape(CRON_END) + r"\n?", "", cur.stdout, flags=re.S)
+                new = re.sub(
+                    re.escape(CRON_BEGIN) + r".*?" + re.escape(CRON_END) + r"\n?",
+                    "",
+                    cur.stdout,
+                    flags=re.S,
+                )
                 procutil.run(["crontab", "-"], timeout=10, input_text=new)
                 msgs.append("cron block: removed")
     return msgs
@@ -254,18 +312,33 @@ def remove() -> list[str]:
 def status() -> list[str]:
     out: list[str] = []
     if paths.IS_WINDOWS:
-        r = procutil.run(["powershell", "-NoProfile", "-NonInteractive", "-Command",
-                          "Get-ScheduledTask -TaskPath '\\claude-hr\\' -ErrorAction SilentlyContinue | "
-                          "ForEach-Object { $i = $_ | Get-ScheduledTaskInfo; '{0} {1} last={2} next={3}' -f $_.TaskName, $_.State, $i.LastRunTime, $i.NextRunTime }"],
-                         timeout=60)
+        r = procutil.run(
+            [
+                "powershell",
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "Get-ScheduledTask -TaskPath '\\claude-hr\\' -ErrorAction SilentlyContinue | "
+                "ForEach-Object { $i = $_ | Get-ScheduledTaskInfo; '{0} {1} last={2} next={3}' -f $_.TaskName, $_.State, $i.LastRunTime, $i.NextRunTime }",
+            ],
+            timeout=60,
+        )
         out = [ln for ln in r.stdout.splitlines() if ln.strip()]
     elif paths.IS_MAC:
         for s in JOBS:
-            f = paths.home() / "Library" / "LaunchAgents" / f"io.github.timchrist49.{PREFIX}.{s}.plist"
+            f = (
+                paths.home()
+                / "Library"
+                / "LaunchAgents"
+                / f"io.github.timchrist49.{PREFIX}.{s}.plist"
+            )
             out.append(f"{s}: {'installed' if f.exists() else 'missing'}")
     else:
         if _systemd_user_ok():
-            r = procutil.run(["systemctl", "--user", "list-timers", f"{PREFIX}-*", "--all", "--no-pager"], timeout=20)
+            r = procutil.run(
+                ["systemctl", "--user", "list-timers", f"{PREFIX}-*", "--all", "--no-pager"],
+                timeout=20,
+            )
             out += [ln for ln in r.stdout.splitlines() if PREFIX in ln]
         if procutil.cmd_exists("crontab"):
             cur = procutil.run(["crontab", "-l"], timeout=10)

@@ -10,7 +10,11 @@ SKIP = {".git", "__pycache__", ".venv", ".pytest_cache", ".ruff_cache", "dist", 
 
 def text_files():
     for p in ROOT.rglob("*"):
-        if p.is_file() and not any(part in SKIP for part in p.parts) and p.suffix not in {".png", ".gif", ".ico", ".whl", ".pyc"}:
+        if (
+            p.is_file()
+            and not any(part in SKIP for part in p.parts)
+            and p.suffix not in {".png", ".gif", ".ico", ".whl", ".pyc"}
+        ):
             yield p
 
 
@@ -32,22 +36,30 @@ def test_plugin_and_marketplace_manifests_are_consistent():
     assert mk["name"] == "claude-hr"
     for entry in mk["plugins"]:
         if isinstance(entry["source"], dict):  # third-party: must be pinned to a full commit SHA
-            assert re.fullmatch(r"[0-9a-f]{40}", entry["source"].get("sha", "")), f"{entry['name']} is not SHA-pinned"
+            assert re.fullmatch(r"[0-9a-f]{40}", entry["source"].get("sha", "")), (
+                f"{entry['name']} is not SHA-pinned"
+            )
             continue
         src = ROOT / entry["source"]
         manifest = json.loads((src / ".claude-plugin" / "plugin.json").read_text(encoding="utf-8"))
         assert manifest["name"] == entry["name"]
-        assert manifest["version"] == entry["version"], "marketplace and plugin.json versions must match"
+        assert manifest["version"] == entry["version"], (
+            "marketplace and plugin.json versions must match"
+        )
 
 
 def test_versions_agree():
     init = (ROOT / "src" / "claude_hr" / "__init__.py").read_text(encoding="utf-8")
     py = (ROOT / "pyproject.toml").read_text(encoding="utf-8")
-    assert re.search(r'__version__ = "([^"]+)"', init).group(1) == re.search(r'(?m)^version = "([^"]+)"', py).group(1)
+    assert re.search(r'__version__ = "([^"]+)"', init).group(1) == re.search(
+        r'(?m)^version = "([^"]+)"', py
+    ).group(1)
 
 
 def test_every_skill_and_agent_has_frontmatter_description():
-    for md in list((ROOT / "plugins").rglob("SKILL.md")) + list((ROOT / "plugins").glob("*/agents/*.md")):
+    for md in list((ROOT / "plugins").rglob("SKILL.md")) + list(
+        (ROOT / "plugins").glob("*/agents/*.md")
+    ):
         text = md.read_text(encoding="utf-8")
         assert text.startswith("---\n"), md
         fm = text.split("---", 2)[1]
@@ -58,10 +70,14 @@ def test_every_skill_and_agent_has_frontmatter_description():
 def test_skill_and_agent_names_match_their_location():
     """A skill's frontmatter name must equal its directory, an agent's its file name (a rename once garbled one)."""
     for md in (ROOT / "plugins").rglob("SKILL.md"):
-        name = re.search(r"(?m)^name:\s*(\S+)", md.read_text(encoding="utf-8").split("---", 2)[1]).group(1)
+        name = re.search(
+            r"(?m)^name:\s*(\S+)", md.read_text(encoding="utf-8").split("---", 2)[1]
+        ).group(1)
         assert name == md.parent.name, f"{md}: name {name!r} != directory {md.parent.name!r}"
     for md in (ROOT / "plugins").glob("*/agents/*.md"):
-        name = re.search(r"(?m)^name:\s*(\S+)", md.read_text(encoding="utf-8").split("---", 2)[1]).group(1)
+        name = re.search(
+            r"(?m)^name:\s*(\S+)", md.read_text(encoding="utf-8").split("---", 2)[1]
+        ).group(1)
         assert name == md.stem, f"{md}: name {name!r} != file {md.stem!r}"
 
 
@@ -74,7 +90,11 @@ def test_agents_do_not_list_bash_command_filters_in_tools():
 
 def test_side_effecting_skills_are_manual_only():
     for name in ("hr-status", "hr-parallel-worktrees"):
-        fm = (ROOT / "plugins" / "hr-core" / "skills" / name / "SKILL.md").read_text(encoding="utf-8").split("---", 2)[1]
+        fm = (
+            (ROOT / "plugins" / "hr-core" / "skills" / name / "SKILL.md")
+            .read_text(encoding="utf-8")
+            .split("---", 2)[1]
+        )
         assert re.search(r"(?m)^disable-model-invocation:\s*true", fm), name
 
 
@@ -96,11 +116,15 @@ def test_relative_markdown_links_resolve():
 
 
 def test_hook_commands_fail_open_when_hr_is_missing():
-    hooks = json.loads((ROOT / "plugins" / "hr-core" / "hooks" / "hooks.json").read_text(encoding="utf-8"))
+    hooks = json.loads(
+        (ROOT / "plugins" / "hr-core" / "hooks" / "hooks.json").read_text(encoding="utf-8")
+    )
     for groups in hooks["hooks"].values():
         for g in groups:
             for h in g["hooks"]:
-                assert "claude-hr-hook" in h["command"] and "exit 0" in h["command"], "must fail open when claude-hr is absent"
+                assert "claude-hr-hook" in h["command"] and "exit 0" in h["command"], (
+                    "must fail open when claude-hr is absent"
+                )
                 assert h["timeout"] <= 15
             matchers = {g["matcher"] for g in groups}
             assert {"Bash", "PowerShell"} <= matchers
@@ -109,7 +133,13 @@ def test_hook_commands_fail_open_when_hr_is_missing():
 def test_license_is_present_and_consistent():
     text = (ROOT / "LICENSE").read_text(encoding="utf-8")
     assert text.startswith("MIT License\n") and "Copyright (c) 2026 timchrist49" in text
-    assert "Permission is hereby granted, free of charge" in text  # untouched standard text, so GitHub detects it
+    assert (
+        "Permission is hereby granted, free of charge" in text
+    )  # untouched standard text, so GitHub detects it
     assert 'license = { text = "MIT" }' in (ROOT / "pyproject.toml").read_text(encoding="utf-8")
-    plugin = json.loads((ROOT / "plugins" / "hr-core" / ".claude-plugin" / "plugin.json").read_text(encoding="utf-8"))
+    plugin = json.loads(
+        (ROOT / "plugins" / "hr-core" / ".claude-plugin" / "plugin.json").read_text(
+            encoding="utf-8"
+        )
+    )
     assert plugin["license"] == "MIT"

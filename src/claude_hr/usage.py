@@ -99,22 +99,38 @@ def collect(days: int = 7, projects_dir: Path | None = None) -> Ledger:
 
 
 def _n(v: int) -> str:
-    return f"{v / 1_000_000:.2f}M" if v >= 1_000_000 else (f"{v / 1000:.0f}k" if v >= 1000 else str(v))
+    return (
+        f"{v / 1_000_000:.2f}M" if v >= 1_000_000 else (f"{v / 1000:.0f}k" if v >= 1000 else str(v))
+    )
 
 
 def format_ledger(led: Ledger, by: str = "day", top: int = 12) -> str:
     groups = {"day": led.by_day, "model": led.by_model, "project": led.by_project}[by]
-    rows = sorted(groups.items(), key=(lambda kv: kv[0]) if by == "day" else (lambda kv: -kv[1].total_in))[-top:] if by == "day" else sorted(groups.items(), key=lambda kv: -kv[1].total_in)[:top]
+    rows = (
+        sorted(
+            groups.items(), key=(lambda kv: kv[0]) if by == "day" else (lambda kv: -kv[1].total_in)
+        )[-top:]
+        if by == "day"
+        else sorted(groups.items(), key=lambda kv: -kv[1].total_in)[:top]
+    )
     out = [f"Token usage, last {led.days} days ({led.files} transcript files, local data only)", ""]
-    out.append(f"{by:<44} {'msgs':>6} {'input':>8} {'cache-wr':>9} {'cache-rd':>9} {'output':>8} {'hit%':>5}")
+    out.append(
+        f"{by:<44} {'msgs':>6} {'input':>8} {'cache-wr':>9} {'cache-rd':>9} {'output':>8} {'hit%':>5}"
+    )
     for key, b in rows:
         label = key if len(key) <= 44 else "…" + key[-43:]
-        out.append(f"{label:<44} {b.messages:>6} {_n(b.input):>8} {_n(b.cache_write):>9} {_n(b.cache_read):>9} {_n(b.output):>8} {b.cache_hit * 100:>4.0f}%")
+        out.append(
+            f"{label:<44} {b.messages:>6} {_n(b.input):>8} {_n(b.cache_write):>9} {_n(b.cache_read):>9} {_n(b.output):>8} {b.cache_hit * 100:>4.0f}%"
+        )
     t = led.total
     out.append("")
-    out.append(f"{'TOTAL':<44} {t.messages:>6} {_n(t.input):>8} {_n(t.cache_write):>9} {_n(t.cache_read):>9} {_n(t.output):>8} {t.cache_hit * 100:>4.0f}%")
+    out.append(
+        f"{'TOTAL':<44} {t.messages:>6} {_n(t.input):>8} {_n(t.cache_write):>9} {_n(t.cache_read):>9} {_n(t.output):>8} {t.cache_hit * 100:>4.0f}%"
+    )
     out.append("")
-    out.append("input = uncached prompt tokens; cache-rd = tokens served from the prompt cache (cheap); hit% = cache-rd / all prompt tokens.")
+    out.append(
+        "input = uncached prompt tokens; cache-rd = tokens served from the prompt cache (cheap); hit% = cache-rd / all prompt tokens."
+    )
     return "\n".join(out)
 
 
@@ -141,7 +157,9 @@ def collect_tool_use(days: int = 30, projects_dir: Path | None = None) -> dict[s
                         rec = json.loads(line)
                     except ValueError:
                         continue
-                    content = (rec.get("message") or {}).get("content") if isinstance(rec, dict) else None
+                    content = (
+                        (rec.get("message") or {}).get("content") if isinstance(rec, dict) else None
+                    )
                     if not isinstance(content, list):
                         continue
                     for block in content:
@@ -167,7 +185,10 @@ def collect_tool_use(days: int = 30, projects_dir: Path | None = None) -> dict[s
 def format_tool_use(counts: dict[str, int], days: int, top: int = 25) -> str:
     out = [f"Skills, subagents and MCP servers actually used, last {days} days", ""]
     for kind, title in (("skill", "skills"), ("agent", "subagents"), ("mcp", "MCP servers")):
-        rows = sorted(((k.split(":", 1)[1], n) for k, n in counts.items() if k.startswith(kind + ":")), key=lambda r: -r[1])[:top]
+        rows = sorted(
+            ((k.split(":", 1)[1], n) for k, n in counts.items() if k.startswith(kind + ":")),
+            key=lambda r: -r[1],
+        )[:top]
         out.append(f"{title}:")
         out += [f"  {n:5d}  {name}" for name, n in rows] or ["  (none)"]
         out.append("")

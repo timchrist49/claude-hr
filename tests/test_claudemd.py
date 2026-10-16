@@ -12,13 +12,17 @@ def rules(rep):
 
 
 def test_clean_file_has_no_failures(sandbox, tmp_path):
-    (tmp_path / "CLAUDE.md").write_text("# Project\n- Run tests with `pytest -q`.\n- Use tabs for Makefiles.\n")
+    (tmp_path / "CLAUDE.md").write_text(
+        "# Project\n- Run tests with `pytest -q`.\n- Use tabs for Makefiles.\n"
+    )
     rep = lint(tmp_path)
     assert not [f for f in rep.findings if f.severity == "fail"]
 
 
 def test_too_long_fails(sandbox, tmp_path):
-    (tmp_path / "CLAUDE.md").write_text("\n".join(f"- rule number {i} about thing {i}" for i in range(260)))
+    (tmp_path / "CLAUDE.md").write_text(
+        "\n".join(f"- rule number {i} about thing {i}" for i in range(260))
+    )
     r = rules(lint(tmp_path))
     assert ("L1", "fail") in r
     assert ("L2", "fail") in r
@@ -55,7 +59,9 @@ def test_conflicting_package_managers(sandbox, tmp_path):
 def test_path_scoped_rules_do_not_count_as_always_loaded(sandbox, tmp_path):
     rd = tmp_path / ".claude" / "rules"
     rd.mkdir(parents=True)
-    (rd / "py.md").write_text('---\npaths: "**/*.py"\n---\n' + "\n".join(f"- line {i}" for i in range(40)))
+    (rd / "py.md").write_text(
+        '---\npaths: "**/*.py"\n---\n' + "\n".join(f"- line {i}" for i in range(40))
+    )
     rep = lint(tmp_path)
     src = next(s for s in rep.sources if s.path.name == "py.md")
     assert src.conditional

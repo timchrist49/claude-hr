@@ -16,7 +16,9 @@ def test_proxy_args_are_safe_for_parallel_agents(sandbox):
     assert args[args.index("--host") + 1] == "127.0.0.1"
     assert "--workers" in args
     assert "--memory-db-path" in args
-    assert str(Path(args[args.index("--memory-db-path") + 1])).startswith(str(sandbox))  # never cwd-relative
+    assert str(Path(args[args.index("--memory-db-path") + 1])).startswith(
+        str(sandbox)
+    )  # never cwd-relative
 
 
 def test_lite_footprint_drops_ml_features(sandbox, monkeypatch):
@@ -62,7 +64,9 @@ def test_client_env_keeps_tool_search_and_labels_project(sandbox, tmp_path, monk
     headers = env["ANTHROPIC_CUSTOM_HEADERS"]
     assert "X-Headroom-Project: my proj" in headers  # label encoding identical to `headroom wrap`
     assert "X-Headroom-Cwd: " in headers
-    assert "%20" in headers.split("X-Headroom-Cwd: ")[1]  # full path is percent-encoded (space, backslashes)
+    assert (
+        "%20" in headers.split("X-Headroom-Cwd: ")[1]
+    )  # full path is percent-encoded (space, backslashes)
 
 
 def test_client_env_preserves_user_headers(sandbox, tmp_path, monkeypatch):

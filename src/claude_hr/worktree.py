@@ -24,7 +24,9 @@ def _safe(name: str) -> str:
     return n
 
 
-def new(name: str, base: str = "HEAD", prefix: str = "hr/", cwd: Path | None = None) -> tuple[int, str]:
+def new(
+    name: str, base: str = "HEAD", prefix: str = "hr/", cwd: Path | None = None
+) -> tuple[int, str]:
     root = repo_root(cwd)
     if root is None:
         return 1, "not inside a git repository"
@@ -39,7 +41,9 @@ def new(name: str, base: str = "HEAD", prefix: str = "hr/", cwd: Path | None = N
         exclude = Path(gp.stdout.strip())
         exclude = exclude if exclude.is_absolute() else root / exclude
         try:
-            existing = exclude.read_text(encoding="utf-8", errors="ignore") if exclude.exists() else ""
+            existing = (
+                exclude.read_text(encoding="utf-8", errors="ignore") if exclude.exists() else ""
+            )
             if ".claude/worktrees/" not in existing:
                 exclude.parent.mkdir(parents=True, exist_ok=True)
                 with exclude.open("a", encoding="utf-8") as fh:
@@ -69,7 +73,9 @@ def list_all(cwd: Path | None = None) -> list[dict]:
     return out
 
 
-def remove(name: str, force: bool = False, delete_branch: bool = False, cwd: Path | None = None) -> tuple[int, str]:
+def remove(
+    name: str, force: bool = False, delete_branch: bool = False, cwd: Path | None = None
+) -> tuple[int, str]:
     root = repo_root(cwd)
     if root is None:
         return 1, "not inside a git repository"
@@ -86,11 +92,18 @@ def remove(name: str, force: bool = False, delete_branch: bool = False, cwd: Pat
     notes = []
     if delete_branch:
         for branch in (f"hr/{slug}", slug):
-            if _git("show-ref", "--verify", "--quiet", f"refs/heads/{branch}", cwd=root).returncode != 0:
+            if (
+                _git("show-ref", "--verify", "--quiet", f"refs/heads/{branch}", cwd=root).returncode
+                != 0
+            ):
                 continue
-            res = _git("branch", "-d", branch, cwd=root)  # -d: only a branch that is fully merged; unmerged work is never lost
+            res = _git(
+                "branch", "-d", branch, cwd=root
+            )  # -d: only a branch that is fully merged; unmerged work is never lost
             if res.returncode == 0:
                 notes.append(f"deleted branch {branch}")
             else:
-                notes.append(f"kept branch {branch} (not fully merged; delete it with: git branch -D {branch})")
+                notes.append(
+                    f"kept branch {branch} (not fully merged; delete it with: git branch -D {branch})"
+                )
     return 0, "; ".join([f"removed {path}", *notes])

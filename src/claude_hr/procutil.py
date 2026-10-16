@@ -69,7 +69,11 @@ def _is_shim(path: Path) -> bool:
 
 def _native_fallbacks() -> list[Path]:
     exe = "claude.exe" if paths.IS_WINDOWS else "claude"
-    return [paths.home() / ".local" / "bin" / exe, paths.claude_home() / "local" / exe, Path("/usr/local/bin") / exe]
+    return [
+        paths.home() / ".local" / "bin" / exe,
+        paths.claude_home() / "local" / exe,
+        Path("/usr/local/bin") / exe,
+    ]
 
 
 def find_claude(configured: str = "") -> Path | None:
@@ -115,7 +119,9 @@ def run(
 
     extra: dict = {}
     if paths.IS_WINDOWS:
-        extra["creationflags"] = 0x08000000  # CREATE_NO_WINDOW: pythonw-run jobs would otherwise flash a console per call
+        extra["creationflags"] = (
+            0x08000000  # CREATE_NO_WINDOW: pythonw-run jobs would otherwise flash a console per call
+        )
     try:
         return subprocess.run(
             cmd,
@@ -132,7 +138,11 @@ def run(
     except FileNotFoundError as exc:
         return subprocess.CompletedProcess(cmd, 127, "", str(exc))
     except subprocess.TimeoutExpired as exc:
-        out = exc.stdout.decode("utf-8", "replace") if isinstance(exc.stdout, bytes) else (exc.stdout or "")
+        out = (
+            exc.stdout.decode("utf-8", "replace")
+            if isinstance(exc.stdout, bytes)
+            else (exc.stdout or "")
+        )
         return subprocess.CompletedProcess(cmd, 124, out, f"timeout after {timeout}s")
     except OSError as exc:
         return subprocess.CompletedProcess(cmd, 126, "", str(exc))

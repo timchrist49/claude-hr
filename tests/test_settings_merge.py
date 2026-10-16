@@ -20,7 +20,11 @@ def test_fresh_apply_then_idempotent():
 
 
 def test_user_values_preserved_and_siblings_untouched():
-    cur = {"env": {"A": "user", "Z": "z"}, "model": "opusplan", "permissions": {"deny": ["Bash(rm -rf *)"]}}
+    cur = {
+        "env": {"A": "user", "Z": "z"},
+        "model": "opusplan",
+        "permissions": {"deny": ["Bash(rm -rf *)"]},
+    }
     doc, st, rep = apply_baseline(cur, BASE, None, atomic=ATOMIC)
     assert doc["env"]["A"] == "user"  # pre-existing different value kept
     assert doc["env"]["B"] == "2" and doc["env"]["Z"] == "z"

@@ -16,12 +16,32 @@ from pathlib import Path
 from . import paths
 from .config import Config
 
-EMPHASIS = {"CRITICAL", "IMPORTANT", "MUST", "NEVER", "ALWAYS", "MANDATORY", "FORBIDDEN", "ABSOLUTELY"}
+EMPHASIS = {
+    "CRITICAL",
+    "IMPORTANT",
+    "MUST",
+    "NEVER",
+    "ALWAYS",
+    "MANDATORY",
+    "FORBIDDEN",
+    "ABSOLUTELY",
+}
 VAGUE = [
-    "clean code", "best practices", "be careful", "write good", "high quality code",
-    "properly", "as appropriate", "where possible", "if needed", "make sure it works",
+    "clean code",
+    "best practices",
+    "be careful",
+    "write good",
+    "high quality code",
+    "properly",
+    "as appropriate",
+    "where possible",
+    "if needed",
+    "make sure it works",
 ]
-STALE_MODELS = re.compile(r"\b(claude[- ]?3[\w.-]*|sonnet[- ]?[34](\.\d)?\b|opus[- ]?[34](\.\d)?\b|haiku[- ]?[34](\.\d)?\b)", re.I)
+STALE_MODELS = re.compile(
+    r"\b(claude[- ]?3[\w.-]*|sonnet[- ]?[34](\.\d)?\b|opus[- ]?[34](\.\d)?\b|haiku[- ]?[34](\.\d)?\b)",
+    re.I,
+)
 SECRET_PATTERNS = [
     (re.compile(r"gh[pousr]_[A-Za-z0-9]{30,}"), "GitHub token"),
     (re.compile(r"github_pat_[A-Za-z0-9_]{40,}"), "GitHub fine-grained PAT"),
@@ -29,10 +49,17 @@ SECRET_PATTERNS = [
     (re.compile(r"\bAKIA[0-9A-Z]{16}\b"), "AWS access key id"),
     (re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----"), "private key block"),
     (re.compile(r"xox[baprs]-[A-Za-z0-9-]{10,}"), "Slack token"),
-    (re.compile(r"(?i)\b(password|passwd|secret|api[_-]?key)\b\s*[:=]\s*['\"]?[A-Za-z0-9/+_-]{12,}"), "inline credential"),
+    (
+        re.compile(
+            r"(?i)\b(password|passwd|secret|api[_-]?key)\b\s*[:=]\s*['\"]?[A-Za-z0-9/+_-]{12,}"
+        ),
+        "inline credential",
+    ),
 ]
 PM_NAMES = ("npm", "pnpm", "yarn", "bun")
-ALWAYS_RUN = re.compile(r"(?i)\b(always|must)\s+(run|execute)\s+(the\s+)?(lint|linter|tests?|format|formatter|prettier|eslint)")
+ALWAYS_RUN = re.compile(
+    r"(?i)\b(always|must)\s+(run|execute)\s+(the\s+)?(lint|linter|tests?|format|formatter|prettier|eslint)"
+)
 
 
 @dataclass
@@ -75,7 +102,15 @@ class Report:
     def to_json(self) -> str:
         return json.dumps(
             {
-                "sources": [{"path": str(s.path), "kind": s.kind, "lines": s.lines, "conditional": s.conditional} for s in self.sources],
+                "sources": [
+                    {
+                        "path": str(s.path),
+                        "kind": s.kind,
+                        "lines": s.lines,
+                        "conditional": s.conditional,
+                    }
+                    for s in self.sources
+                ],
                 "always_loaded_lines": self.always_loaded_lines,
                 "est_tokens": self.est_tokens,
                 "findings": [asdict(f) for f in self.findings],
@@ -97,9 +132,19 @@ def _read(path: Path) -> str | None:
 IMPORT_RE = re.compile(r"(?m)^[^`\n]*?(?<![\w`])@((?:~|\.{1,2}|/)?[\w./\\-]+\.[\w]+)")
 
 
-def _expand_imports(src: Source, seen: set[Path], depth: int, out: list[Source], findings: list[Finding]) -> None:
+def _expand_imports(
+    src: Source, seen: set[Path], depth: int, out: list[Source], findings: list[Finding]
+) -> None:
     if depth > 4:
-        findings.append(Finding("L8", "warn", str(src.path), 1, "import chain deeper than 4 hops is ignored by Claude Code"))
+        findings.append(
+            Finding(
+                "L8",
+                "warn",
+                str(src.path),
+                1,
+                "import chain deeper than 4 hops is ignored by Claude Code",
+            )
+        )
         return
     for m in IMPORT_RE.finditer(src.text):
         raw = m.group(1)
@@ -110,7 +155,9 @@ def _expand_imports(src: Source, seen: set[Path], depth: int, out: list[Source],
         except OSError:
             continue
         if not target.is_file():
-            findings.append(Finding("L8", "fail", str(src.path), line, f"import @{raw} does not resolve"))
+            findings.append(
+                Finding("L8", "fail", str(src.path), line, f"import @{raw} does not resolve")
+            )
             continue
         if target in seen:
             continue
@@ -190,13 +237,37 @@ def lint(cwd: Path, cfg: Config) -> Report:
         if s.kind == "memory":
             size_kb = len(s.text.encode("utf-8")) / 1024
             if s.lines > 200 or size_kb > 25:
-                F.append(Finding("L14", "warn", name, 1, f"MEMORY.md is {s.lines} lines / {size_kb:.0f} KB; only the first 200 lines / 25 KB load"))
+                F.append(
+                    Finding(
+                        "L14",
+                        "warn",
+                        name,
+                        1,
+                        f"MEMORY.md is {s.lines} lines / {size_kb:.0f} KB; only the first 200 lines / 25 KB load",
+                    )
+                )
             continue
         limit = max_global if s.kind == "user" else max_project
         if s.lines > limit:
-            F.append(Finding("L1", "fail", name, 1, f"{s.lines} lines (limit {limit}); long files reduce adherence and cost tokens every session"))
+            F.append(
+                Finding(
+                    "L1",
+                    "fail",
+                    name,
+                    1,
+                    f"{s.lines} lines (limit {limit}); long files reduce adherence and cost tokens every session",
+                )
+            )
         elif s.lines > int(limit * 0.6):
-            F.append(Finding("L1", "warn", name, 1, f"{s.lines} lines (limit {limit}); consider trimming or moving file-specific advice to .claude/rules/"))
+            F.append(
+                Finding(
+                    "L1",
+                    "warn",
+                    name,
+                    1,
+                    f"{s.lines} lines (limit {limit}); consider trimming or moving file-specific advice to .claude/rules/",
+                )
+            )
 
         emph = 0
         fence = False
@@ -213,27 +284,87 @@ def lint(cwd: Path, cfg: Config) -> Report:
             low = line.lower()
             for phrase in VAGUE:
                 if phrase in low:
-                    F.append(Finding("L5", "warn", name, i, f'vague instruction ("{phrase}"): say the concrete rule or drop it'))
+                    F.append(
+                        Finding(
+                            "L5",
+                            "warn",
+                            name,
+                            i,
+                            f'vague instruction ("{phrase}"): say the concrete rule or drop it',
+                        )
+                    )
             if re.search(r"[├└│]──", line):
                 tree_glyphs += 1
             if STALE_MODELS.search(line):
-                F.append(Finding("L10", "warn", name, i, "refers to an older model generation; scaffolding for older models can hurt newer ones"))
+                F.append(
+                    Finding(
+                        "L10",
+                        "warn",
+                        name,
+                        i,
+                        "refers to an older model generation; scaffolding for older models can hurt newer ones",
+                    )
+                )
             if re.search(r"\b(TODO|FIXME)\b", line):
-                F.append(Finding("L10", "warn", name, i, "TODO/FIXME in standing instructions goes stale"))
+                F.append(
+                    Finding(
+                        "L10", "warn", name, i, "TODO/FIXME in standing instructions goes stale"
+                    )
+                )
             if re.search(r"\b20\d\d-\d\d-\d\d\b", line):
                 F.append(Finding("L10", "info", name, i, "dated statement; will go stale"))
             if ALWAYS_RUN.search(line):
-                F.append(Finding("L12", "warn", name, i, "deterministic step ('always run lint/tests'): enforce with a hook, not prose"))
+                F.append(
+                    Finding(
+                        "L12",
+                        "warn",
+                        name,
+                        i,
+                        "deterministic step ('always run lint/tests'): enforce with a hook, not prose",
+                    )
+                )
             for pat, label in SECRET_PATTERNS:
                 if pat.search(line):
-                    F.append(Finding("L13", "fail", name, i, f"possible secret in instructions ({label})"))
+                    F.append(
+                        Finding(
+                            "L13", "fail", name, i, f"possible secret in instructions ({label})"
+                        )
+                    )
         if emph > 2:
-            F.append(Finding("L4", "fail" if emph > 6 else "warn", name, 1, f"{emph} emphasis words (CRITICAL/MUST/NEVER...): overuse makes newer models over-trigger"))
+            F.append(
+                Finding(
+                    "L4",
+                    "fail" if emph > 6 else "warn",
+                    name,
+                    1,
+                    f"{emph} emphasis words (CRITICAL/MUST/NEVER...): overuse makes newer models over-trigger",
+                )
+            )
         if fenced_lines > 30:
-            F.append(Finding("L7", "warn", name, 1, f"{fenced_lines} lines of code blocks; point to file:line instead"))
+            F.append(
+                Finding(
+                    "L7",
+                    "warn",
+                    name,
+                    1,
+                    f"{fenced_lines} lines of code blocks; point to file:line instead",
+                )
+            )
         if tree_glyphs > 3:
-            F.append(Finding("L6", "fail", name, 1, "directory tree in instructions: derivable from the repo, goes stale"))
-        for m in re.finditer(r"(?m)^#+\s*(architecture|project structure|directory structure|file structure|overview)\b.*$", s.text, re.I):
+            F.append(
+                Finding(
+                    "L6",
+                    "fail",
+                    name,
+                    1,
+                    "directory tree in instructions: derivable from the repo, goes stale",
+                )
+            )
+        for m in re.finditer(
+            r"(?m)^#+\s*(architecture|project structure|directory structure|file structure|overview)\b.*$",
+            s.text,
+            re.I,
+        ):
             start = s.text[: m.start()].count("\n")
             body = 0
             for nxt in lines[start + 1 :]:
@@ -241,11 +372,29 @@ def lint(cwd: Path, cfg: Config) -> Report:
                     break
                 body += 1
             if body > 10:
-                F.append(Finding("L6", "warn", name, start + 1, f'"{m.group(0).strip("# ")}" section is {body} lines; Claude can read the code'))
+                F.append(
+                    Finding(
+                        "L6",
+                        "warn",
+                        name,
+                        start + 1,
+                        f'"{m.group(0).strip("# ")}" section is {body} lines; Claude can read the code',
+                    )
+                )
         # learned-patterns block budget (Headroom `learn`)
-        lm = re.search(r"<!-- headroom:learn:start -->(.*?)<!-- headroom:learn:end -->", s.text, re.S)
+        lm = re.search(
+            r"<!-- headroom:learn:start -->(.*?)<!-- headroom:learn:end -->", s.text, re.S
+        )
         if lm and len(lm.group(1).splitlines()) > max_learned:
-            F.append(Finding("L1", "warn", name, 1, f"auto-learned block is {len(lm.group(1).splitlines())} lines (budget {max_learned}); prune it"))
+            F.append(
+                Finding(
+                    "L1",
+                    "warn",
+                    name,
+                    1,
+                    f"auto-learned block is {len(lm.group(1).splitlines())} lines (budget {max_learned}); prune it",
+                )
+            )
         if s.kind in {"project", "local"}:
             _check_references(s, F)
         if s.kind == "rule":
@@ -253,16 +402,34 @@ def lint(cwd: Path, cfg: Config) -> Report:
 
     # always-loaded budget
     if rep.always_loaded_lines > 250:
-        F.append(Finding("L2", "fail", "(all sources)", 0, f"{rep.always_loaded_lines} always-loaded lines across {len([s for s in rep.sources if not s.conditional])} files (limit 250)"))
+        F.append(
+            Finding(
+                "L2",
+                "fail",
+                "(all sources)",
+                0,
+                f"{rep.always_loaded_lines} always-loaded lines across {len([s for s in rep.sources if not s.conditional])} files (limit 250)",
+            )
+        )
     if rep.est_tokens > warn_tokens:
-        F.append(Finding("L2", "warn", "(all sources)", 0, f"~{rep.est_tokens} tokens of instructions load every session (budget {warn_tokens})"))
+        F.append(
+            Finding(
+                "L2",
+                "warn",
+                "(all sources)",
+                0,
+                f"~{rep.est_tokens} tokens of instructions load every session (budget {warn_tokens})",
+            )
+        )
 
     _check_contradictions(rep, F)
     for s in rep.sources:
         if s.kind == "local":
-            gi = (s.path.parent / ".gitignore")
+            gi = s.path.parent / ".gitignore"
             if gi.is_file() and "CLAUDE.local.md" not in (_read(gi) or ""):
-                F.append(Finding("L13", "fail", str(s.path), 1, "CLAUDE.local.md is not in .gitignore"))
+                F.append(
+                    Finding("L13", "fail", str(s.path), 1, "CLAUDE.local.md is not in .gitignore")
+                )
     order = {"fail": 0, "warn": 1, "info": 2}
     rep.findings.sort(key=lambda f: (order[f.severity], f.file, f.line))
     return rep
@@ -274,41 +441,93 @@ def _check_references(s: Source, F: list[Finding]) -> None:
     for m in re.finditer(r"`((?:\./)?[\w.-]+(?:/[\w.@-]+)+\.\w{1,6})`", s.text):
         ref = m.group(1)
         if not (base / ref).exists():
-            F.append(Finding("L8", "warn", str(s.path), s.text[: m.start()].count("\n") + 1, f"referenced path `{ref}` does not exist"))
+            F.append(
+                Finding(
+                    "L8",
+                    "warn",
+                    str(s.path),
+                    s.text[: m.start()].count("\n") + 1,
+                    f"referenced path `{ref}` does not exist",
+                )
+            )
     for m in re.finditer(r"`npm run ([\w:.-]+)`", s.text):
         if pkg is None:
             try:
-                pkg = json.loads((base / "package.json").read_text(encoding="utf-8")).get("scripts", {})
+                pkg = json.loads((base / "package.json").read_text(encoding="utf-8")).get(
+                    "scripts", {}
+                )
             except (OSError, ValueError):
                 pkg = {}
         if pkg and m.group(1) not in pkg:
-            F.append(Finding("L8", "warn", str(s.path), s.text[: m.start()].count("\n") + 1, f"`npm run {m.group(1)}` is not a script in package.json"))
+            F.append(
+                Finding(
+                    "L8",
+                    "warn",
+                    str(s.path),
+                    s.text[: m.start()].count("\n") + 1,
+                    f"`npm run {m.group(1)}` is not a script in package.json",
+                )
+            )
 
 
 def _check_rule_frontmatter(s: Source, F: list[Finding]) -> None:
     m = re.match(r"---\s*\n(.*?)\n---", s.text, re.S)
     if m:
-        keys = {ln.split(":", 1)[0].strip() for ln in m.group(1).splitlines() if ":" in ln and not ln.startswith((" ", "-"))}
+        keys = {
+            ln.split(":", 1)[0].strip()
+            for ln in m.group(1).splitlines()
+            if ":" in ln and not ln.startswith((" ", "-"))
+        }
         extra = keys - {"paths"}
         if extra:
-            F.append(Finding("L11", "warn", str(s.path), 1, f"rule frontmatter supports only `paths`; ignored: {', '.join(sorted(extra))}"))
+            F.append(
+                Finding(
+                    "L11",
+                    "warn",
+                    str(s.path),
+                    1,
+                    f"rule frontmatter supports only `paths`; ignored: {', '.join(sorted(extra))}",
+                )
+            )
     if s.lines > 80:
-        F.append(Finding("L11", "warn", str(s.path), 1, f"rule file is {s.lines} lines (keep rules under 80)"))
+        F.append(
+            Finding(
+                "L11", "warn", str(s.path), 1, f"rule file is {s.lines} lines (keep rules under 80)"
+            )
+        )
 
 
 def _check_contradictions(rep: Report, F: list[Finding]) -> None:
     loaded = [s for s in rep.sources if not s.conditional and s.kind != "memory"]
     chosen: dict[str, set[str]] = {}
     for s in loaded:
-        for m in re.finditer(r"(?i)\b(?:use|prefer|always use|run with)\s+`?(npm|pnpm|yarn|bun)\b", s.text):
+        for m in re.finditer(
+            r"(?i)\b(?:use|prefer|always use|run with)\s+`?(npm|pnpm|yarn|bun)\b", s.text
+        ):
             chosen.setdefault(m.group(1).lower(), set()).add(str(s.path))
     if len(chosen) > 1:
-        F.append(Finding("L9", "fail", "(all sources)", 0, "conflicting package managers asserted: " + ", ".join(sorted(chosen))))
+        F.append(
+            Finding(
+                "L9",
+                "fail",
+                "(all sources)",
+                0,
+                "conflicting package managers asserted: " + ", ".join(sorted(chosen)),
+            )
+        )
     for a, b in (("tabs", "spaces"),):
         ta = [s for s in loaded if re.search(rf"(?i)\buse {a}\b", s.text)]
         tb = [s for s in loaded if re.search(rf"(?i)\buse {b}\b", s.text)]
         if ta and tb:
-            F.append(Finding("L9", "fail", "(all sources)", 0, f"conflicting indentation rules: 'use {a}' vs 'use {b}'"))
+            F.append(
+                Finding(
+                    "L9",
+                    "fail",
+                    "(all sources)",
+                    0,
+                    f"conflicting indentation rules: 'use {a}' vs 'use {b}'",
+                )
+            )
     # near-duplicate lines across different files (waste + drift risk)
     seen: list[tuple[str, str]] = []
     for s in loaded:
@@ -317,8 +536,20 @@ def _check_contradictions(rep: Report, F: list[Finding]) -> None:
             if len(t) < 40 or t.startswith("#"):
                 continue
             for other_t, other_f in seen:
-                if other_f != str(s.path) and difflib.SequenceMatcher(None, t, other_t).quick_ratio() > 0.9 and difflib.SequenceMatcher(None, t, other_t).ratio() >= 0.85:
-                    F.append(Finding("L9", "warn", str(s.path), 0, f"near-duplicate of a line in {other_f}: {t[:60]}"))
+                if (
+                    other_f != str(s.path)
+                    and difflib.SequenceMatcher(None, t, other_t).quick_ratio() > 0.9
+                    and difflib.SequenceMatcher(None, t, other_t).ratio() >= 0.85
+                ):
+                    F.append(
+                        Finding(
+                            "L9",
+                            "warn",
+                            str(s.path),
+                            0,
+                            f"near-duplicate of a line in {other_f}: {t[:60]}",
+                        )
+                    )
                     break
             seen.append((t, str(s.path)))
 

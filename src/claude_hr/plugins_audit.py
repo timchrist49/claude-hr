@@ -23,7 +23,9 @@ class PluginRow:
     mcp_servers: int = 0
     hooks: int = 0
     installs: int = 1  # project-scope entries for the same plugin are folded into one row
-    uses: int | None = None  # skill + subagent + MCP invocations in the usage window (None = not measured)
+    uses: int | None = (
+        None  # skill + subagent + MCP invocations in the usage window (None = not measured)
+    )
     skill_names: list[str] = field(default_factory=list)
     agent_names: list[str] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
@@ -44,7 +46,12 @@ def plugin_cost(claude: Path, plugin_id: str) -> PluginRow:
     text = r.stdout or ""
     m = re.search(r"Always-on:\s*~?([\d,]+)\s*tok", text)
     row.always_on_tokens = _int(m.group(1)) if m else 0
-    for label, attr in (("Skills", "skills"), ("Agents", "agents"), ("MCP servers", "mcp_servers"), ("Hooks", "hooks")):
+    for label, attr in (
+        ("Skills", "skills"),
+        ("Agents", "agents"),
+        ("MCP servers", "mcp_servers"),
+        ("Hooks", "hooks"),
+    ):
         mm = re.search(rf"{label} \((\d+)\)", text)
         if mm:
             setattr(row, attr, int(mm.group(1)))
@@ -68,7 +75,9 @@ def count_uses(row: PluginRow, counts: dict[str, int]) -> int:
     return total
 
 
-def audit_plugins(cfg: Config, claude: Path | None, cwd: Path | None = None, usage_days: int = 30) -> list[PluginRow]:
+def audit_plugins(
+    cfg: Config, claude: Path | None, cwd: Path | None = None, usage_days: int = 30
+) -> list[PluginRow]:
     if not claude:
         return []
     from . import usage as usage_mod
@@ -84,7 +93,11 @@ def audit_plugins(cfg: Config, claude: Path | None, cwd: Path | None = None, usa
     sources: dict[str, set[str]] = {}  # plugin name -> distinct marketplaces it is installed from
     by_key: dict[tuple[str, str], PluginRow] = {}
     for p in setup._installed_plugins():
-        if not p.get("enabled", True) and p.get("scope") == "project" and not p.get("projectEnabled"):
+        if (
+            not p.get("enabled", True)
+            and p.get("scope") == "project"
+            and not p.get("projectEnabled")
+        ):
             continue
         name = p["id"].split("@")[0]
         sources.setdefault(name, set()).add(p["id"])
@@ -100,34 +113,51 @@ def audit_plugins(cfg: Config, claude: Path | None, cwd: Path | None = None, usa
         if name in projects and row.scope == "user":
             row.notes.append(f"project-scoped candidate: {projects[name]['why']}")
         if row.mcp_servers:
-            row.notes.append(f"{row.mcp_servers} MCP server(s): tool schemas are deferred only while tool search is on")
+            row.notes.append(
+                f"{row.mcp_servers} MCP server(s): tool schemas are deferred only while tool search is on"
+            )
         if measured:
             row.uses = count_uses(row, counts)
-            if row.uses == 0 and row.enabled and row.always_on_tokens >= 100 and not row.id.startswith("hr-core@"):
-                row.notes.append(f"not used in the last {usage_days} days: disabling would save ~{row.always_on_tokens} tokens/session")
+            if (
+                row.uses == 0
+                and row.enabled
+                and row.always_on_tokens >= 100
+                and not row.id.startswith("hr-core@")
+            ):
+                row.notes.append(
+                    f"not used in the last {usage_days} days: disabling would save ~{row.always_on_tokens} tokens/session"
+                )
         rows.append(row)
     for row in rows:
         if len(sources.get(row.id.split("@")[0], ())) > 1:
-            row.notes.append("same plugin name installed from several marketplaces (duplicate skills)")
+            row.notes.append(
+                "same plugin name installed from several marketplaces (duplicate skills)"
+            )
         if row.installs > 1:
             row.notes.append(f"enabled in {row.installs} projects")
     return rows
 
 
 def format_plugins(rows: list[PluginRow]) -> str:
-    out = [f"{'plugin':<52} {'scope':<8} {'always-on':>10} {'skills':>6} {'agents':>6} {'mcp':>4} {'uses':>6}"]
+    out = [
+        f"{'plugin':<52} {'scope':<8} {'always-on':>10} {'skills':>6} {'agents':>6} {'mcp':>4} {'uses':>6}"
+    ]
     seen = set()
     total = 0
     for r in sorted(rows, key=lambda r: -r.always_on_tokens):
         key = (r.id, r.scope)
         uses = "-" if r.uses is None else str(r.uses)
-        out.append(f"{r.id:<52} {r.scope:<8} {('~' + str(r.always_on_tokens)):>10} {r.skills:>6} {r.agents:>6} {r.mcp_servers:>4} {uses:>6}")
+        out.append(
+            f"{r.id:<52} {r.scope:<8} {('~' + str(r.always_on_tokens)):>10} {r.skills:>6} {r.agents:>6} {r.mcp_servers:>4} {uses:>6}"
+        )
         for n in r.notes:
             out.append(f"    - {n}")
         if r.enabled and key not in seen:
             seen.add(key)
             total += r.always_on_tokens
-    out.append(f"\nEstimated always-on cost of enabled plugins: ~{total:,} tokens added to every session")
+    out.append(
+        f"\nEstimated always-on cost of enabled plugins: ~{total:,} tokens added to every session"
+    )
     return "\n".join(out)
 
 
@@ -195,4 +225,8 @@ def audit_skills(cfg: Config, cwd: Path) -> tuple[list[str], dict]:
         fm = _frontmatter(sk.read_text(encoding="utf-8", errors="replace"))
         if fm.get("disable-model-invocation", "").lower() != "true":
             total_desc += len((fm.get("description", "") + " " + fm.get("when_to_use", "")).strip())
-    return msgs, {"user_project_skills": count, "plugin_skills": plugin_skill_count, "description_chars": total_desc}
+    return msgs, {
+        "user_project_skills": count,
+        "plugin_skills": plugin_skill_count,
+        "description_chars": total_desc,
+    }

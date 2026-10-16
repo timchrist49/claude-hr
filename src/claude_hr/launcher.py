@@ -33,9 +33,33 @@ from . import paths, procutil
 
 # Fallbacks used only when `claude --help` cannot be parsed (the real list is read from the installed CLI and cached).
 PASSTHROUGH_SUBCOMMANDS = {
-    "mcp", "plugin", "plugins", "update", "upgrade", "install", "doctor", "config", "setup-token", "auth",
-    "migrate-installer", "completion", "logs", "stop", "kill", "rm", "respawn", "attach", "daemon", "purge",
-    "import", "ultrareview", "auto-mode", "project", "gateway", "eval", "help",
+    "mcp",
+    "plugin",
+    "plugins",
+    "update",
+    "upgrade",
+    "install",
+    "doctor",
+    "config",
+    "setup-token",
+    "auth",
+    "migrate-installer",
+    "completion",
+    "logs",
+    "stop",
+    "kill",
+    "rm",
+    "respawn",
+    "attach",
+    "daemon",
+    "purge",
+    "import",
+    "ultrareview",
+    "auto-mode",
+    "project",
+    "gateway",
+    "eval",
+    "help",
 }
 PASSTHROUGH_FLAGS = {"-v", "--version", "-h", "--help"}
 HEADLESS_FLAGS = {"-p", "--print"}
@@ -53,7 +77,7 @@ def _split_hr_flags(argv: list[str]) -> tuple[dict, list[str]]:
             rest.extend(argv[i:])
             break
         if a.startswith("--hr-"):
-            name = a[len("--hr-"):]
+            name = a[len("--hr-") :]
             if name == "wait":
                 if i + 1 < len(argv):
                     try:
@@ -96,7 +120,9 @@ def _parse_help(text: str) -> tuple[set[str], set[str], set[str]]:
             section = ""
             continue
         if section == "c":
-            m = re.match(r"^ {2}([a-z][\w-]*)(?:\|([a-z][\w-]*))?(?=\s|$)", line)  # exactly 2 spaces: wrapped text is deeper
+            m = re.match(
+                r"^ {2}([a-z][\w-]*)(?:\|([a-z][\w-]*))?(?=\s|$)", line
+            )  # exactly 2 spaces: wrapped text is deeper
             if m:
                 subs.update(g for g in m.groups() if g)
         elif section == "o" and re.match(r"^ {2}-", line):
@@ -135,8 +161,18 @@ def _cli_shape(real: Path) -> tuple[set[str], set[str], set[str]] | None:
         return None
     try:
         cache.parent.mkdir(parents=True, exist_ok=True)
-        cache.write_text("\n".join([key, *(f"S:{x}" for x in sorted(subs)), *(f"V:{x}" for x in sorted(value)),
-                                    *(f"W:{x}" for x in sorted(variadic))]) + "\n", encoding="utf-8")
+        cache.write_text(
+            "\n".join(
+                [
+                    key,
+                    *(f"S:{x}" for x in sorted(subs)),
+                    *(f"V:{x}" for x in sorted(value)),
+                    *(f"W:{x}" for x in sorted(variadic)),
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
     except OSError:
         pass
     return subs, value, variadic
@@ -178,7 +214,9 @@ def classify(args: list[str], shape: tuple[set[str], set[str], set[str]] | None 
         return "passthrough"
     if sub == "agents":
         return "agents"
-    if sub is not None and (sub in subs or sub in PASSTHROUGH_SUBCOMMANDS):  # some (daemon) are hidden from --help
+    if sub is not None and (
+        sub in subs or sub in PASSTHROUGH_SUBCOMMANDS
+    ):  # some (daemon) are hidden from --help
         return "passthrough"
     if any(a in HEADLESS_FLAGS for a in args):
         return "headless"
@@ -190,8 +228,14 @@ def classify(args: list[str], shape: tuple[set[str], set[str], set[str]] | None 
 # ---------------------------------------------------------------------------------------------
 def _logged_in(env: dict[str, str]) -> bool:
     """Is there any credential Claude Code will use? (macOS keeps it in the keychain: assume yes.)"""
-    keys = ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN",
-            "CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX", "CLAUDE_CODE_USE_FOUNDRY")
+    keys = (
+        "ANTHROPIC_API_KEY",
+        "ANTHROPIC_AUTH_TOKEN",
+        "CLAUDE_CODE_OAUTH_TOKEN",
+        "CLAUDE_CODE_USE_BEDROCK",
+        "CLAUDE_CODE_USE_VERTEX",
+        "CLAUDE_CODE_USE_FOUNDRY",
+    )
     if any(env.get(k) for k in keys) or paths.IS_MAC:
         return True
     if (paths.claude_home() / ".credentials.json").exists():
@@ -319,7 +363,9 @@ def _daemon_is_ours(status: dict, proxy_url: str) -> bool:
         ring = read_json(_ring_path(), []) or []
     except Exception:
         return False
-    return any(r.get("pid") == status.get("starter_pid") and r.get("proxy") == proxy_url for r in ring)
+    return any(
+        r.get("pid") == status.get("starter_pid") and r.get("proxy") == proxy_url for r in ring
+    )
 
 
 def _prepare_daemon(cfg, claude: Path, proxy_url: str, verbose: bool) -> None:
@@ -328,7 +374,9 @@ def _prepare_daemon(cfg, claude: Path, proxy_url: str, verbose: bool) -> None:
     if not st["running"] or _daemon_is_ours(st, proxy_url):
         return
     if policy == "never":
-        _say("a Claude background service is already running without Headroom; its sessions will not be compressed")
+        _say(
+            "a Claude background service is already running without Headroom; its sessions will not be compressed"
+        )
         return
     if policy == "always" or st["workers"] == 0:  # -1 (unknown) is deliberately NOT treated as idle
         procutil.run([str(claude), "daemon", "stop", "--any"], timeout=30)
@@ -352,13 +400,19 @@ def main(argv: list[str] | None = None) -> int:
 
     opts, args = _split_hr_flags(argv)
 
-    nest = int(os.environ.get("CLAUDE_HR_NEST", "0") or 0) if os.environ.get("CLAUDE_HR_NEST", "0").isdigit() else 0
+    nest = (
+        int(os.environ.get("CLAUDE_HR_NEST", "0") or 0)
+        if os.environ.get("CLAUDE_HR_NEST", "0").isdigit()
+        else 0
+    )
     if os.environ.get("CLAUDE_HR_SESSION") == "1":
         # Claude spawning `claude` itself (hooks, plugin commands, self-update relaunch): the outer launch already
         # routed, limited and registered this session. Pass straight through - but never loop through a shim forever.
         if nest >= NEST_LIMIT:
-            _say("claude-hr is invoking itself in a loop (a `claude` shim resolves to itself). "
-                 "Set CLAUDE_HR_CLAUDE_BIN to the real Claude Code binary or run `claude-hr-ctl shim remove`.")
+            _say(
+                "claude-hr is invoking itself in a loop (a `claude` shim resolves to itself). "
+                "Set CLAUDE_HR_CLAUDE_BIN to the real Claude Code binary or run `claude-hr-ctl shim remove`."
+            )
             return 126
         os.environ["CLAUDE_HR_NEST"] = str(nest + 1)
         real = procutil.find_claude()
@@ -374,13 +428,21 @@ def main(argv: list[str] | None = None) -> int:
     verbose = bool(opts.get("verbose")) or os.environ.get("CLAUDE_HR_VERBOSE") == "1"
     real = procutil.find_claude(_configured_binary())
     if real is None:
-        _say("Claude Code was not found. Install it (https://claude.ai/install.sh) or run `claude-hr-ctl setup`.")
+        _say(
+            "Claude Code was not found. Install it (https://claude.ai/install.sh) or run `claude-hr-ctl setup`."
+        )
         return 127
 
     first = next((a for a in args if not a.startswith("-")), None)
     shape = None
-    if args and not (args[0] in PASSTHROUGH_SUBCOMMANDS or args[0] in PASSTHROUGH_FLAGS or args[0] == "agents"):
-        shape = _best_effort(_cli_shape, real) if (first is not None or args[0].startswith("-")) else None
+    if args and not (
+        args[0] in PASSTHROUGH_SUBCOMMANDS or args[0] in PASSTHROUGH_FLAGS or args[0] == "agents"
+    ):
+        shape = (
+            _best_effort(_cli_shape, real)
+            if (first is not None or args[0].startswith("-"))
+            else None
+        )
     kind = classify(args, shape)
 
     if kind == "passthrough" and not opts.get("dry-run") and not verbose:
@@ -406,7 +468,11 @@ def main(argv: list[str] | None = None) -> int:
     configured = str(cfg.get("claude.binary", "") or "")
     claude = procutil.find_claude(configured) if configured else real
 
-    default_flags = [str(x) for x in (cfg.get("claude.default_flags", []) or [])] if kind in {"session", "headless"} else []
+    default_flags = (
+        [str(x) for x in (cfg.get("claude.default_flags", []) or [])]
+        if kind in {"session", "headless"}
+        else []
+    )
     cmd = [str(claude), *default_flags, *args]
     op_file = str(cfg.get("credentials.op_env_file", "") or "")
     if op_file and kind != "passthrough" and procutil.cmd_exists("op"):
@@ -430,22 +496,33 @@ def main(argv: list[str] | None = None) -> int:
 
     if want_route and opts.get("wrap") and hr.binary():
         # Upstream behaviour: per-session proxy, code-graph watcher, MCP re-registration (~6s start).
-        cmd = [str(hr.binary()), "wrap", "claude", "--port", str(hr.port),
-               *(["--memory"] if cfg.get("headroom.memory", True) else []),
-               *(["--code-graph"] if cfg.get("headroom.code_graph", True) else []),
-               "--", *args]
+        cmd = [
+            str(hr.binary()),
+            "wrap",
+            "claude",
+            "--port",
+            str(hr.port),
+            *(["--memory"] if cfg.get("headroom.memory", True) else []),
+            *(["--code-graph"] if cfg.get("headroom.code_graph", True) else []),
+            "--",
+            *args,
+        ]
         plan.append("route=headroom-wrap")
         want_route = False
     elif want_route and user_base and not _is_loopback_url(user_base):
         # The user already routes through their own gateway; silently replacing it would break their setup.
         plan.append("route=direct (ANTHROPIC_BASE_URL is already set to a gateway)")
         if verbose:
-            _say("ANTHROPIC_BASE_URL points at your own gateway: leaving it alone (no Headroom for this launch)")
+            _say(
+                "ANTHROPIC_BASE_URL points at your own gateway: leaving it alone (no Headroom for this launch)"
+            )
         want_route = False
     elif want_route and not _logged_in(env):
         # The first-run login flow behind a custom base URL is unverified; log in direct, route from the next launch.
         plan.append("route=direct (no login yet)")
-        _say("no Claude login found: starting without Headroom so you can log in. Run claude-hr again afterwards.")
+        _say(
+            "no Claude login found: starting without Headroom so you can log in. Run claude-hr again afterwards."
+        )
         want_route = False
     elif want_route:
         wait = float(opts.get("wait", cfg.get("headroom.start_wait_s", 90)))
@@ -453,13 +530,17 @@ def main(argv: list[str] | None = None) -> int:
             wait = 0.0  # it failed to come up moments ago: don't stall every launch for the full wait again
         if hr.binary() is None:
             plan.append("route=direct (headroom not installed; run `claude-hr-ctl setup`)")
-            _say("Headroom is not installed - running Claude directly. Run `claude-hr-ctl setup` to install it.")
+            _say(
+                "Headroom is not installed - running Claude directly. Run `claude-hr-ctl setup` to install it."
+            )
             want_route = False
         else:
             health = hr.health()
             if not health.ok and not opts.get("dry-run"):
                 if wait > 0:
-                    _say(f"waiting for the Headroom proxy (up to {int(wait)}s; only after boot/updates)...")
+                    _say(
+                        f"waiting for the Headroom proxy (up to {int(wait)}s; only after boot/updates)..."
+                    )
                 health = hr.ensure(wait_s=wait, announce=lambda m: _say(m))
                 _mark_failed(not health.ok and wait > 0)
             if health.ok:
@@ -468,17 +549,27 @@ def main(argv: list[str] | None = None) -> int:
                 plan.append(f"route=headroom {hr.url} v{health.version}")
             elif bool(cfg.get("headroom.fail_open", True)):
                 plan.append(f"route=direct (proxy {health.status})")
-                _say(f"Headroom proxy is not healthy ({health.status}); continuing WITHOUT compression. "
-                     "Diagnose: `claude-hr-ctl doctor`.")
+                _say(
+                    f"Headroom proxy is not healthy ({health.status}); continuing WITHOUT compression. "
+                    "Diagnose: `claude-hr-ctl doctor`."
+                )
             else:
-                _say(f"Headroom proxy is not healthy ({health.status}) and fail_open=false; aborting.")
+                _say(
+                    f"Headroom proxy is not healthy ({health.status}) and fail_open=false; aborting."
+                )
                 return 3
     else:
         plan.append("route=direct")
 
     # Auth shadowing: an exported API key silently overrides the subscription login.
-    if env.get("ANTHROPIC_API_KEY") and (paths.claude_home() / ".credentials.json").exists() and verbose:
-        _say("note: ANTHROPIC_API_KEY is set and overrides your subscription login for this session")
+    if (
+        env.get("ANTHROPIC_API_KEY")
+        and (paths.claude_home() / ".credentials.json").exists()
+        and verbose
+    ):
+        _say(
+            "note: ANTHROPIC_API_KEY is set and overrides your subscription login for this session"
+        )
 
     if kind in {"agents", "daemon"} and routed_url:
         _best_effort(_prepare_daemon, cfg, claude, routed_url, verbose)
@@ -491,8 +582,15 @@ def main(argv: list[str] | None = None) -> int:
             if not adm.allowed and not opts.get("force") and not opts.get("dry-run"):
                 # Too many sessions only warns (a stricter machine can set resources.enforce_sessions = "block");
                 # critically low RAM blocks interactive/agent launches because the machine would thrash.
-                block_sessions = str(cfg.get("resources.enforce_sessions", "warn")) == "block" and kind != "headless"
-                if adm.reason_kind == "ram" and kind != "headless" or (adm.reason_kind == "sessions" and block_sessions):
+                block_sessions = (
+                    str(cfg.get("resources.enforce_sessions", "warn")) == "block"
+                    and kind != "headless"
+                )
+                if (
+                    adm.reason_kind == "ram"
+                    and kind != "headless"
+                    or (adm.reason_kind == "sessions" and block_sessions)
+                ):
                     _say(f"{adm.reason}. Start anyway with --hr-force, or close a session.")
                     return 75
                 _say(f"warning: {adm.reason}")
@@ -521,7 +619,9 @@ def main(argv: list[str] | None = None) -> int:
     # Windows has no exec(): keep a thin parent that owns the Job Object.
     child_pids: list[int] = []
     try:
-        return _run_windows(cfg, cmd, env, cwd, kind, routed_url, track and not opts.get("no-limits"), child_pids)
+        return _run_windows(
+            cfg, cmd, env, cwd, kind, routed_url, track and not opts.get("no-limits"), child_pids
+        )
     finally:
         for pid in child_pids:
             _best_effort(resources.unregister_session, pid)
@@ -542,7 +642,9 @@ def _run_windows(cfg, cmd, env, cwd, kind, routed_url, limits: bool, pids: list[
     # kill-on-close Job Object for those; interactive and headless sessions do get one.
     if limits and kind in {"session", "headless"} and bool(cfg.get("resources.enabled", True)):
         try:
-            job = resources.WindowsJob(resources.memory_limits_gb(cfg)[0], bool(cfg.get("resources.kill_on_exit", True)))
+            job = resources.WindowsJob(
+                resources.memory_limits_gb(cfg)[0], bool(cfg.get("resources.kill_on_exit", True))
+            )
             job.assign(proc.pid)
         except OSError:
             job = None

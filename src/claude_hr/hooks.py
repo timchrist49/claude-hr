@@ -27,17 +27,37 @@ _READERS = (
     r"git\s+(?:log|show|diff|cat-file))"
 )
 RULES: list[tuple[re.Pattern, str]] = [
-    (re.compile(rf"(?ism)(?:^|[;&|(\s]){_READERS}\b[^\n;&|]*{_SECRET_FILE}"), "reads a credential file"),
-    (re.compile(r"(?ism)(?:^|[;&|(])\s*(?:env|printenv|set|export\s+-p|compgen\s+-e|Get-ChildItem\s+Env:|gci\s+Env:|dir\s+Env:)\s*(?:$|[;&|>])"),
-     "dumps the whole environment"),
-    (re.compile(rf"(?ism)(?:^|[;&|(])\s*printenv\s+\w*{_SECRET_NAME}"), "prints a secret-looking variable"),
+    (
+        re.compile(rf"(?ism)(?:^|[;&|(\s]){_READERS}\b[^\n;&|]*{_SECRET_FILE}"),
+        "reads a credential file",
+    ),
+    (
+        re.compile(
+            r"(?ism)(?:^|[;&|(])\s*(?:env|printenv|set|export\s+-p|compgen\s+-e|Get-ChildItem\s+Env:|gci\s+Env:|dir\s+Env:)\s*(?:$|[;&|>])"
+        ),
+        "dumps the whole environment",
+    ),
+    (
+        re.compile(rf"(?ism)(?:^|[;&|(])\s*printenv\s+\w*{_SECRET_NAME}"),
+        "prints a secret-looking variable",
+    ),
     (re.compile(r"(?is)/proc/(?:self|\d+)/environ"), "reads process environment"),
-    (re.compile(rf"(?is)\b(?:echo|printf|Write-Output|Write-Host)\b[^\n;&|]*\$\{{?(?:env:)?\w*{_SECRET_NAME}\w*\}}?"),
-     "prints a secret-looking variable"),
-    (re.compile(rf"(?ism)(?:^|[;&|(])\s*\$env:\w*{_SECRET_NAME}\w*\s*(?:$|[;&|])"), "prints a secret-looking variable"),
+    (
+        re.compile(
+            rf"(?is)\b(?:echo|printf|Write-Output|Write-Host)\b[^\n;&|]*\$\{{?(?:env:)?\w*{_SECRET_NAME}\w*\}}?"
+        ),
+        "prints a secret-looking variable",
+    ),
+    (
+        re.compile(rf"(?ism)(?:^|[;&|(])\s*\$env:\w*{_SECRET_NAME}\w*\s*(?:$|[;&|])"),
+        "prints a secret-looking variable",
+    ),
     (re.compile(r"(?is)\bgh\s+auth\s+token\b"), "prints the GitHub token"),
     (re.compile(r"(?is)\bop\s+(?:read|item\s+get)\b(?![^\n]*\|)"), "prints a 1Password secret"),
-    (re.compile(r"(?is)\bsecurity\s+find-(?:generic|internet)-password\b[^\n]*\s-w\b"), "prints a keychain secret"),
+    (
+        re.compile(r"(?is)\bsecurity\s+find-(?:generic|internet)-password\b[^\n]*\s-w\b"),
+        "prints a keychain secret",
+    ),
 ]
 
 
@@ -102,7 +122,9 @@ def _headroom_summary(port: int) -> dict | None:
     out = {
         "saved": (body.get("savings") or {}).get("total_tokens") or life.get("tokens_saved") or 0,
         "pct": disp.get("savings_percent"),
-        "five_hour": (((body.get("subscription_window") or {}).get("latest") or {}).get("five_hour") or {}).get("utilization_pct"),
+        "five_hour": (
+            ((body.get("subscription_window") or {}).get("latest") or {}).get("five_hour") or {}
+        ).get("utilization_pct"),
     }
     try:
         paths.state_dir().mkdir(parents=True, exist_ok=True)

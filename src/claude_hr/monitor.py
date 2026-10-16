@@ -52,8 +52,13 @@ def snapshot(cfg: Config) -> dict:
         "claude_dir_gb": _claude_dir_gb(),
         "sessions": len(resources.live_sessions()),
         "session_limit": resources.session_limit(cfg),
-        "proxy": {"enabled": health is not None, "ok": bool(health and health.ok), "status": health.status if health else "off",
-                  "version": health.version if health else "", "rss_mb": round(proxy_rss)},
+        "proxy": {
+            "enabled": health is not None,
+            "ok": bool(health and health.ok),
+            "status": health.status if health else "off",
+            "version": health.version if health else "",
+            "rss_mb": round(proxy_rss),
+        },
     }
     return snap
 
@@ -62,13 +67,27 @@ def evaluate(cfg: Config, snap: dict) -> list[Alert]:
     m = cfg.section("monitor")
     alerts: list[Alert] = []
     if snap["disk_free_gb"] and snap["disk_free_gb"] < float(m.get("disk_warn_gb", 10)):
-        alerts.append(Alert("disk", "Low disk space", f"{snap['disk_free_gb']} GB free on the home volume"))
+        alerts.append(
+            Alert("disk", "Low disk space", f"{snap['disk_free_gb']} GB free on the home volume")
+        )
     if snap["ram_total_gb"]:
         used_pct = 100 * (1 - snap["ram_free_gb"] / snap["ram_total_gb"])
         if used_pct > float(m.get("mem_warn_pct", 90)):
-            alerts.append(Alert("memory", "High memory use", f"{used_pct:.0f}% RAM used, {snap['sessions']} Claude session(s)"))
+            alerts.append(
+                Alert(
+                    "memory",
+                    "High memory use",
+                    f"{used_pct:.0f}% RAM used, {snap['sessions']} Claude session(s)",
+                )
+            )
     if snap["claude_dir_gb"] > float(m.get("claude_dir_warn_gb", 10)):
-        alerts.append(Alert("claude-dir", "~/.claude is large", f"{snap['claude_dir_gb']} GB; run `claude-hr-ctl cleanup`"))
+        alerts.append(
+            Alert(
+                "claude-dir",
+                "~/.claude is large",
+                f"{snap['claude_dir_gb']} GB; run `claude-hr-ctl cleanup`",
+            )
+        )
     if snap["proxy"]["enabled"] and not snap["proxy"]["ok"]:
         alerts.append(Alert("proxy", "Headroom proxy down", f"status={snap['proxy']['status']}"))
     return alerts
@@ -76,7 +95,11 @@ def evaluate(cfg: Config, snap: dict) -> list[Alert]:
 
 def heal(cfg: Config, snap: dict) -> str:
     """Restart the shared proxy if it died. Rate-limited to once per 10 minutes."""
-    if not (snap["proxy"]["enabled"] and not snap["proxy"]["ok"] and cfg.flag("monitor.restart_proxy", True)):
+    if not (
+        snap["proxy"]["enabled"]
+        and not snap["proxy"]["ok"]
+        and cfg.flag("monitor.restart_proxy", True)
+    ):
         return ""
     stamp = paths.state_dir() / "last-proxy-restart"
     try:
@@ -93,7 +116,9 @@ def heal(cfg: Config, snap: dict) -> str:
         hr.stop()
         conflict = getattr(hr, "last_conflict", None)
         if conflict and procutil.port_listening(hr.host, hr.port):
-            return f"port {hr.port} is held by another program (pid {conflict}); change headroom.port"
+            return (
+                f"port {hr.port} is held by another program (pid {conflict}); change headroom.port"
+            )
     hr.ensure(wait_s=0)
     return "proxy restart requested"
 
@@ -109,10 +134,17 @@ def deliver(cfg: Config, alert: Alert) -> None:
         except (OSError, ValueError, subprocess.SubprocessError):
             pass
     if m.get("alert_ntfy_url"):
-        _post(str(m["alert_ntfy_url"]), alert.body.encode(), {"Title": alert.title, "Priority": "high"})
+        _post(
+            str(m["alert_ntfy_url"]),
+            alert.body.encode(),
+            {"Title": alert.title, "Priority": "high"},
+        )
     if m.get("alert_webhook_url"):
-        _post(str(m["alert_webhook_url"]), json.dumps({"title": alert.title, "text": alert.body}).encode(),
-              {"Content-Type": "application/json"})
+        _post(
+            str(m["alert_webhook_url"]),
+            json.dumps({"title": alert.title, "text": alert.body}).encode(),
+            {"Content-Type": "application/json"},
+        )
     with open(paths.logs_dir() / "alerts.log", "a", encoding="utf-8") as fh:
         fh.write(f"{time.strftime('%Y-%m-%dT%H:%M:%S')} {alert.key} {alert.title}: {alert.body}\n")
 
@@ -144,7 +176,9 @@ def tick(cfg: Config) -> dict:
         if key not in {a.key for a in alerts}:
             del sent[key]
     write_json(state_f, sent)
-    write_json(paths.state_dir() / "health.json", {**snap, "alerts": [a.key for a in alerts], "note": note})
+    write_json(
+        paths.state_dir() / "health.json", {**snap, "alerts": [a.key for a in alerts], "note": note}
+    )
     line = json.dumps({**snap, "alerts": [a.key for a in alerts]})
     log = paths.logs_dir() / "monitor.jsonl"
     try:

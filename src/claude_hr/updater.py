@@ -30,7 +30,9 @@ def installed_is_behind(repo) -> tuple[str, str] | None:
     """(checkout version, installed version) if the managed checkout holds a newer claude-hr than the one that is installed
     (a reinstall failed or was killed), else None."""
     try:
-        text = (pathlib.Path(repo) / "src" / "claude_hr" / "__init__.py").read_text(encoding="utf-8")
+        text = (pathlib.Path(repo) / "src" / "claude_hr" / "__init__.py").read_text(
+            encoding="utf-8"
+        )
     except OSError:
         return None
     m = re.search(r'__version__\s*=\s*"([^"]+)"', text)
@@ -57,7 +59,11 @@ class Result:
     detail: str = ""
 
     def line(self) -> str:
-        arrow = f"{self.current or '?'} -> {self.target}" if self.target and self.target != self.current else self.current
+        arrow = (
+            f"{self.current or '?'} -> {self.target}"
+            if self.target and self.target != self.current
+            else self.current
+        )
         return f"{self.component:<9} {self.action:<11} {arrow}  {self.detail}".rstrip()
 
 
@@ -129,7 +135,7 @@ def _windows_reinstall_script(cmd: list[str], pid: int, ppid: int, log, env=None
         "Wait-Process -Id $ids -Timeout 120 -ErrorAction SilentlyContinue",
         "Log ('running: ' + " + _ps_quote(" ".join(cmd)) + ")",
         "& " + " ".join(_ps_quote(part) for part in cmd) + " 2>&1 | ForEach-Object { "
-        "if ($_ -is [System.Management.Automation.ErrorRecord]) { $_.Exception.Message } else { \"$_\" } } | "
+        'if ($_ -is [System.Management.Automation.ErrorRecord]) { $_.Exception.Message } else { "$_" } } | '
         "Add-Content -LiteralPath $log -Encoding UTF8",
         "Log ('reinstall exit code ' + $LASTEXITCODE)",
         "if ($PSCommandPath) { Remove-Item -LiteralPath $PSCommandPath -Force -ErrorAction SilentlyContinue }",
@@ -165,8 +171,17 @@ def _start_systemd_service(cmd: list[str], log) -> bool:
     cgroup and survives. Returns True if the unit was started."""
     if not (paths.IS_LINUX and resources.caps_available()):
         return False
-    argv = ["systemd-run", "--user", "--quiet", "--collect", f"--unit=claude-hr-selfupdate-{int(time.time())}",
-            "-p", f"StandardOutput=append:{log}", "-p", f"StandardError=append:{log}"]
+    argv = [
+        "systemd-run",
+        "--user",
+        "--quiet",
+        "--collect",
+        f"--unit=claude-hr-selfupdate-{int(time.time())}",
+        "-p",
+        f"StandardOutput=append:{log}",
+        "-p",
+        f"StandardError=append:{log}",
+    ]
     argv += [f"--setenv={k}={v}" for k, v in sorted(_helper_env(os.environ).items())]
     argv += ["--", *cmd]
     return procutil.run(argv, timeout=30).returncode == 0
@@ -185,13 +200,20 @@ def _spawn_detached(cmd: list[str], log_path=None) -> None:
             out = open(log_path, "ab")  # noqa: SIM115
         except OSError:
             out = subprocess.DEVNULL
-    kwargs: dict = {"stdout": out, "stderr": subprocess.STDOUT if out is not subprocess.DEVNULL else subprocess.DEVNULL,
-                    "stdin": subprocess.DEVNULL}
+    kwargs: dict = {
+        "stdout": out,
+        "stderr": subprocess.STDOUT if out is not subprocess.DEVNULL else subprocess.DEVNULL,
+        "stdin": subprocess.DEVNULL,
+    }
     try:
         if paths.IS_WINDOWS:
-            flags = 0x08000000 | 0x00000008 | 0x00000200  # CREATE_NO_WINDOW | DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
+            flags = (
+                0x08000000 | 0x00000008 | 0x00000200
+            )  # CREATE_NO_WINDOW | DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
             try:
-                subprocess.Popen(cmd, creationflags=flags | 0x01000000, **kwargs)  # | CREATE_BREAKAWAY_FROM_JOB
+                subprocess.Popen(
+                    cmd, creationflags=flags | 0x01000000, **kwargs
+                )  # | CREATE_BREAKAWAY_FROM_JOB
             except OSError:  # the parent job does not allow breakaway
                 subprocess.Popen(cmd, creationflags=flags, **kwargs)
         else:
@@ -202,11 +224,15 @@ def _spawn_detached(cmd: list[str], log_path=None) -> None:
 
 
 class Updater:
-    def __init__(self, cfg: Config, dry: bool = False, force: bool = False, allow_downgrade: bool = False):
+    def __init__(
+        self, cfg: Config, dry: bool = False, force: bool = False, allow_downgrade: bool = False
+    ):
         self.cfg, self.dry, self.force, self.allow_downgrade = cfg, dry, force, allow_downgrade
         self.hr = Headroom(cfg)
         self.claude = procutil.find_claude(str(cfg.get("claude.binary", "") or ""))
-        self._pending_reinstall: list[str] | None = None  # set by update_self, started by run() once everything else is done
+        self._pending_reinstall: list[str] | None = (
+            None  # set by update_self, started by run() once everything else is done
+        )
 
     # ---- guards ---------------------------------------------------------------------------
     def _busy(self) -> str:
@@ -242,7 +268,11 @@ class Updater:
         except OSError:
             return False
         home = str(paths.home()).replace("\\", "/").lower()
-        return "/.local/share/claude/" in real or real.startswith(f"{home}/.local/bin/") or "/.claude/local/" in real
+        return (
+            "/.local/share/claude/" in real
+            or real.startswith(f"{home}/.local/bin/")
+            or "/.claude/local/" in real
+        )
 
     def claude_target(self) -> str:
         pin = str(self.cfg.get("claude.pin", "") or "")
@@ -270,11 +300,17 @@ class Updater:
             res.detail = "managed updates disabled in config"
             return res
         if not self.is_native_install():
-            res.detail = "not the native build (npm/Homebrew/WinGet): update it with that package manager"
+            res.detail = (
+                "not the native build (npm/Homebrew/WinGet): update it with that package manager"
+            )
             return res
         if vtuple(tgt) == vtuple(cur):
             return res
-        if vtuple(tgt) < vtuple(cur) and not self.allow_downgrade and not self.cfg.get("claude.pin"):
+        if (
+            vtuple(tgt) < vtuple(cur)
+            and not self.allow_downgrade
+            and not self.cfg.get("claude.pin")
+        ):
             res.detail = f"installed version is newer than channel '{self.cfg.get('claude.channel')}'; not downgrading"
             return res
         if self.dry:
@@ -329,7 +365,11 @@ class Updater:
         if cooldown > 0:  # cool the whole dependency tree, not just headroom-ai itself
             cutoff = (datetime.now(UTC) - timedelta(days=cooldown)).strftime("%Y-%m-%dT%H:%M:%SZ")
         inst = self.hr.install(tgt, exclude_newer=cutoff)
-        ok = inst.returncode == 0 and self.hr.version() is not None and vtuple(self.hr.version()) == vtuple(tgt)
+        ok = (
+            inst.returncode == 0
+            and self.hr.version() is not None
+            and vtuple(self.hr.version()) == vtuple(tgt)
+        )
         if ok:
             ok = self.smoke_headroom()
         if ok:
@@ -357,16 +397,42 @@ class Updater:
             return False
         import urllib.request
 
-        rows = [{"id": i, "status": "ok", "message": "heartbeat received from node-a", "latency_ms": 12} for i in range(300)]
-        body = json.dumps({
-            "model": "claude-sonnet-5-5",
-            "messages": [
-                {"role": "user", "content": "check the nodes"},
-                {"role": "assistant", "content": [{"type": "tool_use", "id": "t1", "name": "Bash", "input": {"command": "nodes"}}]},
-                {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t1", "content": json.dumps(rows)}]},
-            ],
-        }).encode()
-        req = urllib.request.Request(f"{self.hr.url}/v1/compress", data=body, headers={"content-type": "application/json"})
+        rows = [
+            {"id": i, "status": "ok", "message": "heartbeat received from node-a", "latency_ms": 12}
+            for i in range(300)
+        ]
+        body = json.dumps(
+            {
+                "model": "claude-sonnet-5-5",
+                "messages": [
+                    {"role": "user", "content": "check the nodes"},
+                    {
+                        "role": "assistant",
+                        "content": [
+                            {
+                                "type": "tool_use",
+                                "id": "t1",
+                                "name": "Bash",
+                                "input": {"command": "nodes"},
+                            }
+                        ],
+                    },
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "tool_result",
+                                "tool_use_id": "t1",
+                                "content": json.dumps(rows),
+                            }
+                        ],
+                    },
+                ],
+            }
+        ).encode()
+        req = urllib.request.Request(
+            f"{self.hr.url}/v1/compress", data=body, headers={"content-type": "application/json"}
+        )
         opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
         try:
             with opener.open(req, timeout=60) as resp:  # noqa: S310
@@ -404,15 +470,24 @@ class Updater:
             res.detail = "not a managed checkout (dev install?)"
             return res
         g = str(git[0])
-        cur = procutil.run([g, "-C", str(repo), "describe", "--tags", "--always"], timeout=30).stdout.strip()
-        fetched = procutil.run([g, "-C", str(repo), "fetch", "--tags", "--prune", "origin"], timeout=120)
+        cur = procutil.run(
+            [g, "-C", str(repo), "describe", "--tags", "--always"], timeout=30
+        ).stdout.strip()
+        fetched = procutil.run(
+            [g, "-C", str(repo), "fetch", "--tags", "--prune", "origin"], timeout=120
+        )
         if fetched.returncode != 0:
             # surfaces the usual private-repo problem (no credentials on this VM) instead of silently never updating
-            res.action, res.detail = "failed", "git fetch failed: " + (fetched.stderr or fetched.stdout).strip()[-160:]
+            res.action, res.detail = (
+                "failed",
+                "git fetch failed: " + (fetched.stderr or fetched.stdout).strip()[-160:],
+            )
             return res
         ref = str(self.cfg.get("self.update_ref", "stable"))
         if ref == "stable":
-            tags = procutil.run([g, "-C", str(repo), "tag", "--list", "v*"], timeout=30).stdout.split()
+            tags = procutil.run(
+                [g, "-C", str(repo), "tag", "--list", "v*"], timeout=30
+            ).stdout.split()
             # release tags only: vX.Y.Z (a v1.3.0-rc1 must never outrank v1.3.0, nor be installed unattended)
             tags = sorted((t for t in tags if re.fullmatch(r"v\d+\.\d+\.\d+", t)), key=vtuple)
             tgt = tags[-1] if tags else ""
@@ -423,7 +498,9 @@ class Updater:
             res.detail = "no release tag yet"
             return res
         head = procutil.run([g, "-C", str(repo), "rev-parse", "HEAD"], timeout=30).stdout.strip()
-        want = procutil.run([g, "-C", str(repo), "rev-parse", tgt + "^{commit}"], timeout=30).stdout.strip()
+        want = procutil.run(
+            [g, "-C", str(repo), "rev-parse", tgt + "^{commit}"], timeout=30
+        ).stdout.strip()
         if not want:
             res.target = res.current
             return res
@@ -442,7 +519,12 @@ class Updater:
                 return res
             retry = True
         # only ever move forward: a checkout of `main` that is ahead of the newest tag must not be rewound to it
-        elif procutil.run([g, "-C", str(repo), "merge-base", "--is-ancestor", head, want], timeout=30).returncode != 0:
+        elif (
+            procutil.run(
+                [g, "-C", str(repo), "merge-base", "--is-ancestor", head, want], timeout=30
+            ).returncode
+            != 0
+        ):
             res.target = res.current
             res.detail = f"installed commit is not behind {tgt}; not moving"
             return res
@@ -454,22 +536,46 @@ class Updater:
         if busy:  # replacing the tool env under a running launcher fails on Windows and can leave a broken install
             res.action, res.detail = "deferred", busy
             return res
-        uv = procutil.which_all("uv")  # resolved BEFORE the checkout moves, so "uv missing" never leaves it ahead of the tool
+        uv = procutil.which_all(
+            "uv"
+        )  # resolved BEFORE the checkout moves, so "uv missing" never leaves it ahead of the tool
         if not uv:
             res.action, res.detail = "failed", "uv missing"
             return res
         if not retry:
-            co = procutil.run([g, "-C", str(repo), "checkout", "--detach", "--quiet", tgt], timeout=60)
+            co = procutil.run(
+                [g, "-C", str(repo), "checkout", "--detach", "--quiet", tgt], timeout=60
+            )
             if co.returncode != 0:
-                res.action, res.detail = "failed", "git checkout failed: " + (co.stderr or co.stdout).strip()[-160:]
+                res.action, res.detail = (
+                    "failed",
+                    "git checkout failed: " + (co.stderr or co.stdout).strip()[-160:],
+                )
                 return res
         # Re-installing replaces the files this process runs from, so it is handed to a detached helper that starts
         # only at the very END of run() (see _launch_reinstall): the helper must never overlap with later components.
-        self._pending_reinstall = [str(uv[0]), "tool", "install", "--python", "3.13", "--force", "--reinstall", str(repo)]
-        write_json(paths.state_dir() / "self-update.json", {"from": head, "to": want, "ts": time.time()})
+        self._pending_reinstall = [
+            str(uv[0]),
+            "tool",
+            "install",
+            "--python",
+            "3.13",
+            "--force",
+            "--reinstall",
+            str(repo),
+        ]
+        write_json(
+            paths.state_dir() / "self-update.json", {"from": head, "to": want, "ts": time.time()}
+        )
         res.action = "updated"
-        res.detail = ("retrying the reinstall of the checked-out release (the last one did not finish); " if retry else "") + \
-            "reinstalling in the background (log: logs/self-update.log); run `claude-hr-ctl setup` afterwards if config changed"
+        res.detail = (
+            (
+                "retrying the reinstall of the checked-out release (the last one did not finish); "
+                if retry
+                else ""
+            )
+            + "reinstalling in the background (log: logs/self-update.log); run `claude-hr-ctl setup` afterwards if config changed"
+        )
         return res
 
     def _launch_reinstall(self) -> None:
@@ -494,22 +600,51 @@ class Updater:
 
                     script = _windows_reinstall_script(cmd, os.getpid(), os.getppid(), log)
                     ps1 = paths.state_dir() / "self-update.ps1"
-                    ps1.write_bytes(b"\xef\xbb\xbf" + script.encode("utf-8"))  # BOM: PowerShell 5.1 reads ANSI otherwise
+                    ps1.write_bytes(
+                        b"\xef\xbb\xbf" + script.encode("utf-8")
+                    )  # BOM: PowerShell 5.1 reads ANSI otherwise
                     if _start_helper_task(str(shell[0]), ps1):
                         return
-                    _log({"component": "self", "action": "note", "detail": "scheduler refused the helper task; starting the helper directly"})
-                    ps1.unlink(missing_ok=True)  # the fallback carries the script itself; do not leave a copy on disk
+                    _log(
+                        {
+                            "component": "self",
+                            "action": "note",
+                            "detail": "scheduler refused the helper task; starting the helper directly",
+                        }
+                    )
+                    ps1.unlink(
+                        missing_ok=True
+                    )  # the fallback carries the script itself; do not leave a copy on disk
                     encoded = base64.b64encode(script.encode("utf-16-le")).decode("ascii")
-                    cmd = [str(shell[0]), "-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-EncodedCommand", encoded]
+                    cmd = [
+                        str(shell[0]),
+                        "-NoProfile",
+                        "-NonInteractive",
+                        "-WindowStyle",
+                        "Hidden",
+                        "-EncodedCommand",
+                        encoded,
+                    ]
             if not paths.IS_WINDOWS and _start_systemd_service(cmd, log):
                 return
             _spawn_detached(cmd, log)
         except OSError as exc:
-            _log({"component": "self", "action": "failed", "detail": f"could not start the reinstall: {exc}"})
+            _log(
+                {
+                    "component": "self",
+                    "action": "failed",
+                    "detail": f"could not start the reinstall: {exc}",
+                }
+            )
 
     # ---- orchestration --------------------------------------------------------------------
     def run(self, components: list[str] | None = None) -> Report:
-        order = components or ["claude", "headroom", "self", "plugins"]  # self before plugins: the plugin comes from the repo
+        order = components or [
+            "claude",
+            "headroom",
+            "self",
+            "plugins",
+        ]  # self before plugins: the plugin comes from the repo
         fns = {
             "claude": self.update_claude,
             "headroom": self.update_headroom,
@@ -523,7 +658,15 @@ class Updater:
             except Exception as exc:  # one broken component must not block the others
                 res = Result(name, action="failed", detail=f"{type(exc).__name__}: {exc}")
             report.results.append(res)
-            _log({"component": res.component, "from": res.current, "to": res.target, "action": res.action, "detail": res.detail})
+            _log(
+                {
+                    "component": res.component,
+                    "from": res.current,
+                    "to": res.target,
+                    "action": res.action,
+                    "detail": res.detail,
+                }
+            )
         st = read_json(paths.state_dir() / "update-state.json", {}) or {}
         st["last_run"] = time.time()
         st["last_ok"] = report.ok

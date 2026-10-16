@@ -41,7 +41,9 @@ QUIET_CLI_ENV = {
 }
 
 
-def pick_release(releases: dict, cooldown_days: float, fallback: str | None = None, now: float | None = None) -> str | None:
+def pick_release(
+    releases: dict, cooldown_days: float, fallback: str | None = None, now: float | None = None
+) -> str | None:
     """Newest X.Y.Z release whose earliest file is >= cooldown_days old, ignoring pre-releases and yanked builds."""
     from datetime import datetime
 
@@ -50,7 +52,12 @@ def pick_release(releases: dict, cooldown_days: float, fallback: str | None = No
     best_name: str | None = None
     for ver, files in releases.items():
         parts = ver.split(".")
-        if len(parts) != 3 or not all(p.isdigit() for p in parts) or not files or all(f.get("yanked") for f in files):
+        if (
+            len(parts) != 3
+            or not all(p.isdigit() for p in parts)
+            or not files
+            or all(f.get("yanked") for f in files)
+        ):
             continue
         times = []
         for f in files:
@@ -160,10 +167,14 @@ class Headroom:
 
     def latest_version(self, timeout: float = 15.0, cooldown_days: float = 0.0) -> str | None:
         """Newest stable, non-yanked release at least `cooldown_days` old (0 = just the newest)."""
-        status, body = procutil.http_json("https://pypi.org/pypi/headroom-ai/json", timeout=timeout, loopback=False)
+        status, body = procutil.http_json(
+            "https://pypi.org/pypi/headroom-ai/json", timeout=timeout, loopback=False
+        )
         if status != 200 or not isinstance(body, dict):
             return None
-        return pick_release(body.get("releases") or {}, cooldown_days, body.get("info", {}).get("version"))
+        return pick_release(
+            body.get("releases") or {}, cooldown_days, body.get("info", {}).get("version")
+        )
 
     # ---- proxy ----------------------------------------------------------------------------
     def health(self, timeout: float = 0.6) -> Health:
@@ -246,7 +257,9 @@ class Headroom:
         paths.ensure_dirs()
         try:
             log = self._open_log()
-        except OSError:  # e.g. a symlink planted at the log path: run without a log rather than not at all
+        except (
+            OSError
+        ):  # e.g. a symlink planted at the log path: run without a log rather than not at all
             log = None
         kwargs: dict = {
             "stdin": subprocess.DEVNULL,
@@ -263,11 +276,17 @@ class Headroom:
                     | getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
                 )
                 try:
-                    proc = subprocess.Popen([str(b), *self.proxy_args()], creationflags=flags | 0x01000000, **kwargs)
+                    proc = subprocess.Popen(
+                        [str(b), *self.proxy_args()], creationflags=flags | 0x01000000, **kwargs
+                    )
                 except OSError:  # CREATE_BREAKAWAY_FROM_JOB not permitted by the parent job
-                    proc = subprocess.Popen([str(b), *self.proxy_args()], creationflags=flags, **kwargs)
+                    proc = subprocess.Popen(
+                        [str(b), *self.proxy_args()], creationflags=flags, **kwargs
+                    )
             else:
-                proc = subprocess.Popen([str(b), *self.proxy_args()], start_new_session=True, **kwargs)
+                proc = subprocess.Popen(
+                    [str(b), *self.proxy_args()], start_new_session=True, **kwargs
+                )
         finally:
             if log is not None:
                 log.close()  # the child has its own copy of the handle
@@ -282,7 +301,13 @@ class Headroom:
     def _open_log():
         """Proxy stdout/stderr log: owner-only (it can contain project paths and request metadata) and never opened
         through a symlink. Raises OSError if the path is a symlink."""
-        flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
+        flags = (
+            os.O_WRONLY
+            | os.O_CREAT
+            | os.O_APPEND
+            | getattr(os, "O_BINARY", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+        )
         fd = os.open(paths.logs_dir() / "headroom-proxy.log", flags, 0o600)
         if hasattr(os, "fchmod"):
             try:
@@ -304,12 +329,16 @@ class Headroom:
                     return health
                 listening = procutil.port_listening(self.host, self.port)
                 st = read_json(self._state_file(), {}) or {}
-                starting = bool(st.get("pid")) and sysinfo.pid_alive(int(st["pid"])) and (
-                    time.time() - float(st.get("started", 0)) < 180
+                starting = (
+                    bool(st.get("pid"))
+                    and sysinfo.pid_alive(int(st["pid"]))
+                    and (time.time() - float(st.get("started", 0)) < 180)
                 )
                 if listening and not starting:
                     # something is bound to the port but is not a healthy proxy we just started: don't wait for it
-                    return Health(False, "port-busy", detail=f"port {self.port} is held by another process")
+                    return Health(
+                        False, "port-busy", detail=f"port {self.port} is held by another process"
+                    )
                 if not listening and not starting:
                     if self.binary() is None:
                         return Health(False, "not-installed", detail="headroom is not installed")
@@ -324,7 +353,11 @@ class Headroom:
             if health.ok:
                 return health
             if proc is not None and proc.poll() is not None:
-                return Health(False, "crashed", detail=f"proxy exited with code {proc.returncode} (see headroom-proxy.log)")
+                return Health(
+                    False,
+                    "crashed",
+                    detail=f"proxy exited with code {proc.returncode} (see headroom-proxy.log)",
+                )
             time.sleep(1.0)
         return self.health()
 
@@ -336,8 +369,13 @@ class Headroom:
                 return b"headroom" in Path(f"/proc/{pid}/cmdline").read_bytes().lower()
             if paths.IS_WINDOWS:
                 r = procutil.run(
-                    ["powershell", "-NoProfile", "-NonInteractive", "-Command",
-                     f"(Get-CimInstance Win32_Process -Filter 'ProcessId={int(pid)}').CommandLine"],
+                    [
+                        "powershell",
+                        "-NoProfile",
+                        "-NonInteractive",
+                        "-Command",
+                        f"(Get-CimInstance Win32_Process -Filter 'ProcessId={int(pid)}').CommandLine",
+                    ],
                     timeout=20,
                 )
             else:
@@ -373,7 +411,12 @@ class Headroom:
             r = procutil.run(["netstat", "-ano", "-p", "TCP"], timeout=15)
             for line in r.stdout.splitlines():
                 cols = line.split()
-                if len(cols) >= 5 and cols[0] == "TCP" and cols[3] == "LISTENING" and cols[1].rsplit(":", 1)[-1] == str(port):
+                if (
+                    len(cols) >= 5
+                    and cols[0] == "TCP"
+                    and cols[3] == "LISTENING"
+                    and cols[1].rsplit(":", 1)[-1] == str(port)
+                ):
                     if cols[-1].isdigit():
                         pids.add(int(cols[-1]))
             return pids
@@ -394,7 +437,9 @@ class Headroom:
     @staticmethod
     def _terminate_tree(pid: int) -> bool:
         if paths.IS_WINDOWS:
-            return procutil.run(["taskkill", "/PID", str(pid), "/T", "/F"], timeout=20).returncode == 0
+            return (
+                procutil.run(["taskkill", "/PID", str(pid), "/T", "/F"], timeout=20).returncode == 0
+            )
         try:
             os.killpg(os.getpgid(pid), 15)
             return True
@@ -416,11 +461,15 @@ class Headroom:
         name = urllib.parse.quote(cwd.name.strip() or "root", safe="-_.() ")
         headers = [f"X-Headroom-Project: {name}"]
         try:
-            headers.append(f"X-Headroom-Cwd: {urllib.parse.quote(str(cwd.resolve()), safe='/:._-~()')}")  # same encoding as `headroom wrap`
+            headers.append(
+                f"X-Headroom-Cwd: {urllib.parse.quote(str(cwd.resolve()), safe='/:._-~()')}"
+            )  # same encoding as `headroom wrap`
         except OSError:
             pass
         existing = os.environ.get("ANTHROPIC_CUSTOM_HEADERS", "")
-        env["ANTHROPIC_CUSTOM_HEADERS"] = "\n".join([existing, *headers]) if existing else "\n".join(headers)
+        env["ANTHROPIC_CUSTOM_HEADERS"] = (
+            "\n".join([existing, *headers]) if existing else "\n".join(headers)
+        )
         if bool(self.h.get("one_m_context", False)):
             env.setdefault("ANTHROPIC_MODEL", os.environ.get("ANTHROPIC_MODEL", "opus[1m]"))
         if bool(self.h.get("quiet_cli", True)):
@@ -438,7 +487,10 @@ class Headroom:
             "args": ["mcp", "serve"],
             # same workspace as the proxy: without it the MCP tool keeps its plaintext store in ~/.headroom, outside the
             # folder that `uninstall --purge` removes and that claude-hr keeps owner-only
-            "env": {"HEADROOM_PROXY_URL": self.url, "HEADROOM_WORKSPACE_DIR": str(paths.hr_home() / "headroom")},
+            "env": {
+                "HEADROOM_PROXY_URL": self.url,
+                "HEADROOM_WORKSPACE_DIR": str(paths.hr_home() / "headroom"),
+            },
         }
 
     def serena_pin(self) -> str:
@@ -453,14 +505,23 @@ class Headroom:
 
     def resolve_serena_pin(self, cooldown_days: float = 5.0) -> str:
         """`uvx serena-agent` without a version pulls whatever is newest on every start: pin it once, reviewably."""
-        status, body = procutil.http_json("https://pypi.org/pypi/serena-agent/json", timeout=15.0, loopback=False)
+        status, body = procutil.http_json(
+            "https://pypi.org/pypi/serena-agent/json", timeout=15.0, loopback=False
+        )
         if status != 200 or not isinstance(body, dict):
             return ""
-        ver = pick_release(body.get("releases") or {}, cooldown_days, body.get("info", {}).get("version")) or ""
+        ver = (
+            pick_release(
+                body.get("releases") or {}, cooldown_days, body.get("info", {}).get("version")
+            )
+            or ""
+        )
         if ver:
             try:
                 paths.state_dir().mkdir(parents=True, exist_ok=True)
-                atomic_write_text(paths.state_dir() / "serena-pin.txt", ver + "\n", follow_symlinks=False)
+                atomic_write_text(
+                    paths.state_dir() / "serena-pin.txt", ver + "\n", follow_symlinks=False
+                )
             except OSError:
                 pass
         return ver
@@ -471,7 +532,16 @@ class Headroom:
         return {
             "type": "stdio",
             "command": "uvx",
-            "args": ["--from", src, "serena", "start-mcp-server", "--project-from-cwd",
-                     "--context", "claude-code", "--open-web-dashboard", "False"],
+            "args": [
+                "--from",
+                src,
+                "serena",
+                "start-mcp-server",
+                "--project-from-cwd",
+                "--context",
+                "claude-code",
+                "--open-web-dashboard",
+                "False",
+            ],
             "env": {},
         }
