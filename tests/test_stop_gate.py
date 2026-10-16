@@ -4,7 +4,9 @@ import io
 import json
 import subprocess
 import sys
+import time
 import types
+from pathlib import Path
 from types import SimpleNamespace as NS
 
 import pytest
@@ -21,13 +23,15 @@ class Fakes:
         self.trust = "trusted"
         self.fmt_calls = []
         self.gate_calls = []
+        self.fingerprint_calls = []
         self.formatted = []
         self.gate_result = NS(
             action="pass", reason="", results=[NS(name="ruff"), NS(name="pytest")]
         )
         self.fmt_raises = None
 
-    def fingerprint(self, root):
+    def fingerprint(self, root, **kw):
+        self.fingerprint_calls.append(kw)
         return f"fp-{self.tree}"
 
     def trust_state(self, root, state_dir):
@@ -270,6 +274,99 @@ def test_state_remembers_at_most_fifty_repositories(sandbox):
     assert state.seen("repo-0") is None and state.seen("repo-59") == "fp-59"
     state.remember("repo-10", "again")  # re-seen: moves to the newest end
     assert list(state.data)[-1] == "repo-10"
+
+
+def test_the_hook_budget_is_below_the_plugins_hook_timeout():
+    hooks_json = Path(__file__).resolve().parents[1] / "plugins/hr-gates/hooks/hooks.json"
+    timeout = json.loads(hooks_json.read_text(encoding="utf-8"))["hooks"]["Stop"][0]["hooks"][0][
+        "timeout"
+    ]
+    assert stop_gate.HOOK_BUDGET_S == 150
+    assert stop_gate.HOOK_BUDGET_S + 10 <= timeout, "a killed hook silently drops its block"
+
+
+def test_every_step_is_handed_what_is_left_of_one_budget(fakes, repo, monkeypatch):
+    monkeypatch.setattr(stop_gate, "HOOK_BUDGET_S", 40)
+    t0 = time.monotonic()
+    stop_gate.handle(payload(repo))
+    assert fakes.fmt_calls[0]["timeout_s"] <= 20.0, "the formatter may use half of what is left"
+    deadline = fakes.gate_calls[0]["deadline"]
+    assert t0 + 39 < deadline < t0 + 41
+    assert len(fakes.fingerprint_calls) == 2
+    assert all(call.get("deadline") == deadline for call in fakes.fingerprint_calls)
+
+
+def test_configured_timeouts_are_limits_inside_the_budget_not_additions(fakes, repo, monkeypatch):
+    monkeypatch.setenv("CLAUDE_HR_FORMAT__TIMEOUT_S", "600")
+    monkeypatch.setenv("CLAUDE_HR_VERIFY__GATE_TIMEOUT_S", "900")
+    stop_gate.handle(payload(repo))
+    assert fakes.fmt_calls[0]["timeout_s"] <= stop_gate.HOOK_BUDGET_S / 2
+    # verify.gate clamps its own limit against the deadline it is given (tested with the real module)
+    assert fakes.gate_calls[0]["timeout_s"] == 900 and fakes.gate_calls[0]["deadline"]
+
+
+def test_the_formatter_is_skipped_when_almost_nothing_is_left(fakes, repo, monkeypatch):
+    monkeypatch.setattr(stop_gate, "HOOK_BUDGET_S", 1.5)
+    stop_gate.handle(payload(repo))
+    assert fakes.fmt_calls == [] and len(fakes.gate_calls) == 1
+    monkeypatch.setattr(stop_gate, "HOOK_BUDGET_S", 0)  # already spent: not even git is asked
+    fakes.tree = "B"
+    assert stop_gate.handle(payload(repo)) is None and len(fakes.gate_calls) == 1
+
+
+def test_a_budget_skip_that_started_no_check_is_retried_a_cut_short_run_is_remembered(fakes, repo):
+    fakes.gate_result = NS(
+        action="skip", reason="time budget: 3s left", results=[], note="time budget"
+    )
+    stop_gate.handle(payload(repo))
+    stop_gate.handle(payload(repo))
+    assert len(fakes.gate_calls) == 2, "the tree was not looked at: try again next time"
+    row = auditlog.tail(1)[0]
+    assert row["verify"] == "skip" and row["note"] == "time budget"
+
+    fakes.tree = "B"
+    fakes.gate_result = NS(
+        action="skip", reason="inconclusive", results=[NS(name="slow")], note="time budget"
+    )
+    stop_gate.handle(payload(repo))
+    stop_gate.handle(payload(repo))
+    assert len(fakes.gate_calls) == 3, (
+        "a run that started and was cut short is not started again and again"
+    )
+    assert auditlog.tail(1)[0]["note"] == "time budget"
+
+
+def test_an_ordinary_turn_leaves_no_note_in_the_trail(fakes, repo):
+    stop_gate.handle(payload(repo))
+    assert "note" not in auditlog.tail(1)[0]
+
+
+def test_two_sessions_saving_together_do_not_overwrite_each_other(sandbox):
+    a, b = stop_gate._State.load(), stop_gate._State.load()  # both read the same (empty) file
+    a.remember("repo-a", "fp-a")
+    b.remember("repo-b", "fp-b")
+    a.save()
+    b.save()  # b's copy knows nothing of repo-a: its save must merge, not replace
+    merged = stop_gate._State.load()
+    assert merged.seen("repo-a") == "fp-a" and merged.seen("repo-b") == "fp-b"
+    assert not (paths.state_dir() / "gates.lock").exists(), "the lock is released"
+    idle = stop_gate._State.load()
+    idle.save()  # nothing remembered: nothing written
+    assert stop_gate._State.load().data == merged.data
+
+
+def test_saving_state_keeps_at_most_fifty_repositories_on_disk(sandbox):
+    for batch in range(3):
+        state = stop_gate._State.load()
+        for i in range(30):
+            state.remember(f"repo-{batch}-{i}", "fp")
+        state.save()
+    on_disk = stop_gate._State.load().data
+    assert (
+        len(on_disk) == stop_gate.STATE_KEEP
+        and "repo-2-29" in on_disk
+        and "repo-0-0" not in on_disk
+    )
 
 
 def test_the_stop_path_does_not_import_the_control_cli_or_heavy_modules(sandbox):

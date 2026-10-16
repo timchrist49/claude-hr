@@ -42,8 +42,16 @@ MAX_TRUSTED_REPOS = 200
 MAX_BLOCK_FPS = 20  # fingerprints with a block count, per repo
 ACTIVE_ENV = "CLAUDE_HR_VERIFY_ACTIVE"  # set for every check: a nested gate (a test that drives hooks) must not recurse
 _DIFF_CAP = 4 * 1024 * 1024
-_STAT_CAP = 200
 _ADVISORY_CAP = 5
+# Time left under the hook's deadline (see stop_gate.HOOK_BUDGET_S) that the gate keeps for what happens AFTER the
+# checks (second fingerprint, test-weakening scan, state write), and the least the checks themselves are worth
+# starting with. Below the sum the gate does not start them (skip, note "time budget").
+POST_RUN_RESERVE_S = 10.0
+MIN_RUN_S = 5.0
+# test-weakening: one diff line is looked at only up to this many characters (a minified bundle or a hostile line
+# must not cost more than a normal one), and the whole scan stops after this many seconds
+_MAX_LINE = 2000
+_ADVISORY_BUDGET_S = 5.0
 
 
 class VerifyConfigError(ValueError):
@@ -107,6 +115,9 @@ class GateOutcome:
     fingerprint: str = ""
     results: list[CheckResult] = field(default_factory=list)
     seconds: float = 0.0
+    # short machine-readable tag for the audit trail ("time budget": the hook's deadline cut the run short or
+    # left no time to start); empty for every ordinary outcome
+    note: str = ""
 
 
 # ---------------------------------------------------------------------------------------------------------------
@@ -252,14 +263,73 @@ def load(root: Path) -> Recipe | None:
     return _parse(data, Path(root), str(config_path(root)))
 
 
+@dataclass(frozen=True)
+class Loaded:
+    """One read of the config: the recipe parsed from `data`, and the digest of exactly those bytes."""
+
+    recipe: Recipe | None
+    data: bytes | None
+    sha256: str | None
+
+
+def load_checked(root: Path) -> Loaded:
+    """load() that also hands back the bytes and their digest, so a caller can show the parsed recipe, judge its trust
+    (trust_state_of) and approve it (trust(..., expect_sha256=)) all from the same read. Raises VerifyConfigError."""
+    data = _read_config(root)
+    if data is None:
+        return Loaded(None, None, None)
+    return Loaded(_parse(data, Path(root), str(config_path(root))), data, _sha256(data))
+
+
+# Characters that print as nothing (or as a blank) although Python calls them printable: variation selectors, the
+# combining grapheme joiner, Hangul/Braille/Khmer fillers. They are shown escaped as well.
+_BLANKS = re.compile(
+    "[\u034f\u115f\u1160\u17b4\u17b5\u180b-\u180f\u2800\u3164\ufe00-\ufe0f\uffa0\U000e0100-\U000e01ef]"
+)
+
+
+def _escape_char(ch: str) -> str:
+    n = ord(ch)
+    if n < 0x100:
+        return f"\\x{n:02x}"
+    return f"\\u{n:04x}" if n < 0x10000 else f"\\U{n:08x}"
+
+
+def safe_text(text: str) -> str:
+    """`text` with every character that could hide or alter what a terminal shows written out visibly (\\x1b, \\u202e).
+
+    Everything from a repository's recipe that a person reads before approving it goes through here: an ESC or CR
+    can erase the line that was just printed, a bidi override can reorder it, a zero-width character can make two
+    different commands look equal. What stays as it is: printable text (letters, digits, punctuation, symbols, the
+    plain space) in any script. A literal backslash is not doubled (Windows paths), so the text `\\x1b` typed out by
+    an author looks the same as an escaped ESC; either way the person sees it and nothing is hidden.
+    """
+    if text.isprintable() and not _BLANKS.search(text):
+        return text
+    return "".join(c if c.isprintable() and not _BLANKS.match(c) else _escape_char(c) for c in text)
+
+
 def _toml_str(value: str) -> str:
-    # JSON string escapes are valid TOML basic-string escapes, except that TOML also forbids a raw DEL
-    return json.dumps(value, ensure_ascii=False).replace("\x7f", "\\u007f")
+    # JSON string escapes are valid TOML basic-string escapes. JSON leaves DEL, the C1 controls, bidi/format
+    # characters and the line separators raw: they are written as \uXXXX too, so the proposal is as readable on a
+    # terminal as it is on disk (and a lone surrogate, which TOML cannot hold, becomes U+FFFD)
+    text = json.dumps(value, ensure_ascii=False)
+    if text.isprintable() and not _BLANKS.search(text):
+        return text
+    out = []
+    for c in text:
+        if c.isprintable() and not _BLANKS.match(c):
+            out.append(c)
+        elif 0xD800 <= ord(c) <= 0xDFFF:
+            out.append("\\ufffd")
+        else:
+            out.append(_escape_char(c).replace("\\x", "\\u00"))
+    return "".join(out)
 
 
 def _comment(text: str, limit: int = 200) -> str:
-    """One line, no control characters: notes carry text from the repo (CI files) and must not break the TOML."""
-    return re.sub(r"[\x00-\x1f\x7f]+", " ", text).strip()[:limit]
+    """One line, nothing a terminal could act on: notes carry text from the repo (CI files) and must not break the TOML."""
+    return safe_text(re.sub(r"[\x00-\x1f\x7f]+", " ", text).strip()[:limit])
 
 
 _HEADER = """\
@@ -304,10 +374,13 @@ def render_toml(r: Recipe) -> str:
 
 
 def command_line(check: Check) -> str:
-    """The check as a shell-looking line, for display only (it is never executed that way)."""
+    """The check as a shell-looking line, for display only (it is never executed that way).
+
+    Passed through safe_text: an argv item with an escape sequence, a CR or a bidi override is shown as such.
+    """
     import shlex
 
-    return shlex.join(check.argv)
+    return safe_text(shlex.join(check.argv))
 
 
 # ---------------------------------------------------------------------------------------------------------------
@@ -342,10 +415,9 @@ def _trusted_hash(root: Path, state_dir: Path) -> str | None:
     return value if isinstance(value, str) else None
 
 
-def trust_state(root: Path, state_dir: Path) -> str:
-    """no-config | invalid | untrusted | modified (trusted once, edited since) | trusted. Never raises."""
+def trust_state_of(root: Path, state_dir: Path, data: bytes | None) -> str:
+    """trust_state for config bytes the caller already read (so the verdict and the parsed recipe share one read)."""
     try:
-        data = _read_config(root)
         if data is None:
             return "no-config"
         try:
@@ -360,19 +432,38 @@ def trust_state(root: Path, state_dir: Path) -> str:
         return "untrusted"
 
 
+def trust_state(root: Path, state_dir: Path) -> str:
+    """no-config | invalid | untrusted | modified (trusted once, edited since) | trusted. Never raises."""
+    try:
+        data = _read_config(root)
+    except (OSError, ValueError):
+        return "untrusted"
+    return trust_state_of(root, state_dir, data)
+
+
 def is_trusted(root: Path, state_dir: Path) -> bool:
     return trust_state(root, state_dir) == "trusted"
 
 
-def trust(root: Path, state_dir: Path) -> str:
-    """Record the hash of the config as it is now. Refuses a missing or invalid file. Returns the hash."""
+def trust(root: Path, state_dir: Path, expect_sha256: str | None = None) -> str:
+    """Record the hash of the config as it is now. Refuses a missing or invalid file. Returns the hash.
+
+    `expect_sha256` is the digest of the bytes a person was shown (Loaded.sha256): when the file on disk no longer
+    hashes to it, nothing is recorded (VerifyConfigError). Without it the approval would cover whatever is on disk
+    at the moment of the write, which is not necessarily what was on the screen.
+    """
     data = _read_config(root)
     if data is None:
         raise VerifyConfigError(
             f"no {config_path(root)} to trust (create it with: claude-hr-ctl verify init --write)"
         )
-    _parse(data, Path(root), "")
     digest = _sha256(data)
+    if expect_sha256 is not None and digest != expect_sha256:
+        raise VerifyConfigError(
+            f"{config_path(root)} changed after it was shown to you; nothing was trusted. "
+            "Read it again, then run `claude-hr-ctl verify trust` again"
+        )
+    _parse(data, Path(root), "")
     path = _trust_file(state_dir)
     state = _read_dict(path)
     key = _repo_key(root)
@@ -385,7 +476,8 @@ def trust(root: Path, state_dir: Path) -> str:
 
 
 def untrust(root: Path, state_dir: Path) -> bool:
-    """Forget the approval for this repo. True if there was one."""
+    """Forget the approval for this repo. True if there was one. Needs only the repo's key: it works while the recipe is
+    missing, unreadable or invalid (revoking must never depend on the file being well-formed)."""
     path = _trust_file(state_dir)
     state = _read_dict(path)
     if state.pop(_repo_key(root), None) is None:
@@ -397,35 +489,103 @@ def untrust(root: Path, state_dir: Path) -> bool:
 # ---------------------------------------------------------------------------------------------------------------
 # running checks
 # ---------------------------------------------------------------------------------------------------------------
-_SECRET_NAME = re.compile(r"TOKEN|SECRET|PASSW|KEY|CREDENTIAL", re.IGNORECASE)
-_KEEP_ENV = frozenset(
-    {"PATH", "HOME", "USERPROFILE", "TEMP", "TMP", "TMPDIR", "SYSTEMROOT", "LANG", "LANGUAGE"}
+# THE environment deny-list. Every child process claude-hr starts from a repository's text (the verify checks here,
+# the formatter step in fmt.py) gets the environment minus these. A variable is dropped when its name, upper-cased,
+#   - contains one of SECRET_ENV_WORDS, or starts with one of SECRET_ENV_PREFIXES, or is one of SECRET_ENV_NAMES,
+#   - unless it is one of KEEP_ENV / starts with a KEEP_ENV_PREFIXES entry (what a toolchain cannot run without and
+#     that holds no secret: GIT_AUTHOR_NAME would otherwise match "AUTH", the CA-bundle paths match "CERT").
+# Values are also dropped when they embed credentials in a URL (https://user:pass@host). A deny-list, not an
+# allow-list, so a harmless variable some tool needs keeps working; it is a speed bump for a naive `print(os.environ)`,
+# not a boundary (the check runs as you and can read ~/.aws or its parent's environment). Keep fmt.py in step.
+SECRET_ENV_WORDS = (
+    "TOKEN",
+    "SECRET",
+    "PASS",  # PASSWORD, PASSPHRASE, DB_PASS, PGPASSFILE, GIT_ASKPASS, ...
+    "PWD",  # MYSQL_PWD (the shell's own PWD is dropped too: it would name the hook's directory, not the check's)
+    "KEY",
+    "CRED",
+    "AUTH",  # also SSH_AUTH_SOCK
+    "COOKIE",
+    "DSN",
+    "CONNECTION",
+    "PRIVATE",
+    "CERT",
 )
+SECRET_ENV_PREFIXES = (
+    "ANTHROPIC_",
+    "CLAUDE_CODE_",
+    "AWS_",
+    "AZURE_",
+    "GOOGLE_",
+    "GCP_",
+    "GITHUB_",
+    "GH_",
+    "NPM_",
+)
+SECRET_ENV_NAMES = frozenset({"DATABASE_URL", "SSH_AUTH_SOCK", "GIT_ASKPASS", "SSH_ASKPASS"})
+KEEP_ENV = frozenset(
+    {
+        "PATH",
+        "PATHEXT",
+        "HOME",
+        "USERPROFILE",
+        "SYSTEMROOT",
+        "WINDIR",
+        "TEMP",
+        "TMP",
+        "TMPDIR",
+        "APPDATA",
+        "LOCALAPPDATA",
+        "PROGRAMDATA",
+        "LANG",
+        "LANGUAGE",
+        "CARGO_HOME",
+        "RUSTUP_HOME",
+        "VIRTUAL_ENV",
+        "GOPATH",
+        "JAVA_HOME",
+        # paths to public CA bundles (they contain "CERT" but no secret): behind a TLS-inspecting proxy a check that
+        # downloads anything cannot work without them
+        "SSL_CERT_FILE",
+        "SSL_CERT_DIR",
+        "NODE_EXTRA_CA_CERTS",
+    }
+)
+KEEP_ENV_PREFIXES = ("GIT_AUTHOR_", "GIT_COMMITTER_")
+_URL_CREDENTIALS = re.compile(r"://[^/@\s:]+:[^/@\s]+@")
+
+
+def is_secret_env(name: str, value: str = "") -> bool:
+    """Would the deny-list drop this variable? (see SECRET_ENV_WORDS)"""
+    upper = name.upper()
+    if upper in KEEP_ENV or upper.startswith(KEEP_ENV_PREFIXES):
+        return False
+    if (
+        upper in SECRET_ENV_NAMES
+        or upper.startswith(SECRET_ENV_PREFIXES)
+        or any(word in upper for word in SECRET_ENV_WORDS)
+    ):
+        return True
+    return "://" in value and bool(_URL_CREDENTIALS.search(value[:4096]))
 
 
 def scrubbed_env(base: dict[str, str] | None = None) -> dict[str, str]:
-    """A copy of the environment without anything that looks like a credential, plus CI=1.
+    """A copy of the environment without the names and values the deny-list above drops, plus CI=1.
 
     A deny-list, not an allow-list: toolchains need many harmless variables (SYSTEMROOT, APPDATA, CARGO_HOME,
     VIRTUAL_ENV, ...) and a check that only works in a hand-picked environment would fail in the gate and pass in
-    the terminal. The names in _KEEP_ENV are never dropped.
+    the terminal.
     """
     src = dict(os.environ if base is None else base)
-    env = {}
-    for name, value in src.items():
-        upper = name.upper()
-        secret = (
-            _SECRET_NAME.search(name) or upper.startswith("ANTHROPIC_") or upper == "SSH_AUTH_SOCK"
-        )
-        if not secret or upper in _KEEP_ENV:
-            env[name] = value
+    env = {name: value for name, value in src.items() if not is_secret_env(name, value)}
     env["CI"] = "1"
     env[ACTIVE_ENV] = "1"
     return env
 
 
 _ANSI_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)?|\x1b[@-Z\\-_]")
-_CTRL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+# (the C1 controls too: U+009B is a one-character CSI on terminals that honour 8-bit controls in UTF-8)
+_CTRL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]")
 
 
 def _tail_text(raw: bytes) -> str:
@@ -495,30 +655,140 @@ def _kill_quietly(proc) -> None:
         pass
 
 
-def _kill_tree(proc) -> None:
+_JOB_API: dict = {}  # ctypes handles for the job object calls, built on first use
+
+
+def _job_api() -> dict:
+    """kernel32 job-object entry points with their ctypes signatures (Windows only; raises elsewhere)."""
+    if not _JOB_API:
+        import ctypes
+        from ctypes import wintypes
+
+        class Basic(ctypes.Structure):
+            _fields_ = [
+                ("PerProcessUserTimeLimit", ctypes.c_int64),
+                ("PerJobUserTimeLimit", ctypes.c_int64),
+                ("LimitFlags", wintypes.DWORD),
+                ("MinimumWorkingSetSize", ctypes.c_size_t),
+                ("MaximumWorkingSetSize", ctypes.c_size_t),
+                ("ActiveProcessLimit", wintypes.DWORD),
+                ("Affinity", ctypes.c_size_t),
+                ("PriorityClass", wintypes.DWORD),
+                ("SchedulingClass", wintypes.DWORD),
+            ]
+
+        class Counters(ctypes.Structure):
+            _fields_ = [
+                (n, ctypes.c_uint64) for n in "r_ops w_ops o_ops r_bytes w_bytes o_bytes".split()
+            ]
+
+        class Extended(ctypes.Structure):
+            _fields_ = [
+                ("Basic", Basic),
+                ("Io", Counters),
+                ("ProcessMemoryLimit", ctypes.c_size_t),
+                ("JobMemoryLimit", ctypes.c_size_t),
+                ("PeakProcessMemoryUsed", ctypes.c_size_t),
+                ("PeakJobMemoryUsed", ctypes.c_size_t),
+            ]
+
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        k32.CreateJobObjectW.restype = wintypes.HANDLE
+        k32.CreateJobObjectW.argtypes = [wintypes.LPVOID, wintypes.LPCWSTR]
+        k32.SetInformationJobObject.argtypes = [
+            wintypes.HANDLE,
+            ctypes.c_int,
+            wintypes.LPVOID,
+            wintypes.DWORD,
+        ]
+        k32.AssignProcessToJobObject.argtypes = [wintypes.HANDLE, wintypes.HANDLE]
+        k32.TerminateJobObject.argtypes = [wintypes.HANDLE, wintypes.UINT]
+        k32.CloseHandle.argtypes = [wintypes.HANDLE]
+        _JOB_API.update(ctypes=ctypes, k32=k32, Extended=Extended)
+    return _JOB_API
+
+
+class _Job:
+    """A Windows job object that holds a check and every process it starts, then ends them all.
+
+    taskkill /T walks the parent links of a LIVE process, so it finds nothing once the check has exited and its
+    children were re-parented; a job keeps the membership. KILL_ON_JOB_CLOSE also ends the group if this process is
+    killed itself (the hook's own timeout). Best effort: if the job cannot be made or joined (an enclosing job that
+    forbids nesting) the object is inert and the callers fall back to taskkill. Inert on every other OS.
+    """
+
+    _KILL_ON_JOB_CLOSE = 0x2000
+    _EXTENDED_LIMITS = 9
+
+    def __init__(self, proc) -> None:
+        self._handle = None
+        if not _WIN:
+            return
+        api = None
+        try:
+            api = _job_api()
+            k32, ctypes = api["k32"], api["ctypes"]
+            job = k32.CreateJobObjectW(None, None)
+            if not job:
+                return
+            info = api["Extended"]()
+            info.Basic.LimitFlags = self._KILL_ON_JOB_CLOSE
+            if not k32.SetInformationJobObject(
+                job, self._EXTENDED_LIMITS, ctypes.byref(info), ctypes.sizeof(info)
+            ) or not k32.AssignProcessToJobObject(job, int(proc._handle)):
+                k32.CloseHandle(job)
+                return
+            self._handle = job
+        except Exception:  # noqa: BLE001 - a missing job is a degraded kill, never a failed check
+            self._handle = None
+
+    def terminate(self) -> bool:
+        """End every process in the job. False when there is no job (the caller then uses the other mechanism)."""
+        if self._handle is None:
+            return False
+        try:
+            return bool(_job_api()["k32"].TerminateJobObject(self._handle, 1))
+        except Exception:  # noqa: BLE001
+            return False
+
+    def close(self) -> None:
+        handle, self._handle = self._handle, None
+        if handle is not None:
+            try:
+                _job_api()["k32"].CloseHandle(handle)
+            except Exception:  # noqa: BLE001
+                pass
+
+
+def _taskkill_tree(proc) -> None:
+    import subprocess
+
+    from . import procutil
+
+    taskkill = os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32", "taskkill.exe")
+    if not os.path.isfile(taskkill):
+        taskkill = procutil.resolve_exe("taskkill")  # never the current directory
+    if taskkill is None:
+        return
+    subprocess.run(
+        [taskkill, "/PID", str(proc.pid), "/T", "/F"],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        timeout=15,
+        creationflags=_NO_WINDOW,
+        check=False,
+    )
+
+
+def _kill_tree(proc, job: _Job | None = None) -> None:
     """Kill the check and everything it started. A test runner's workers must not outlive a timeout."""
     import subprocess
 
     try:
         if _WIN:
-            taskkill = os.path.join(
-                os.environ.get("SystemRoot", r"C:\Windows"), "System32", "taskkill.exe"
-            )
-            subprocess.run(
-                [
-                    taskkill if os.path.isfile(taskkill) else "taskkill",
-                    "/PID",
-                    str(proc.pid),
-                    "/T",
-                    "/F",
-                ],
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                timeout=15,
-                creationflags=_NO_WINDOW,
-                check=False,
-            )
+            if job is None or not job.terminate():
+                _taskkill_tree(proc)
         else:
             import signal
 
@@ -533,12 +803,33 @@ def _kill_tree(proc) -> None:
         pass
 
 
+def _reap_group(proc, job: _Job | None) -> None:
+    """The check exited on its own: end whatever it left running (a dev server, a database, a watcher).
+
+    Otherwise one process tree leaks per turn, holding ports and (on Windows) file locks, and may keep rewriting
+    files the next fingerprint then sees. POSIX: the check led its own session, so its pid is the group id and the
+    group outlives the leader as long as it has members (the kernel does not reuse a pid that is a live group id).
+    Windows: the job object.
+    """
+    try:
+        if job is not None:
+            job.terminate()
+        elif not _WIN:
+            import signal
+
+            os.killpg(proc.pid, signal.SIGKILL)
+    except OSError:  # no member left (ProcessLookupError), or not ours to signal
+        pass
+
+
 def _resolve_exe(name: str, cwd: Path, path_env: str) -> str | None:
     """Find the executable like a shell would, but never in the repo unless asked with an explicit path.
 
     shutil.which on Windows looks in the current directory first, so a repo could plant `pytest.bat` next to its
-    config; a bare name is therefore only searched on PATH. A relative path with a separator is relative to the
-    check's cwd (POSIX does that natively, CreateProcess does not).
+    config; a bare name is therefore only searched on PATH, and only through ABSOLUTE PATH entries: a relative one
+    (`node_modules/.bin`, `.`) would be resolved against the hook's working directory, i.e. the repository (same rule
+    as procutil.resolve_exe). A relative path with a separator is relative to the check's cwd (POSIX does that
+    natively, CreateProcess does not).
     """
     pathext = (
         [e.lower() for e in os.environ.get("PATHEXT", ".COM;.EXE;.BAT;.CMD").split(";") if e]
@@ -563,11 +854,16 @@ def _resolve_exe(name: str, cwd: Path, path_env: str) -> str | None:
         return next((c for c in variants(base) if usable(c)), None)
     for directory in path_env.split(os.pathsep):
         directory = directory.strip().strip('"')
-        if directory:
+        if directory and _is_absolute_dir(directory):
             found = next((c for c in variants(os.path.join(directory, name)) if usable(c)), None)
             if found:
                 return found
     return None
+
+
+def _is_absolute_dir(directory: str) -> bool:
+    """Anchored somewhere that is not the working directory (on Windows a drive or UNC share, not `\\tools`)."""
+    return os.path.isabs(directory) and (not _WIN or bool(os.path.splitdrive(directory)[0]))
 
 
 _CMD_UNSAFE = frozenset('&|<>^%"\r\n')
@@ -622,6 +918,7 @@ def _run_one(
         return refused(127, f"not found: {chk.argv[0]}")
     except (OSError, ValueError) as exc:
         return refused(126, f"could not start {chk.argv[0]}: {exc}")
+    job = _Job(proc) if _WIN else None
     tail = _Tail(proc.stdout)
     timed_out = False
     try:
@@ -629,10 +926,15 @@ def _run_one(
             proc.wait(timeout=limit)
         except subprocess.TimeoutExpired:
             timed_out = True
-            _kill_tree(proc)
+            _kill_tree(proc, job)
+        else:
+            _reap_group(proc, job)
     except BaseException:
-        _kill_tree(proc)
+        _kill_tree(proc, job)
         raise
+    finally:
+        if job is not None:
+            job.close()
     # a grandchild that outlives the check may keep the pipe open: do not wait for EOF forever
     tail.thread.join(2.0 if timed_out else 1.0)
     rc = 124 if timed_out else proc.returncode
@@ -654,7 +956,8 @@ def run(
     total_timeout_s: float = 300,
     stop_on_fail: bool = False,
 ) -> RunResult:
-    """Run checks in order. No shell, scrubbed env, per-check timeout, the process tree dies on timeout.
+    """Run checks in order. No shell, scrubbed env, per-check timeout, the process tree dies on timeout, and what a
+    check leaves running when it exits on its own (a dev server, a watcher) is ended with it.
 
     Never raises: a missing tool is a result with rc 127. `total_timeout_s` bounds the whole run (each check gets
     the smaller of its own limit and what is left). The gate passes stop_on_fail=True, `verify run` wants them all.
@@ -686,6 +989,34 @@ def _toplevel(root: Path) -> Path:
     return next((c for c in (base, *base.parents) if (c / ".git").exists()), base)
 
 
+_GIT_EXE: dict[str, str] = {}  # PATH value -> the git it resolved to (a successful lookup only)
+
+
+def _git_exe() -> str | None:
+    """Absolute path of git, found only through absolute PATH entries (procutil.resolve_exe): Popen(["git"]) on
+    Windows would first try the process's own current directory, which is the repository."""
+    path = os.environ.get("PATH", "")
+    exe = _GIT_EXE.get(path)
+    if exe is None:
+        from . import procutil
+
+        exe = procutil.resolve_exe("git")
+        if exe is not None:
+            if len(_GIT_EXE) > 4:
+                _GIT_EXE.clear()
+            _GIT_EXE[path] = exe
+    return exe
+
+
+def _git_timeout(deadline: float | None, cap: float = 20.0) -> float | None:
+    """Seconds one git call may take: `cap`, less what the overall deadline (a time.monotonic() value) leaves.
+    None when (almost) nothing is left: the caller then gives up instead of starting a call it cannot finish."""
+    if deadline is None:
+        return cap
+    left = deadline - time.monotonic()
+    return min(cap, left) if left > 0.25 else None
+
+
 def _git(
     top: Path, *args: str, cap: int = 16_000_000, timeout: float = 20.0
 ) -> tuple[bytes, bool] | None:
@@ -693,10 +1024,13 @@ def _git(
     import subprocess
     import threading
 
+    exe = _git_exe()
+    if exe is None:
+        return None
     kwargs: dict = {"creationflags": _NO_WINDOW} if _WIN else {}
     try:
         proc = subprocess.Popen(
-            ["git", "--no-optional-locks", *args],
+            [exe, "--no-optional-locks", *args],
             cwd=str(top),
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
@@ -775,38 +1109,83 @@ def _status_entries(raw: bytes) -> list[tuple[str, str]]:
         code = tok[:2].decode("ascii", "replace")
         if "R" in code or "C" in code:
             i += 1
-        out.append((code, tok[3:].decode("utf-8", "replace")))
+        # POSIX names are bytes: surrogateescape keeps a non-UTF-8 name equal to what os.scandir reports
+        path = tok[3:].decode("utf-8", "replace") if _WIN else os.fsdecode(tok[3:])
+        out.append((code, path))
     return out
 
 
-def fingerprint(root: Path) -> str:
+def _hash_stats(h, top: Path, rels: list[str]) -> None:
+    """Fold (size, mtime_ns) of every path in `rels` (git's `/`-separated, relative to `top`) into `h`.
+
+    One directory listing per directory instead of one lstat per file: on Windows a scandir entry carries its stat
+    for free, which is ~10x cheaper (5000 files: 0.03 s instead of 0.3 s) and the fingerprint is taken up to three
+    times per turn. A path that has vanished is hashed as "gone". Deterministic: sorted, no timing dependence.
+    """
+    by_dir: dict[str, list[str]] = {}
+    for rel in rels:
+        head, _, name = rel.rstrip("/").rpartition("/")  # a nested repository is listed as `dir/`
+        by_dir.setdefault(head, []).append(name)
+    base = str(top)
+    for head in sorted(by_dir):
+        wanted = set(by_dir[head])
+        found: dict[str, tuple[int, int]] = {}
+        try:
+            with os.scandir(f"{base}/{head}" if head else base) as listing:
+                for entry in listing:
+                    if entry.name in wanted:
+                        try:
+                            st = entry.stat(follow_symlinks=False)
+                        except OSError:
+                            continue
+                        found[entry.name] = (st.st_size, st.st_mtime_ns)
+        except OSError:
+            pass
+        for name in sorted(wanted):
+            stat = found.get(name)
+            where = f"{head}/{name}" if head else name
+            tail = f"{stat[0]}\0{stat[1]}" if stat else "gone"
+            h.update(f"{where}\0{tail}\0".encode("utf-8", "replace"))
+
+
+def fingerprint(root: Path, *, deadline: float | None = None) -> str:
     """Hash of the working-tree change: HEAD, `status`, the `diff HEAD` content, untracked files' (size, mtime).
 
     Equal fingerprints mean "nothing Claude could have changed since last time", so the gate skips. Content is
     hashed for tracked files (cheap, exact); untracked files only by (size, mtime_ns) - a new file's bytes are
-    not in `diff HEAD`. A diff over 4 MB is hashed up to the cap and the tracked files' (size, mtime_ns) are added
-    so a change past the cap still moves the value. Returns "" when git is unavailable or this is not a work tree
-    (never raises): the caller treats that as "cannot tell".
+    not in `diff HEAD` - and ALL of them: there is no cap, so an in-place edit of any untracked file moves the value
+    (a freshly scaffolded repo, an unignored node_modules). The only limit is git's own: a `status` listing past
+    16 MB (roughly 250,000 untracked paths) is "cannot tell". A diff over 4 MB is hashed up to the cap and the
+    tracked files' (size, mtime_ns) are added so a change past the cap still moves the value.
+
+    Returns "" when git is unavailable, this is not a work tree, the listing is truncated or `deadline` (a
+    time.monotonic() value) has passed (never raises): the caller treats that as "cannot tell".
     """
     try:
-        return _fingerprint(Path(root))
+        return _fingerprint(Path(root), deadline)
     except Exception:
         return ""
 
 
-def _fingerprint(root: Path) -> str:
+def _fingerprint(root: Path, deadline: float | None = None) -> str:
     import hashlib
 
+    timeout = _git_timeout(deadline)
+    if timeout is None:
+        return ""
     top = _toplevel(root)
     status, head, diff = _git_parallel(
         top,
         [
-            (("status", "--porcelain=v1", "-z", "-uall"), {}),
-            (("rev-parse", "--verify", "-q", "HEAD"), {}),
-            (("diff", "HEAD", "--no-ext-diff", "--no-textconv", "--no-color"), {"cap": _DIFF_CAP}),
+            (("status", "--porcelain=v1", "-z", "-uall"), {"timeout": timeout}),
+            (("rev-parse", "--verify", "-q", "HEAD"), {"timeout": timeout}),
+            (
+                ("diff", "HEAD", "--no-ext-diff", "--no-textconv", "--no-color"),
+                {"cap": _DIFF_CAP, "timeout": timeout},
+            ),
         ],
     )
-    if status is None:
+    if status is None or status[1]:
         return ""
     h = hashlib.sha1(usedforsecurity=False)
     h.update(b"hr-verify-fp1\0")
@@ -824,13 +1203,7 @@ def _fingerprint(root: Path) -> str:
     watched = [p for code, p in entries if code == "??"]
     if oversize:
         watched += [p for code, p in entries if code != "??"]
-    for rel in watched[:_STAT_CAP]:
-        try:
-            st = os.lstat(top / rel)
-        except OSError:
-            h.update(f"{rel}\0gone\0".encode("utf-8", "replace"))
-            continue
-        h.update(f"{rel}\0{st.st_size}\0{st.st_mtime_ns}\0".encode("utf-8", "replace"))
+    _hash_stats(h, top, watched)
     return h.hexdigest()
 
 
@@ -869,18 +1242,26 @@ _SUPPRESS_RE = re.compile(
     r"|@ts-(?:ignore|expect-error|nocheck)\b|eslint-disable|//\s*nolint\b|#\[allow\("
 )
 _NUM = r"\d+(?:\.\d+)?(?:[eE][-+]?\d+)?|\.\d+(?:[eE][-+]?\d+)?"
-_TOL_KW_RE = re.compile(
-    rf"\b(abs|rel|atol|rtol|delta|tol|tolerance|epsilon|eps|places|decimal|digits|precision|\w*timeout\w*)"
-    rf"\s*[=:(]\s*(?P<n>{_NUM})(?![\w.])",
-    re.IGNORECASE,
+# These two run over text that comes from the repository, so they must stay LINEAR in the length of a line (no
+# `\w*timeout\w*`-style nested/overlapping repeats: `timeout` x n made that one quadratic and stalled the hook past
+# its deadline). The keyword is any identifier of up to 64 characters followed by `=`/`:`/`(` and a number; whether
+# it is a tolerance or timeout word is decided afterwards (_is_tolerance_word). `\s*` and the following class never
+# overlap, so every position has one way to match.
+_TOL_WORDS = frozenset(
+    "abs rel atol rtol delta tol tolerance epsilon eps places decimal digits precision".split()
 )
-_TOL_POS_RE = re.compile(rf"\b(approx|toBeCloseTo)\s*\(\s*[^,()]+,\s*(?P<n>{_NUM})(?![\w.])")
+_TOL_KW_RE = re.compile(rf"\b(\w{{1,64}})\s*[=:(]\s*(?P<n>{_NUM})(?![\w.])")
+_TOL_POS_RE = re.compile(
+    rf"\b(approx|toBeCloseTo)\s*\(\s*[^,()\s][^,()]*,\s*(?P<n>{_NUM})(?![\w.])"
+)
 _NUM_RE = re.compile(rf"(?<![\w.])(?:{_NUM})(?![\w.])")
 # for these a smaller number is a looser check (fewer digits compared)
 _INVERTED = frozenset({"places", "decimal", "digits", "precision", "tobecloseto"})
 
 
 def _is_test_path(path: str) -> bool:
+    if len(path) > 1024:  # no real checkout has one; the pattern matching below stays cheap
+        return False
     p = path.replace("\\", "/")
     ext = p.rsplit(".", 1)[-1].lower() if "." in p.rsplit("/", 1)[-1] else ""
     return ext in _CODE_EXTS and bool(_TEST_DIR_RE.search(p) or _TEST_NAME_RE.search(p))
@@ -936,9 +1317,9 @@ def _parse_diff(text: str) -> list[_FileDiff]:
             elif line.startswith("@@"):
                 in_header = False
         elif line.startswith("+"):
-            cur.added.append(line[1:])
+            cur.added.append(line[1 : _MAX_LINE + 1])
         elif line.startswith("-"):
-            cur.removed.append(line[1:])
+            cur.removed.append(line[1 : _MAX_LINE + 1])
     return files
 
 
@@ -954,12 +1335,20 @@ def _skip_hits(line: str) -> str | None:
     return None
 
 
+def _is_tolerance_word(word: str) -> bool:
+    return word in _TOL_WORDS or "timeout" in word
+
+
 def _tolerances(line: str) -> dict[str, float]:
     found: dict[str, float] = {}
+    line = line[:_MAX_LINE]
     for rx in (_TOL_KW_RE, _TOL_POS_RE):
         for m in rx.finditer(line):
+            word = m.group(1).lower()
+            if rx is _TOL_KW_RE and not _is_tolerance_word(word):
+                continue
             try:
-                found.setdefault(m.group(1).lower(), float(m.group("n")))
+                found.setdefault(word, float(m.group("n")))
             except ValueError:
                 continue
     return found
@@ -969,13 +1358,15 @@ def _skeleton(line: str) -> str:
     return _NUM_RE.sub("#", " ".join(line.split()))
 
 
-def _widened(removed: list[str], added: list[str]) -> list[str]:
+def _widened(removed: list[str], added: list[str], deadline: float | None = None) -> list[str]:
     """Tolerance/timeout keywords whose number grew (or whose digit count shrank) between a removed and an added line."""
     by_skeleton: dict[str, list[str]] = {}
     for line in added:
         by_skeleton.setdefault(_skeleton(line), []).append(line)
     hits: list[str] = []
     for line in removed:
+        if deadline is not None and time.monotonic() > deadline:
+            break  # advisory only: out of time means fewer hints, never a stalled hook
         old = _tolerances(line)
         if not old:
             continue
@@ -991,12 +1382,14 @@ def _widened(removed: list[str], added: list[str]) -> list[str]:
 
 
 def _clean(path: str) -> str:
-    return re.sub(r"[\x00-\x1f\x7f]+", " ", path)[:100]
+    return safe_text(re.sub(r"[\x00-\x1f\x7f]+", " ", path)[:100])
 
 
-def _advisories(diff_text: str) -> list[str]:
+def _advisories(diff_text: str, deadline: float | None = None) -> list[str]:
     ranked: list[tuple[int, int, str]] = []
     for idx, fd in enumerate(_parse_diff(diff_text)):
+        if deadline is not None and time.monotonic() > deadline:
+            break
         if not fd.path or not _is_test_path(fd.path):
             continue
         name = _clean(fd.path)
@@ -1026,7 +1419,7 @@ def _advisories(diff_text: str) -> list[str]:
         )
         if lost > 0:
             add(2, f"{lost} assertion line(s) removed without a replacement")
-        keys = sorted(set(_widened(removed, added)))
+        keys = sorted(set(_widened(removed, added, deadline)))
         if keys:
             add(3, f"tolerance/timeout widened ({', '.join(keys[:3])})")
         net = sum(bool(_SUPPRESS_RE.search(s)) for s in fd.added) - sum(
@@ -1041,14 +1434,19 @@ def _advisories(diff_text: str) -> list[str]:
     return [text for _, _, text in ranked[:_ADVISORY_CAP]]
 
 
-def test_weakening(root: Path) -> list[str]:
+def test_weakening(root: Path, *, deadline: float | None = None) -> list[str]:
     """ADVISORY regex scan of `git diff -U0 HEAD` for ways a change could make the tests pass by checking less.
 
     At most 5 short '<file>: <what>' strings; [] when nothing stands out or git cannot answer. It only flags,
     it never blocks by itself, and it never raises. Only tracked changes are in `diff HEAD`; a brand-new
-    untracked test file is not scanned.
+    untracked test file is not scanned. Every line is looked at only up to _MAX_LINE characters, the patterns are
+    linear, and the scan stops after _ADVISORY_BUDGET_S seconds (or at `deadline`, a time.monotonic() value): the
+    text is the repository's own and must not be able to stall the end-of-turn hook.
     """
     try:
+        timeout = _git_timeout(deadline)
+        if timeout is None:
+            return []
         res = _git(
             _toplevel(Path(root)),
             "-c",
@@ -1061,10 +1459,14 @@ def test_weakening(root: Path) -> list[str]:
             "--no-textconv",
             "--no-color",
             cap=2 * 1024 * 1024,
+            timeout=timeout,
         )
         if res is None:
             return []
-        return _advisories(res[0].decode("utf-8", errors="replace"))
+        stop = time.monotonic() + _ADVISORY_BUDGET_S
+        if deadline is not None:
+            stop = min(stop, deadline)
+        return _advisories(res[0].decode("utf-8", errors="replace"), stop)
     except Exception:
         return []
 
@@ -1116,24 +1518,39 @@ def _gate_entry(state_dir: Path, key: str) -> dict:
     return entry if isinstance(entry, dict) else {}
 
 
-def _mark_green(fp: str):
+def _mark_green(fp: str, fp_after: str = ""):
+    """Remember `fp` (the tree the checks ran on) as green, and `fp_after` (the tree they left: a check may write
+    coverage files, a test database, a log) so the next look at that tree is not mistaken for a change."""
+
     def update(entry: dict) -> None:
         entry["last_green"] = fp
+        if fp_after and fp_after != fp:
+            entry["last_green_after"] = fp_after
+        else:
+            entry.pop("last_green_after", None)
         entry["blocks"] = {}
         entry.pop("last_block", None)
 
     return update
 
 
-def _mark_block(fp: str, summary: str):
+def _mark_block(fp: str, summary: str, fp_after: str = ""):
+    """Count one block for the change `fp`, and under `fp_after` too: the next Stop fingerprints the tree the failing
+    check left behind, and that must count as the same change or a check that writes a file never reaches the cap."""
+
     def update(entry: dict) -> None:
         raw = entry.get("blocks")
         blocks = dict(raw) if isinstance(raw, dict) else {}
-        blocks[fp] = _count(blocks.pop(fp, 0)) + 1
+        count = _count(blocks.pop(fp, 0)) + 1
+        blocks[fp] = count
+        last = {"fp": fp, "summary": summary}
+        if fp_after and fp_after != fp:
+            blocks[fp_after] = max(count, _count(blocks.pop(fp_after, 0)))
+            last["fp_after"] = fp_after
         while len(blocks) > MAX_BLOCK_FPS:
             blocks.pop(next(iter(blocks)))
         entry["blocks"] = blocks
-        entry["last_block"] = {"fp": fp, "summary": summary}
+        entry["last_block"] = last
 
     return update
 
@@ -1153,6 +1570,7 @@ def gate(
     timeout_s: float = 120,
     tier: str = "fast",
     test_guard: bool = True,
+    deadline: float | None = None,
 ) -> GateOutcome:
     """Run the trusted recipe's tier for the work tree as it is now. Never raises, never runs untrusted config.
 
@@ -1161,21 +1579,51 @@ def gate(
     pass  - every check passed; the fingerprint is remembered as green
     block - a check failed; `reason` is what to hand the model (summary line, output tail, test-weakening hints)
     error - something outside the code under test went wrong (missing tool, broken state file, bug): fail open
+
+    `deadline` (a time.monotonic() value) is the caller's overall budget, the end-of-turn hook's, which a killed
+    hook would silently turn into a lost block. The checks get min(timeout_s, what is left minus
+    POST_RUN_RESERVE_S), every git call is bounded by it, and with less than POST_RUN_RESERVE_S + MIN_RUN_S left
+    nothing is started (skip, note "time budget").
     """
     t0 = time.monotonic()
     try:
-        out = _gate(Path(root), Path(state_dir), max_blocks, timeout_s, tier, test_guard)
+        out = _gate(Path(root), Path(state_dir), max_blocks, timeout_s, tier, test_guard, deadline)
     except Exception as exc:
         out = GateOutcome("error", f"verify gate failed: {type(exc).__name__}: {exc}")
     out.seconds = time.monotonic() - t0
     return out
 
 
+def _fingerprint_by(root: Path, deadline: float | None) -> str:
+    return fingerprint(root) if deadline is None else fingerprint(root, deadline=deadline)
+
+
 def _gate(
-    root: Path, state_dir: Path, max_blocks: int, timeout_s: float, tier: str, test_guard: bool
+    root: Path,
+    state_dir: Path,
+    max_blocks: int,
+    timeout_s: float,
+    tier: str,
+    test_guard: bool,
+    deadline: float | None = None,
 ) -> GateOutcome:
     def skip(reason: str, fp: str = "") -> GateOutcome:
         return GateOutcome("skip", reason, fp)
+
+    def room() -> float:
+        """Seconds the checks themselves may take under the caller's deadline (inf without one)."""
+        if deadline is None:
+            return float("inf")
+        return deadline - time.monotonic() - POST_RUN_RESERVE_S
+
+    def out_of_time(fp: str = "") -> GateOutcome:
+        left = max(0.0, room() + POST_RUN_RESERVE_S)
+        return GateOutcome(
+            "skip",
+            f"time budget: {left:.0f}s of the hook's deadline left, too little to run the checks; not blocking",
+            fp,
+            note="time budget",
+        )
 
     if os.environ.get(ACTIVE_ENV):
         return skip("running inside a verify check; not nesting")
@@ -1203,25 +1651,36 @@ def _gate(
         return skip(f"no {tier} checks in .claude/{CONFIG_NAME}")
     if max_blocks < 1:
         return skip("blocking is disabled (gate_max_blocks < 1)")
-    fp = fingerprint(root)
+    if room() < MIN_RUN_S:
+        return out_of_time()
+    fp = _fingerprint_by(root, deadline)
     if not fp:
-        return skip("cannot fingerprint the work tree (git missing or not a repository)")
+        return skip(
+            "cannot fingerprint the work tree (git missing, not a repository, too many untracked files "
+            "or out of time)"
+        )
     entry = _gate_entry(state_dir, key)
-    if entry.get("last_green") == fp:
+    if fp in (entry.get("last_green"), entry.get("last_green_after")):
         return skip("unchanged since the last passing run", fp)
     blocks = entry.get("blocks")
     seen = _count(blocks.get(fp)) if isinstance(blocks, dict) else 0
     if seen >= max_blocks:
         last = entry.get("last_block")
-        summary = last.get("summary") if isinstance(last, dict) and last.get("fp") == fp else None
+        same = isinstance(last, dict) and fp in (last.get("fp"), last.get("fp_after"))
+        summary = last.get("summary") if same else None
         tail = f"; last failure: {summary}" if isinstance(summary, str) else ""
         return skip(f"block cap reached ({seen}/{max_blocks}) for this change{tail}", fp)
+    if room() < MIN_RUN_S:  # the fingerprint and the state lookup may have used what was left
+        return out_of_time(fp)
+    budget = min(timeout_s, room())
 
-    rr = run(root, checks, total_timeout_s=timeout_s, stop_on_fail=True)
+    rr = run(root, checks, total_timeout_s=budget, stop_on_fail=True)
     failed = rr.failed
     if failed is None and not rr.skipped:
+        # the tree the checks leave behind (coverage files, a test database) is what the next Stop will look at
+        after = _fingerprint_by(root, deadline)
         try:
-            _record(state_dir, key, _mark_green(fp))
+            _record(state_dir, key, _mark_green(fp, after))
         except OSError:
             pass  # not remembering a green run only costs one re-run
         return GateOutcome(
@@ -1235,9 +1694,10 @@ def _gate(
         done = f"{len(rr.results)} of {len(checks)}"
         return GateOutcome(
             "skip",
-            f"time budget ({timeout_s:g}s) used up after {done} checks; not blocking",
+            f"time budget ({budget:g}s) used up after {done} checks; not blocking",
             fp,
             rr.results,
+            note="time budget",
         )
     if failed.launch_failed:
         return GateOutcome(
@@ -1249,18 +1709,24 @@ def _gate(
     if failed.clamped:
         return GateOutcome(
             "skip",
-            f"time budget ({timeout_s:g}s) ran out inside {_clean(failed.name)}; inconclusive, not blocking",
+            f"time budget ({budget:g}s) ran out inside {_clean(failed.name)}; inconclusive, not blocking",
             fp,
             rr.results,
+            note="time budget",
         )
     summary = _failure_summary(failed)
     lines = [summary]
     if failed.output:
         lines.append(failed.output)
+    # the failing check may have written files; the next Stop fingerprints that tree and must find the count there
+    after = _fingerprint_by(root, deadline)
     if test_guard:
-        lines += [f"Possible test weakening: {adv}" for adv in test_weakening(root)]
+        advice = (
+            test_weakening(root) if deadline is None else test_weakening(root, deadline=deadline)
+        )
+        lines += [f"Possible test weakening: {adv}" for adv in advice]
     try:
-        _record(state_dir, key, _mark_block(fp, summary))
+        _record(state_dir, key, _mark_block(fp, summary, after))
     except OSError as exc:
         # without a block counter the cap cannot work: fail open instead of nagging forever
         return GateOutcome(

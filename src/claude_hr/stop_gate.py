@@ -14,11 +14,19 @@ import json
 import os
 import sys
 import time
+from contextlib import contextmanager
 from pathlib import Path
 
 from . import paths, procutil
 
 STATE_KEEP = 50  # repositories remembered in state/gates.json
+# ONE time budget for the whole hook, shared by the git calls, the formatter and the checks. The plugin's hook timeout
+# (plugins/hr-gates/hooks/hooks.json) is 170 s and a hook that gets killed prints nothing: the block it was about to
+# deliver is silently lost, no state is saved and the checks' process tree is left running. Finishing a little early
+# is always better, so every step is handed what is left of this (verify.gate_timeout_s and format.timeout_s are
+# upper limits inside it, not additions to it).
+HOOK_BUDGET_S = 150
+_GIT_ROOT_S = 8.0  # the longest `git rev-parse` may take
 
 
 def run() -> int:
@@ -37,6 +45,7 @@ def run() -> int:
 
 def handle(payload: dict) -> dict | None:
     """The whole decision, separated from stdin/stdout so it can be tested. Returns the JSON to print or None."""
+    deadline = time.monotonic() + HOOK_BUDGET_S
     if os.environ.get("CLAUDE_HR_GATES", "").lower() == "off":
         return None
     # Skip when a subagent is stopping (its parent session gets its own Stop) and in plan mode (nothing was changed on
@@ -50,7 +59,10 @@ def handle(payload: dict) -> dict | None:
     cfg = config.load()
     if not cfg.flag("gates.enabled", True):
         return None
-    root = _git_root(str(payload.get("cwd") or os.getcwd()))
+    root = _git_root(
+        str(payload.get("cwd") or os.getcwd()),
+        timeout=min(_GIT_ROOT_S, deadline - time.monotonic()),
+    )
     if root is None:
         return None
 
@@ -58,7 +70,7 @@ def handle(payload: dict) -> dict | None:
 
     state = _State.load()
     key = _repo_key(root)
-    sig_before = _signature(verify, root)
+    sig_before = _signature(verify, root, deadline)
     if state.seen(key) == sig_before:
         return None  # nothing changed since the last time this gate looked at the tree (and the recipe's trust did not)
     started = time.monotonic()
@@ -66,12 +78,14 @@ def handle(payload: dict) -> dict | None:
     formatted: list[str] = []
     skipped = errors = 0
     formatters: list[str] = []
-    if cfg.flag("format.enabled", True):
+    # the formatter may use at most half of what is left, so the checks always keep the rest
+    fmt_budget = min(float(cfg.get("format.timeout_s", 30)), (deadline - time.monotonic()) / 2)
+    if cfg.flag("format.enabled", True) and fmt_budget >= 1.0:
         from . import fmt
 
         rep = fmt.format_changed(
             root,
-            timeout_s=float(cfg.get("format.timeout_s", 30)),
+            timeout_s=fmt_budget,
             max_files=int(cfg.get("format.max_files", 40)),
             max_kb=int(cfg.get("format.max_file_kb", 512)),
             skip_globs=tuple(cfg.get("format.skip_globs", []) or ()),
@@ -91,21 +105,37 @@ def handle(payload: dict) -> dict | None:
             timeout_s=int(cfg.get("verify.gate_timeout_s", 120)),
             tier=str(cfg.get("verify.tier", "fast")),
             test_guard=cfg.flag("verify.test_guard", True),
+            deadline=deadline,
         )
 
-    blocked = outcome is not None and outcome.action == "block"
-    if not blocked and not (outcome is not None and outcome.action == "error"):
+    action = getattr(outcome, "action", "")
+    note = str(getattr(outcome, "note", "") or "")
+    blocked = action == "block"
+    # "time budget" with no check run: not even started, so the tree was NOT looked at. Retry next time like an error
+    # (the formatter or git ate the budget this turn); a run that started and was cut short is remembered, or an
+    # over-long suite would be started and cut short again on every Stop.
+    not_looked_at = bool(note) and action == "skip" and not getattr(outcome, "results", None)
+    if not blocked and action != "error" and not not_looked_at:
         # remember the tree as it is NOW (after formatting) so the next idle Stop is a no-op. A blocked tree is NOT
         # remembered (if Claude stops again without changing anything, the failing checks must be looked at again) and
         # neither is an error (a missing tool may be installed before the next turn).
         # The state AFTER the checks: they may leave files behind (coverage output, build artifacts that are not
-        # gitignored), and the next idle Stop must not mistake that for a change by Claude.
-        state.remember(key, _signature(verify, root))
+        # gitignored), and the next idle Stop must not mistake that for a change by Claude. (Accepted trade-off: an
+        # edit someone else makes during the run is absorbed the same way, and is only checked on the next change.)
+        state.remember(key, _signature(verify, root, deadline))
         state.save()
 
     if cfg.flag("gates.trail", True):
         _trail(
-            cfg, root, formatted, skipped, errors, formatters, outcome, time.monotonic() - started
+            cfg,
+            root,
+            formatted,
+            skipped,
+            errors,
+            formatters,
+            outcome,
+            time.monotonic() - started,
+            note=note,
         )
 
     if blocked:
@@ -114,11 +144,13 @@ def handle(payload: dict) -> dict | None:
 
 
 def _trail(
-    cfg, root: Path, formatted, skipped, errors, formatters, outcome, seconds: float
+    cfg, root: Path, formatted, skipped, errors, formatters, outcome, seconds: float, note: str = ""
 ) -> None:
     from . import auditlog
 
     checks = [r.name for r in getattr(outcome, "results", []) or []] if outcome else []
+    # e.g. note="time budget": the hook's deadline cut the checks short (or left no time to start them)
+    extra = {"note": note} if note else {}
     auditlog.record(
         "gate",
         repo=auditlog.repo_id(root),
@@ -129,6 +161,7 @@ def _trail(
         verify=outcome.action if outcome else "off",
         checks=checks,
         seconds=round(seconds, 2),
+        **extra,
     )
 
 
@@ -145,13 +178,17 @@ def repo_tools_allowed(cfg, root: Path) -> bool:
         return False
 
 
-def _signature(verify, root: Path) -> str:
-    """The working tree plus the recipe's trust state: trusting a recipe must re-run the gate even if no file changed."""
-    return f"{verify.fingerprint(root)}|{verify.trust_state(root, paths.state_dir())}"
+def _signature(verify, root: Path, deadline: float | None = None) -> str:
+    """The working tree plus the recipe's trust state: trusting a recipe must re-run the gate even if no file changed.
+    `deadline` (a time.monotonic() value) bounds the git calls of the fingerprint."""
+    fp = verify.fingerprint(root, deadline=deadline)
+    return f"{fp}|{verify.trust_state(root, paths.state_dir())}"
 
 
-def _git_root(cwd: str) -> Path | None:
-    r = procutil.run(["git", "-C", cwd, "rev-parse", "--show-toplevel"], timeout=8)
+def _git_root(cwd: str, timeout: float = _GIT_ROOT_S) -> Path | None:
+    if timeout <= 0.25:  # the hook's budget is already spent
+        return None
+    r = procutil.run(["git", "-C", cwd, "rev-parse", "--show-toplevel"], timeout=timeout)
     if r.returncode != 0 or not (r.stdout or "").strip():
         return None
     return Path((r.stdout or "").strip().splitlines()[0])
@@ -167,6 +204,8 @@ class _State:
 
     def __init__(self, data: dict):
         self.data = data
+        # the keys this process set: save() writes only those over whatever is on disk by then
+        self._remembered: list[str] = []
 
     @classmethod
     def load(cls) -> _State:
@@ -187,19 +226,58 @@ class _State:
         self.data[key] = {"fp": fp, "ts": int(time.time())}
         while len(self.data) > STATE_KEEP:
             self.data.pop(next(iter(self.data)))
+        if key in self._remembered:
+            self._remembered.remove(key)
+        self._remembered.append(key)
 
     def save(self) -> None:
-        from .jsonio import atomic_write_text
+        """Write this process's entries into gates.json, merged into the file as it is NOW and under a lock: two
+        sessions that finish together must not overwrite each other's repositories with a stale copy."""
+        from .jsonio import atomic_write_text, read_json
 
+        if not self._remembered:
+            return
         try:
-            paths.state_dir().mkdir(parents=True, exist_ok=True)
-            atomic_write_text(
-                paths.state_dir() / "gates.json",
-                json.dumps(self.data) + "\n",
-                follow_symlinks=False,
-            )
+            state_dir = paths.state_dir()
+            state_dir.mkdir(parents=True, exist_ok=True)
+            with _best_effort_lock(state_dir / "gates.lock"):
+                try:
+                    current = read_json(state_dir / "gates.json", {}) or {}
+                except Exception:
+                    current = {}
+                if not isinstance(current, dict):
+                    current = {}
+                for key in self._remembered:
+                    if key in self.data:
+                        current.pop(key, None)  # re-insert last: dict order doubles as recency
+                        current[key] = self.data[key]
+                while len(current) > STATE_KEEP:
+                    current.pop(next(iter(current)))
+                self.data = current
+                atomic_write_text(
+                    state_dir / "gates.json", json.dumps(current) + "\n", follow_symlinks=False
+                )
         except OSError:
             pass
+
+
+@contextmanager
+def _best_effort_lock(path: Path):
+    """An advisory lock that never blocks the hook for long: after 2 s (or if no lock file can be made) go on
+    without it, the worst case is one lost bookkeeping entry (the next Stop re-runs the gate once)."""
+    lock = None
+    try:
+        from .filelock import locked
+
+        lock = locked(path, timeout=2.0, stale_after=60.0)
+        lock.__enter__()
+    except OSError:  # includes the lock timeout
+        lock = None
+    try:
+        yield
+    finally:
+        if lock is not None:
+            lock.__exit__(None, None, None)
 
 
 def _crash() -> None:

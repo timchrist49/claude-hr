@@ -5,6 +5,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -364,3 +365,170 @@ def test_trail_prints_and_prunes(repo, capsys):
     rc, text = run(capsys, "trail")
     assert rc == 0 and "gate" in text and "verify=block" in text
     assert run(capsys, "trail", "--prune")[0] == 0
+
+
+# ---- what a person reads before trusting, and what exactly gets trusted ------------------------------------------
+
+
+def write_recipe_text(repo, text, trusted=False):
+    p = verify.config_path(repo)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(text, encoding="utf-8", newline="\n")
+    if trusted:
+        verify.trust(repo, paths.state_dir())
+    return p
+
+
+TWO_TIERS = """
+[[fast]]
+name = "test"
+argv = ["pytest", "-q"]
+
+[[full]]
+name = "test"
+argv = ["sh", "-c", "echo HIDDEN-CHECK-RAN > ../hidden.txt"]
+
+[[full]]
+name = "test"
+argv = ["pytest", "-q"]
+"""
+
+HOSTILE = (
+    '[[fast]]\nname = "lint"\n'
+    'argv = ["python", "-c", "pass", "\\u001b[2K\\r  [fast 1] lint: ruff check ."]\n'
+    'cwd = "sub\\u202eevil"\n'
+)
+
+
+def recipe_lines(text):
+    return [ln.strip() for ln in text.splitlines() if ln.strip().startswith(("[fast ", "[full "))]
+
+
+def test_the_trust_prompt_shows_every_check_of_both_tiers(repo, capsys, at_the_keyboard):
+    """A [[full]] check that only shares a NAME with a [[fast]] one used to be hidden, and `verify run --tier full`
+    ran it without a prompt."""
+    write_recipe_text(repo, TWO_TIERS)
+    for argv in (("verify", "status"), ("verify", "trust")):
+        rc, text = run(capsys, *argv)
+        assert rc == 0
+        lines = recipe_lines(text)
+        assert len(lines) == 3, text
+        assert lines[0].startswith("[fast 1] test: pytest -q") and "identical" not in lines[0]
+        assert lines[1].startswith("[full 1] test: sh -c ") and "HIDDEN-CHECK-RAN" in lines[1]
+        assert "identical" not in lines[1], (
+            "same name, different command: shown and not labelled a repeat"
+        )
+        assert (
+            lines[2].startswith("[full 2] test: pytest -q")
+            and "(identical to [fast 1])" in lines[2]
+        )
+    assert "file sha256:" in text and verify.trust_state(repo, paths.state_dir()) == "trusted"
+
+
+def test_a_repeat_is_only_called_a_repeat_when_every_field_matches(repo, capsys):
+    write_recipe_text(
+        repo,
+        '[[fast]]\nname = "t"\nargv = ["pytest", "-q"]\n\n'
+        '[[full]]\nname = "t"\nargv = ["pytest", "-q"]\ntimeout_s = 300\n\n'
+        '[[full]]\nname = "t"\nargv = ["pytest", "-q"]\ncwd = "sub"\n\n'
+        '[[full]]\nname = "t"\nargv = ["pytest", "-q"]\n',
+    )
+    lines = recipe_lines(run(capsys, "verify", "status")[1])
+    assert ["identical" in ln for ln in lines] == [False, False, False, True]
+
+
+def test_terminal_escapes_in_a_recipe_are_shown_not_obeyed(repo, capsys, at_the_keyboard):
+    write_recipe_text(repo, HOSTILE)
+    for argv in (("verify", "status"), ("verify", "trust")):
+        rc, text = run(capsys, *argv)
+        assert rc == 0
+        assert "\x1b" not in text and "\u202e" not in text
+        assert "\r" not in text.replace("\r\n", "\n")
+        assert "\\x1b[2K\\x0d" in text and "sub\\u202eevil" in text, text
+
+
+def test_a_recipe_changed_while_the_person_reads_it_is_not_trusted(repo, capsys, monkeypatch):
+    monkeypatch.setattr(ctl, "_not_a_person", lambda: None)
+    write_recipe(repo, trusted=False)
+    p = verify.config_path(repo)
+
+    def confirm_after_a_swap(
+        question,
+    ):  # a git checkout, an editor or another session lands while `input()` waits
+        p.write_text(
+            p.read_text(encoding="utf-8")
+            + '\n[[fast]]\nname = "evil"\nargv = ["sh", "-c", "id"]\n',
+            encoding="utf-8",
+            newline="\n",
+        )
+        return True
+
+    monkeypatch.setattr(ctl, "_confirm", confirm_after_a_swap)
+    rc, text = run(capsys, "verify", "trust")
+    assert rc == 1 and "changed after it was shown" in text and "trusted (" not in text
+    assert verify.trust_state(repo, paths.state_dir()) == "untrusted"
+    assert not (paths.state_dir() / "verify-trust.json").exists()
+
+
+def test_verify_run_judges_and_runs_the_bytes_of_one_read(repo, capsys, agent_shell, monkeypatch):
+    write_recipe(repo)  # trusted
+    reads = []
+    real = verify._read_config
+    monkeypatch.setattr(verify, "_read_config", lambda root: (reads.append(root), real(root))[1])
+    rc, text = run(capsys, "verify", "run")
+    assert "[FAIL] needs-ok-file" in text and len(reads) == 1
+
+
+def test_verify_untrust_works_when_the_recipe_is_invalid_or_missing(repo, capsys):
+    key = verify._repo_key(repo)
+    trust_file = paths.state_dir() / "verify-trust.json"
+    p = write_recipe(repo, trusted=True)
+    p.write_text("[[fast", encoding="utf-8")  # invalid: `verify status` refuses, revoking must not
+    assert run(capsys, "verify", "status")[0] == 2
+    rc, text = run(capsys, "verify", "untrust")
+    assert rc == 0 and "trust removed" in text
+    assert key not in json.loads(trust_file.read_text(encoding="utf-8"))
+
+    p = write_recipe(repo, trusted=True)
+    assert key in json.loads(trust_file.read_text(encoding="utf-8"))
+    p.unlink()
+    rc, text = run(capsys, "verify", "untrust")
+    assert rc == 0 and "trust removed" in text
+    assert key not in json.loads(trust_file.read_text(encoding="utf-8"))
+
+
+# ---- the block cap, the time budget -------------------------------------------------------------------------------
+
+
+def test_a_failing_check_that_writes_a_file_every_run_blocks_at_most_twice(repo):
+    """Claude was blocked on every attempt to stop (up to Claude Code's own cap of 8): the check's own output file
+    changed the tree each time, so every Stop looked like a new change."""
+    code = "open('test.log', 'a').write('x'); raise SystemExit(1)"
+    recipe = f'[[fast]]\nname = "noisy"\nargv = [{json.dumps(sys.executable)}, "-c", {json.dumps(code)}]\n'
+    write_recipe_text(repo, recipe, trusted=True)
+    (repo / "app.py").write_text("x = 2\n", encoding="utf-8", newline="\n")  # Claude's change
+    results = [stop(repo) for _ in range(6)]
+    assert [bool(r) for r in results] == [True, True, False, False, False, False]
+    assert (repo / "test.log").read_text() == "xx", "the check ran twice and not again"
+    (repo / "app.py").write_text(
+        "x = 3\n", encoding="utf-8", newline="\n"
+    )  # a real change: fresh budget
+    assert stop(repo)["decision"] == "block"
+
+
+def test_the_hook_finishes_inside_its_budget_even_when_the_suite_would_not(repo, monkeypatch):
+    monkeypatch.setattr(stop_gate, "HOOK_BUDGET_S", 7)
+    monkeypatch.setattr(verify, "POST_RUN_RESERVE_S", 1.0)
+    monkeypatch.setattr(verify, "MIN_RUN_S", 1.0)
+    recipe = (
+        f'[[fast]]\nname = "slow-suite"\nargv = [{json.dumps(sys.executable)}, "-c", '
+        '"import time; time.sleep(120)"]\ntimeout_s = 120\n'
+    )
+    write_recipe_text(repo, recipe, trusted=True)
+    t0 = time.monotonic()
+    assert stop(repo) is None  # inconclusive is never a block
+    assert time.monotonic() - t0 < 14, "the check was given what was left of the budget, not 120 s"
+    row = auditlog.tail(1)[0]
+    assert (
+        row["verify"] == "skip" and row["note"] == "time budget" and row["checks"] == ["slow-suite"]
+    )

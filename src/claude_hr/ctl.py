@@ -782,19 +782,29 @@ def _not_a_person() -> str | None:
 
 
 def _show_recipe(root: Path, recipe) -> None:
-    for tier in ("fast", "full"):
-        shown = list(getattr(recipe, tier))
-        if tier == "full":
-            fast = {c.name for c in recipe.fast}
-            shown = [
-                c for c in shown if c.name not in fast
-            ]  # `full` repeats `fast`: show only the additions
-        for c in shown:
-            from . import verify
+    """Every check of both tiers, in full, exactly as the gate would run it.
 
-            out(
-                f"  [{tier}] {c.name}: {verify.command_line(c)}   (timeout {c.timeout_s}s, cwd {c.cwd})"
+    This is what a person reads before approving the file, so nothing is left out and nothing is printed raw: name,
+    argv items and cwd go through verify.safe_text (an escape sequence or bidi override in the repository's text is
+    shown as \\x1b / \\u202e, it cannot erase or reorder the line). A [[full]] check is only labelled a repeat when
+    it is IDENTICAL to a [[fast]] check (name, argv, timeout and cwd); one that merely shares a name with a fast
+    check is shown like any other, so a difference cannot hide behind a familiar name.
+    """
+    from . import verify
+
+    fast = list(recipe.fast)
+    for tier in ("fast", "full"):
+        for n, c in enumerate(getattr(recipe, tier), 1):
+            same = (
+                next((i for i, f in enumerate(fast, 1) if f == c), None) if tier == "full" else None
             )
+            repeat = f"   (identical to [fast {same}])" if same else ""
+            out(
+                f"  [{tier} {n}] {verify.safe_text(c.name)}: {verify.command_line(c)}"
+                f"   (timeout {c.timeout_s}s, cwd {verify.safe_text(c.cwd)}){repeat}"
+            )
+    for note in getattr(recipe, "notes", None) or []:
+        out(f"  note: {verify.safe_text(str(note)[:300])}")
 
 
 def _confirm(question: str) -> bool:
@@ -887,12 +897,24 @@ def cmd_verify(a, cfg) -> int:
             "outside Claude Code: claude-hr-ctl verify trust"
         )
         return 0
+    if a.action == "untrust":
+        # before the recipe is loaded: revoking must work while the file is missing, unreadable or invalid
+        removed = verify.untrust(root, paths.state_dir())
+        out(
+            "trust removed: the end-of-turn gate will not run this repository's commands"
+            if removed
+            else "this repository was not trusted"
+        )
+        return 0
+    # ONE read of the file: the recipe shown, the trust verdict and (for `trust`) the digest that is approved all come
+    # from these bytes, so what a person sees is what gets trusted or run
     try:
-        recipe = verify.load(root)
+        loaded = verify.load_checked(root)
     except ValueError as exc:
-        out(f"{cp}: {exc}")
+        out(f"{cp}: {verify.safe_text(str(exc))}")
         return 2
-    state = verify.trust_state(root, paths.state_dir())
+    recipe = loaded.recipe
+    state = verify.trust_state_of(root, paths.state_dir(), loaded.data)
     if a.action == "status":
         if recipe is None:
             out(f"no recipe at {cp}  ->  `claude-hr-ctl verify init --write`")
@@ -904,14 +926,6 @@ def cmd_verify(a, cfg) -> int:
         }.get(state, state)
         out(f"{cp}: {meaning}")
         _show_recipe(root, recipe)
-        return 0
-    if a.action == "untrust":
-        removed = verify.untrust(root, paths.state_dir())
-        out(
-            "trust removed: the end-of-turn gate will not run this repository's commands"
-            if removed
-            else "this repository was not trusted"
-        )
         return 0
     if a.action == "trust":
         if recipe is None:
@@ -936,13 +950,15 @@ def cmd_verify(a, cfg) -> int:
                 out(audit.render(findings, [], root=root))
         except Exception:  # noqa: BLE001 - the preflight is advice; it must not block the decision
             pass
+        out(f"\nfile sha256: {loaded.sha256}")
         if not _confirm("\nTrust exactly this file?"):
             out("not trusted")
             return 1
         try:
-            digest = verify.trust(root, paths.state_dir())
+            # refuses when the file no longer hashes to what was shown above
+            digest = verify.trust(root, paths.state_dir(), expect_sha256=loaded.sha256)
         except ValueError as exc:
-            out(str(exc))
+            out(verify.safe_text(str(exc)))
             return 1
         out(f"trusted ({digest[:12]}...): the end-of-turn gate may now run these commands")
         return 0
