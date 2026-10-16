@@ -46,14 +46,16 @@ def test_systemd_units():
 
 @pytest.mark.skipif(not shutil.which("systemd-analyze"), reason="systemd-analyze not available")
 def test_systemd_units_verify(tmp_path):
+    units = tmp_path / "units"  # tmp_path also holds the sandbox profile (every test is sandboxed)
+    units.mkdir()
     for spec in [
         schedule.Spec("monitor", "interval", minutes=15),
         schedule.Spec("update", "daily", at="03:17"),
     ]:
         service, timer = schedule.render_systemd(spec, ["/bin/true"], "/usr/bin:/bin")
-        (tmp_path / f"claude-hr-{spec.name}.service").write_text(service)
-        (tmp_path / f"claude-hr-{spec.name}.timer").write_text(timer)
-    files = [str(p) for p in tmp_path.iterdir()]
+        (units / f"claude-hr-{spec.name}.service").write_text(service)
+        (units / f"claude-hr-{spec.name}.timer").write_text(timer)
+    files = [str(p) for p in units.iterdir()]
     r = subprocess.run(["systemd-analyze", "verify", *files], capture_output=True, text=True)
     assert r.returncode == 0, r.stderr
 
