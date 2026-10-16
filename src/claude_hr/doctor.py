@@ -114,10 +114,12 @@ REAPPLY = "claude-hr-ctl setup --only settings claude-md plugins"
 def _managed_settings_check(cfg: Config, hr: Headroom, claude: Path | None) -> Check:
     """Is the managed baseline applied, and is it the one this release would apply?
 
-    Two things make an applied baseline stale: setup was last run by another claude-hr version (the unattended self-update
-    replaces the code but applies nothing; the daily update job re-applies it, doctor says so until then), and a pending
-    change in `setup`'s own dry run (config edited since, a value added by a release). Keys the user changed (`kept`) are
-    theirs and never counted."""
+    What makes an applied baseline stale: setup was last run by another claude-hr version (the unattended self-update
+    replaces the code but applies nothing; the daily update job re-applies the settings and the CLAUDE.md block, never
+    plugins, doctor says so until then), setup applied it to another Claude config directory than this shell uses (a
+    scheduled job cannot know CLAUDE_CONFIG_DIR, so it leaves that alone), and a pending change in `setup`'s own dry run:
+    a value to set (config edited since, a value added by a release) or a managed key to retire (a config change that
+    removes it from the baseline). Keys the user changed (`kept`) are theirs and never counted."""
     state_file = paths.state_dir() / "settings-merge.json"
     try:
         st = read_json(state_file, None)
@@ -142,16 +144,26 @@ def _managed_settings_check(cfg: Config, hr: Headroom, claude: Path | None) -> C
         rep = ClaudeSetup(cfg, hr, claude, dry=True).plan_settings()[3]
     except Exception:  # noqa: BLE001 - an unreadable settings.json is reported by its own check
         rep = None
+    elsewhere = claude_setup.applied_elsewhere()
+    if elsewhere:
+        problems.append(
+            f"applied to {elsewhere}, but this shell's Claude config is {paths.claude_settings()} "
+            "(the daily update job leaves it alone)"
+        )
     if rep is not None and rep.set:
         shown = ", ".join(rep.set[:3]) + (" ..." if len(rep.set) > 3 else "")
         problems.append(f"{len(rep.set)} baseline setting(s) not applied yet ({shown})")
+    # a managed key the config no longer wants (security.stop_review back to plugin-default, a gate turned off) is pending too
+    if rep is not None and rep.removed:
+        shown = ", ".join(rep.removed[:3]) + (" ..." if len(rep.removed) > 3 else "")
+        problems.append(f"{len(rep.removed)} managed setting(s) to retire ({shown})")
     if not problems:
         return Check("managed settings", OK, detail)
     return Check(
         "managed settings",
         WARN,
         f"{detail}; " + "; ".join(problems),
-        REAPPLY if stale else "claude-hr-ctl setup --only settings",
+        REAPPLY if (stale or elsewhere) else "claude-hr-ctl setup --only settings",
     )
 
 

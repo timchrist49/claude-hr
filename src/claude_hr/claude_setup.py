@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -20,21 +21,52 @@ from .jsonio import JsonFileError, atomic_write_text, backup_file, read_json, wr
 BEGIN = "<!-- CLAUDE-HR:BEGIN (managed by claude-hr-ctl; do not edit inside this block) -->"
 END = "<!-- CLAUDE-HR:END -->"
 
-# `setup` writes the version whose managed baseline (settings.json, CLAUDE.md block, plugins) it last applied here. A release
-# that changes the baseline reaches a machine through the unattended self-update only as code: nothing re-applies it, so
-# doctor and the daily update job compare this file with the running version.
+# `setup` records, PER STEP, the claude-hr version whose baseline it applied, and the settings.json it applied it to:
+#   {"settings": "0.2.0", "claude-md": "0.2.0", "plugins": "0.2.0", "config_dir": "<.../settings.json>", "ts": ...}
+# A step that did not run (or failed) has no entry, so `setup --only plugins` never marks the settings as applied and
+# `setup --skip claude-md` is an opt-out the daily update job respects. A release that changes the baseline reaches a machine
+# through the unattended self-update only as code: doctor and the daily update job compare this record with the running
+# version. `uninstall` removes the file together with install.json.
 APPLIED_VERSION_FILE = "applied-version.json"
 BASELINE_STEPS = ("settings", "claude-md", "plugins")
+# What the unattended update job may re-apply: the two ownership-tracked, reversible merges. NEVER plugins or marketplaces
+# (installing code is a decision a person makes: `claude-hr-ctl plugins sync`, which doctor names when one is missing).
+UNATTENDED_STEPS = ("settings", "claude-md")
 
 
-def applied_version() -> str | None:
-    """The claude-hr version whose baseline was last applied, or None (never recorded: set up by a release before 0.2.0)."""
+def _read_record() -> dict:
     try:
         data = read_json(paths.state_dir() / APPLIED_VERSION_FILE, {}) or {}
-        value = data.get("version") if isinstance(data, dict) else None
     except (JsonFileError, OSError):
-        return None
-    return str(value) if value else None
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _same_path(a: str | Path, b: str | Path) -> bool:
+    def norm(p: str | Path) -> str:
+        return os.path.normcase(os.path.realpath(str(p)))
+
+    return bool(str(a)) and bool(str(b)) and norm(a) == norm(b)
+
+
+def applied_version(step: str = "settings") -> str | None:
+    """The claude-hr version whose baseline `step` was last applied by `setup`, or None (never recorded: set up by a release
+    before 0.2.0, or the step was skipped / never ran)."""
+    value = _read_record().get(step)
+    return str(value) if isinstance(value, str) and value else None
+
+
+def applied_config_dir() -> str | None:
+    """The settings.json the recorded baseline was applied to (it follows CLAUDE_CONFIG_DIR), or None."""
+    value = _read_record().get("config_dir")
+    return value if isinstance(value, str) and value else None
+
+
+def applied_elsewhere() -> str | None:
+    """The settings.json the recorded baseline went to, when it is not the one this process resolves (CLAUDE_CONFIG_DIR
+    differs between the shell `setup` ran in and this process), else None."""
+    recorded = applied_config_dir()
+    return recorded if recorded and not _same_path(recorded, paths.claude_settings()) else None
 
 
 def running_version() -> str:
@@ -44,25 +76,64 @@ def running_version() -> str:
     return __version__
 
 
-def record_applied_version() -> None:
-    write_json(
-        paths.state_dir() / APPLIED_VERSION_FILE,
-        {"version": running_version(), "ts": time.time()},
-    )
+def record_applied_version(*steps: str) -> None:
+    """Record the running version as applied for each of `steps` (default: all of BASELINE_STEPS), keeping what is recorded
+    for the other steps. The record describes ONE Claude config directory: applying to another one starts it afresh."""
+    here = str(paths.claude_settings())
+    rec = _read_record()
+    if not _same_path(rec.get("config_dir", ""), here):
+        rec = {}  # it described another profile (or the pre-0.2.0 shape): its entries say nothing about this one
+    for step in steps or BASELINE_STEPS:
+        rec[step] = running_version()
+    rec["config_dir"], rec["ts"] = here, time.time()
+    write_json(paths.state_dir() / APPLIED_VERSION_FILE, rec)
+
+
+def clear_setup_markers() -> None:
+    """`uninstall` calls this: with install.json and the applied-version record gone, the machine is not 'set up', so
+    nothing (the daily update job included) re-applies a baseline the user removed."""
+    for name in ("install.json", APPLIED_VERSION_FILE):
+        try:
+            (paths.state_dir() / name).unlink(missing_ok=True)
+        except OSError:
+            pass  # a file held open for an instant must not abort the rest of the uninstall
 
 
 def was_set_up() -> bool:
-    """True once `setup` has run on this machine (it leaves install.json and the settings ownership record)."""
-    d = paths.state_dir()
-    return (d / "install.json").exists() or (d / "settings-merge.json").exists()
+    """True from `setup` until `uninstall` (state/install.json)."""
+    return (paths.state_dir() / "install.json").exists()
 
 
 def baseline_is_stale() -> tuple[bool, str | None]:
-    """(True, version last applied or None) when this machine was set up but not by the claude-hr that is running now."""
+    """(True, version last applied or None) when this machine was set up but its settings baseline was not applied by the
+    claude-hr that is running now. Reads the `settings` entry of the per-step record."""
     if not was_set_up():
         return False, None
-    applied = applied_version()
+    applied = applied_version("settings")
     return applied != running_version(), applied
+
+
+def unattended_reapply() -> tuple[list[str], str]:
+    """(steps the unattended update job may re-apply now, why it must not when it has a reason to say so).
+
+    A step qualifies only when `setup` recorded it (a skipped step stays skipped), for an older release, and the job resolves
+    the same Claude config directory `setup` applied it to: a scheduled job does not inherit the CLAUDE_CONFIG_DIR of the
+    user's shell, and must never write the baseline into another profile. A machine set up before 0.2.0 has no record: it
+    waits for one `claude-hr-ctl setup` (doctor says so)."""
+    if not was_set_up():
+        return [], ""
+    rec = _read_record()
+    running = running_version()
+    steps = [s for s in UNATTENDED_STEPS if isinstance(rec.get(s), str) and rec[s] != running]
+    if not steps:
+        return [], ""
+    recorded = applied_config_dir()
+    if recorded and applied_elsewhere() is None:
+        return steps, ""
+    return [], (
+        f"the baseline was applied to {recorded or 'an unrecorded Claude config directory'}, this run resolves "
+        f"{paths.claude_settings()}: not touched; run `claude-hr-ctl setup` from the shell you start claude in"
+    )
 
 
 @dataclass

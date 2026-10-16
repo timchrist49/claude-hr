@@ -1,6 +1,9 @@
+import errno
 import json
 import os
 import time
+
+import pytest
 
 from claude_hr import auditlog, paths
 
@@ -144,6 +147,73 @@ def test_a_lock_that_cannot_be_taken_never_costs_the_record(sandbox, monkeypatch
         )  # the lock is busy: it waits briefly, then appends anyway
         assert time.monotonic() - t0 < 5
     assert [r["n"] for r in auditlog.tail(5)] == [1, 2]
+
+
+def _locking_fails_with(monkeypatch, code: int) -> list[int]:
+    """Make the OS locking call (msvcrt.locking / fcntl.flock) raise OSError(code); returns a list that gets one item per call."""
+    calls: list[int] = []
+
+    def boom(*a, **k):
+        calls.append(1)
+        raise OSError(code, os.strerror(code))
+
+    if os.name == "nt":
+        import msvcrt
+
+        monkeypatch.setattr(msvcrt, "locking", boom)
+    else:
+        import fcntl
+
+        monkeypatch.setattr(fcntl, "flock", boom)
+    return calls
+
+
+@pytest.mark.parametrize("name", ["ENOLCK", "EINVAL", "ENOSYS"])
+def test_a_lock_the_system_cannot_take_costs_no_wait_and_is_remembered(sandbox, monkeypatch, name):
+    """NFS without lockd (ENOLCK) or a filesystem without locks never grants a lock: waiting LOCK_WAIT_S for it on every
+    gate record was a pure 1 s delay. Give up at once, append unlocked, and do not even try again in this process."""
+    monkeypatch.setattr(
+        auditlog, "_lock_unusable", False
+    )  # restored by monkeypatch: the flag must not leak
+    monkeypatch.setattr(auditlog, "LOCK_WAIT_S", 30.0)  # a wait would show
+    calls = _locking_fails_with(monkeypatch, getattr(errno, name))
+    t0 = time.monotonic()
+    assert auditlog.record("gate", n=1) is True
+    assert time.monotonic() - t0 < 5 and len(calls) == 1
+    assert auditlog._lock_unusable is True
+    assert auditlog.record("gate", n=2) is True
+    assert len(calls) == 1  # the second record did not ask the OS again
+    assert [r["n"] for r in auditlog.tail(5)] == [1, 2]
+
+
+@pytest.mark.parametrize("name", ["EACCES", "EAGAIN"])
+def test_a_lock_that_is_merely_busy_is_retried_for_a_short_bounded_time(sandbox, monkeypatch, name):
+    monkeypatch.setattr(auditlog, "_lock_unusable", False)
+    assert (
+        auditlog.LOCK_WAIT_S <= 0.25
+    )  # an append never waits long for another one (it is one small write)
+    calls = _locking_fails_with(monkeypatch, getattr(errno, name))
+    t0 = time.monotonic()
+    assert (
+        auditlog.record("gate", n=1) is True
+    )  # fail open: appended unlocked after the bounded wait
+    took = time.monotonic() - t0
+    assert len(calls) > 1 and took < 2.0
+    assert auditlog._lock_unusable is False  # contention says nothing about the filesystem
+    assert auditlog.tail(1)[0]["n"] == 1
+
+
+def test_try_lock_tells_busy_from_unusable(sandbox, monkeypatch):
+    f = auditlog.audit_dir()
+    f.mkdir(parents=True, exist_ok=True)
+    fd = os.open(f / "probe.lock", os.O_RDWR | os.O_CREAT | getattr(os, "O_BINARY", 0))
+    try:
+        _locking_fails_with(monkeypatch, errno.EACCES)
+        assert auditlog._try_lock(fd) is False
+        _locking_fails_with(monkeypatch, errno.ENOLCK)
+        assert auditlog._try_lock(fd) is None
+    finally:
+        os.close(fd)
 
 
 def test_an_unusable_lock_file_never_costs_the_record(sandbox, monkeypatch):

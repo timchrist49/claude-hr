@@ -361,20 +361,86 @@ def test_config_set_false_turns_the_stop_review_off(sandbox):
     assert doc["env"]["ENABLE_STOP_REVIEW"] == "0"
 
 
-def test_setup_records_the_version_whose_baseline_it_applied(sandbox, monkeypatch):
+def test_setup_records_the_version_of_each_baseline_step_it_applied(sandbox, monkeypatch):
     from claude_hr import __version__, ctl
 
     assert claude_setup.applied_version() is None
     assert ctl._run(["setup", "--only", "claude-md", "--dry-run"]) == 0
+    assert claude_setup.applied_version("claude-md") is None  # a dry run applies nothing
     assert ctl._run(["setup", "--only", "claude-md"]) == 0
-    assert claude_setup.applied_version() is None  # the settings baseline was not part of that run
+    assert claude_setup.applied_version("claude-md") == __version__
+    assert (
+        claude_setup.applied_version("settings") is None
+    )  # the settings baseline was not part of that run
+    assert claude_setup.baseline_is_stale() == (True, None)
     assert ctl._run(["setup", "--only", "settings", "--dry-run"]) == 0
-    assert claude_setup.applied_version() is None  # a dry run applies nothing
-    assert ctl._run(["setup", "--only", "settings", "claude-md"]) == 0
-    assert claude_setup.applied_version() == __version__
+    assert claude_setup.applied_version("settings") is None
+    assert ctl._run(["setup", "--only", "settings"]) == 0
+    assert claude_setup.applied_version("settings") == __version__
+    assert (
+        claude_setup.applied_version("claude-md") == __version__
+    )  # kept: the other step's entry survives
+    assert claude_setup.applied_config_dir() == str(paths.claude_settings())
     assert claude_setup.baseline_is_stale() == (False, __version__)
     monkeypatch.setattr("claude_hr.__version__", "9.9.9")  # a newer release is installed unattended
     assert claude_setup.baseline_is_stale() == (True, __version__)
+
+
+def test_a_partial_setup_does_not_mark_the_settings_baseline_as_applied(
+    setup, sandbox, monkeypatch
+):
+    """`setup --only plugins` must leave the settings and CLAUDE.md steps unrecorded (`--only mcp` / `--only headroom` run
+    no baseline step at all): doctor keeps warning and the update job keeps its hands off what the user skipped."""
+    from claude_hr import __version__, ctl
+
+    monkeypatch.setattr(claude_setup.procutil, "find_claude", lambda *a, **k: Path("/fake/claude"))
+    assert ctl._run(["setup", "--only", "plugins"]) == 0
+    assert claude_setup.applied_version("plugins") == __version__
+    assert claude_setup.applied_version("settings") is None
+    assert claude_setup.applied_version("claude-md") is None
+    assert claude_setup.baseline_is_stale() == (
+        True,
+        None,
+    )  # doctor still warns for a machine like this
+    assert claude_setup.unattended_reapply() == ([], "")  # and the job has nothing it may apply
+
+
+def test_setup_with_every_baseline_step_skipped_leaves_nothing_for_the_update_job(
+    setup, sandbox, monkeypatch
+):
+    from claude_hr import config, ctl, updater
+
+    skipped = ["headroom", "settings", "claude-md", "mcp", "plugins", "schedule"]
+    assert ctl._run(["setup", "--skip", *skipped]) == 0
+    assert (paths.state_dir() / "install.json").exists()  # `setup` ran: ...
+    assert claude_setup.was_set_up() and not (paths.state_dir() / "applied-version.json").exists()
+    monkeypatch.setattr("claude_hr.__version__", "9.9.9")
+    assert updater.Updater(config.load()).reapply_baseline() is None
+    assert (
+        not paths.claude_settings().exists() and not paths.claude_user_md().exists()
+    )  # ... the opt-out holds
+
+
+def test_the_applied_record_describes_one_claude_config_dir(sandbox, monkeypatch, tmp_path):
+    """Applying to another profile starts the record afresh: its entries say nothing about the new one."""
+    claude_setup.record_applied_version("settings", "claude-md")
+    first = claude_setup.applied_config_dir()
+    other = tmp_path / "other-profile"
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(other))
+    assert claude_setup.applied_elsewhere() == first
+    claude_setup.record_applied_version("plugins")
+    assert claude_setup.applied_config_dir() == str(other / "settings.json")
+    assert claude_setup.applied_elsewhere() is None
+    assert claude_setup.applied_version("plugins") == claude_setup.running_version()
+    assert (
+        claude_setup.applied_version("settings") is None
+        and claude_setup.applied_version("claude-md") is None
+    )
+    # a damaged record is our own file: it reads as "nothing recorded" and the next setup rewrites it
+    (paths.state_dir() / "applied-version.json").write_text("{ nope", encoding="utf-8")
+    assert claude_setup.applied_version() is None and claude_setup.applied_config_dir() is None
+    claude_setup.record_applied_version("settings")
+    assert claude_setup.applied_version("settings") == claude_setup.running_version()
 
 
 def test_a_failed_baseline_step_is_not_recorded_as_applied(sandbox):
@@ -382,7 +448,8 @@ def test_a_failed_baseline_step_is_not_recorded_as_applied(sandbox):
 
     paths.claude_settings().write_text("{ not json", encoding="utf-8")
     assert ctl._run(["setup", "--only", "settings", "claude-md"]) == 1
-    assert claude_setup.applied_version() is None
+    assert claude_setup.applied_version("settings") is None  # the step that failed stays visible
+    assert claude_setup.baseline_is_stale() == (True, None)
 
 
 def test_baseline_is_not_stale_on_a_machine_setup_never_ran_on(sandbox):
@@ -454,6 +521,48 @@ def test_uninstall_purge_keeps_the_ownership_record_when_settings_could_not_be_r
         paths.state_dir() / "settings-merge.json"
     ).exists()  # purge must not destroy what a retry needs
     assert "was kept" in capsys.readouterr().out
+
+
+def test_uninstall_removes_the_setup_markers_so_no_update_run_resurrects_the_baseline(
+    setup, sandbox, monkeypatch
+):
+    """Reproduced: setup, uninstall (install.json was left behind), then the next full `update` (or the 03:17 job, when the
+    schedule could not be removed) re-created CLAUDE.md, re-merged settings.json and re-installed the plugins."""
+    from claude_hr import config, ctl, updater
+
+    with monkeypatch.context() as old:
+        old.setattr("claude_hr.__version__", "0.1.9")
+        assert ctl._run(["setup", "--only", "settings", "claude-md"]) == 0
+    state = paths.state_dir()
+    assert (state / "install.json").exists() and (state / "applied-version.json").exists()
+    ctl = _quiet_uninstall(monkeypatch)
+    assert ctl._run(["uninstall", "--dry-run"]) == 0
+    assert (state / "install.json").exists() and (state / "applied-version.json").exists()  # dry
+    assert ctl._run(["uninstall"]) == 0
+    assert not (state / "install.json").exists() and not (state / "applied-version.json").exists()
+    assert not (state / "settings-merge.json").exists() and not claude_setup.was_set_up()
+    assert json.loads(paths.claude_settings().read_text(encoding="utf-8")) == {}
+    assert not paths.claude_user_md().exists()
+    assert claude_setup.baseline_is_stale() == (False, None)
+    # a newer release arrives unattended, then the update job runs: it has nothing to re-apply
+    monkeypatch.setattr("claude_hr.__version__", "9.9.9")
+    setup.fake.calls.clear()
+    assert updater.Updater(config.load()).reapply_baseline() is None
+    assert json.loads(paths.claude_settings().read_text(encoding="utf-8")) == {}
+    assert not paths.claude_user_md().exists() and setup.fake.calls == []
+
+
+def test_uninstall_clears_the_markers_even_when_settings_could_not_be_reverted(
+    setup, sandbox, monkeypatch
+):
+    """The record that lets a later uninstall revert exactly our keys stays; the 'set up' markers go regardless."""
+    ctl = _quiet_uninstall(monkeypatch)
+    assert ctl._run(["setup", "--only", "settings", "claude-md"]) == 0
+    paths.claude_settings().write_text("{ nope", encoding="utf-8")
+    assert ctl._run(["uninstall"]) == 1
+    state = paths.state_dir()
+    assert (state / "settings-merge.json").exists()
+    assert not (state / "install.json").exists() and not (state / "applied-version.json").exists()
 
 
 def test_effective_plugins_drop_a_marketplace_that_is_switched_off(setup, monkeypatch):
