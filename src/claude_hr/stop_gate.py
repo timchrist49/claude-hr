@@ -59,11 +59,12 @@ def handle(payload: dict) -> dict | None:
     cfg = config.load()
     if not cfg.flag("gates.enabled", True):
         return None
-    root = _git_root(
-        str(payload.get("cwd") or os.getcwd()),
-        timeout=min(_GIT_ROOT_S, deadline - time.monotonic()),
-    )
+    cwd = str(payload.get("cwd") or os.getcwd())
+    root = _git_root(cwd, timeout=min(_GIT_ROOT_S, deadline - time.monotonic()))
     if root is None:
+        return None
+    if _state_inside(root, cwd):
+        _state_inside_note(root)
         return None
 
     from . import verify
@@ -225,6 +226,48 @@ def _signature(verify, root: Path, deadline: float | None = None) -> str:
     if not fp:
         return ""
     return f"{fp}|{verify.trust_state(root, paths.state_dir())}"
+
+
+def _state_inside(root: Path, cwd: str) -> bool:
+    """Is the state directory (it holds the trust record) inside the repository being gated or the folder Claude works in?
+
+    CLAUDE_HR_HOME decides where it is, and the hook inherits the environment Claude Code built from the project's own
+    .claude/settings.json: a repository could point it at a folder it ships, with a trust record already in it, and have
+    its own recipe run unprompted. The hook trusts only a record the repository cannot have written, so it does nothing
+    here. The CLI keeps honouring CLAUDE_HR_HOME. Not being able to tell counts as inside."""
+    try:
+        state = _fold(paths.state_dir())
+        trees = (_fold(root), _fold(cwd))
+    except (OSError, ValueError):
+        return True
+    for tree in trees:
+        try:
+            if os.path.commonpath([state, tree]) == tree:
+                return True
+        except ValueError:  # another drive: not inside
+            continue
+    return False
+
+
+def _fold(path: Path | str) -> str:
+    """The real location of `path`, compared without regard to case on Windows."""
+    return os.path.normcase(os.path.realpath(path))
+
+
+def _state_inside_note(root: Path) -> None:
+    """One audit-trail line saying why nothing ran (auditlog needs nothing but paths: no heavy import for a skip)."""
+    try:
+        from . import auditlog
+
+        auditlog.record(
+            "gate",
+            repo=auditlog.repo_id(root),
+            verify="skip",
+            note="state directory inside the repository",
+            reason="the state directory is inside this repository, so its trust record is not honoured",
+        )
+    except Exception:  # noqa: BLE001 - a note is never worth a failed hook
+        pass
 
 
 def _git_root(cwd: str, timeout: float = _GIT_ROOT_S) -> Path | None:

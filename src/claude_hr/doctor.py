@@ -61,6 +61,35 @@ def _desktop_markers(own_port: int) -> list[str]:
     return found
 
 
+_RESTART = "apply them when no Claude session is running: claude-hr-ctl headroom restart"
+
+
+def _proxy_settings_check(hr: Headroom) -> Check | None:
+    """A WARN when the running shared proxy was started with other settings than the config asks for now.
+
+    The proxy keeps the flags and the environment it was started with until it is restarted, so a changed setting, or a
+    release that changed a default, reaches a machine only at its next login or reboot. WARN, never FAIL: it works."""
+    try:
+        state = hr.settings_state()
+    except Exception:  # noqa: BLE001 - an optional comparison must never break doctor
+        return None
+    if state == "changed":
+        return Check(
+            "headroom settings",
+            WARN,
+            "the running proxy was started with other settings than the configuration asks for now",
+            f"Headroom is running with older settings; {_RESTART}",
+        )
+    if state == "older":
+        return Check(
+            "headroom settings",
+            WARN,
+            "the running proxy was started by an older claude-hr, which did not record its settings",
+            f"Headroom was started by an older claude-hr; {_RESTART}",
+        )
+    return None
+
+
 def _security_guidance() -> dict | None:
     """security-guidance's log summary, or None (plugin not installed, no log, or footprint missing)."""
     try:
@@ -381,6 +410,9 @@ def run(cfg: Config, cwd: Path, deep: bool = False) -> list[Check]:
                         f"healthy on {hr.url} (v{h.version}, ~{snap_rss:.0f} MB RSS)",
                     )
                 )
+                stale = _proxy_settings_check(hr)
+                if stale:
+                    out.append(stale)
             else:
                 out.append(
                     Check(

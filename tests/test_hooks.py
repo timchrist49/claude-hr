@@ -1,5 +1,6 @@
 import io
 import json
+import time
 
 import pytest
 
@@ -411,6 +412,94 @@ def test_verify_commands_that_do_not_grant_trust_are_allowed(monkeypatch, cmd):
     monkeypatch.delenv("CLAUDE_HR_GUARD_OFF", raising=False)
     monkeypatch.delenv("CLAUDE_HR_GIT_GUARD", raising=False)
     assert run_guard(monkeypatch, cmd) == 0
+
+
+# What a person types, and what an agent could try, to approve a recipe or to forge the user's answer (one of each verb and
+# record name): each must still be blocked when it is buried in a very long command.
+TRUST_BURIED = [
+    "claude-hr-ctl verify enable",
+    "claude-hr-ctl verify disable",
+    "claude-hr-ctl verify trust",
+    "claude-hr-ctl verify untrust",
+    "echo '{}' > ~/.claude-hr/state/verify-offer.json",
+    "echo '{}' > ~/.claude-hr/state/verify-trust.json",
+    'python -c "from claude_hr import verify; verify.trust(root, state)"',
+    'python -c "from claude_hr import gate_offer; gate_offer.enable(root, proposal, cfg, print)"',
+]
+# Padding that makes an open-ended gap between the words cost the most: the keywords the patterns look for, repeated
+PADDINGS = [
+    "claude_hr verify ",
+    "claude_hr gate_offer ",
+    "claude-hr-ctl verify ",
+    "claude_hr ",
+    "curl ",
+]
+
+
+def padded(pad: str, size: int) -> str:
+    return "# " + pad * (size // len(pad))
+
+
+@pytest.mark.parametrize("pad", PADDINGS)
+def test_a_one_megabyte_command_is_scanned_in_bounded_time(monkeypatch, capsys, pad):
+    """A comment line of padded keywords made the patterns cost the cube of its length: the hook ran past its 10 s timeout,
+    and a hook that is killed lets the command through."""
+    command = padded(pad, 1_000_000) + "\nclaude-hr-ctl verify enable"
+    started = time.perf_counter()
+    assert run_guard(monkeypatch, command) == 2
+    assert (
+        time.perf_counter() - started < 2.0
+    )  # a few tenths of a second on a slow machine; unbounded was minutes
+    assert "only the user does it" in capsys.readouterr().err
+    started = time.perf_counter()
+    assert (
+        hooks.trust_attempt(padded(pad, 1_000_000)) is False
+    )  # the padding alone asks for nothing
+    assert time.perf_counter() - started < 2.0
+
+
+@pytest.mark.parametrize("cmd", TRUST_BURIED)
+@pytest.mark.parametrize("where", ["first", "last"])
+def test_a_trust_attempt_is_found_at_either_end_of_a_very_long_command(
+    monkeypatch, capsys, cmd, where
+):
+    pad = padded("claude_hr verify ", 200_000)  # longer than the two windows that are scanned
+    command = cmd + "\n" + pad if where == "first" else pad + "\n" + cmd
+    assert run_guard(monkeypatch, command) == 2
+    assert "only the user does it" in capsys.readouterr().err
+
+
+def test_padding_aimed_at_the_secret_rules_does_not_hide_a_trust_attempt(monkeypatch, capsys):
+    """The trust check runs first: 15 KB of `curl ` kept the (still slower) secret rules busy for ten seconds and more."""
+    command = "# " + "curl " * 3000 + "\nclaude-hr-ctl verify enable"
+    started = time.perf_counter()
+    assert run_guard(monkeypatch, command) == 2
+    assert time.perf_counter() - started < 2.0
+    assert "only the user does it" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    "cmd",
+    [
+        "claude-hr-ctl "
+        + "--flag value " * 15
+        + "verify enable",  # 195 characters of other words in between
+        "echo x\nclaude-hr-ctl verify trust",
+        "claude-hr-ctl.exe verify untrust",
+    ],
+)
+def test_other_words_between_the_program_and_the_verb_still_count(monkeypatch, cmd):
+    assert run_guard(monkeypatch, cmd) == 2
+
+
+def test_the_guard_fails_open_and_silently_on_an_error_of_its_own(monkeypatch, capsys):
+    def boom(command):
+        raise RuntimeError("pattern engine exploded")
+
+    monkeypatch.setattr(hooks, "trust_attempt", boom)
+    assert run_guard(monkeypatch, "claude-hr-ctl verify enable") == 0
+    out = capsys.readouterr()
+    assert out.out == "" and out.err == ""
 
 
 def test_stop_entry_point_fails_open(sandbox, monkeypatch):

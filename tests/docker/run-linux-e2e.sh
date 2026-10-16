@@ -108,7 +108,7 @@ check "both workflows installable"                    bash -c "claude-hr-ctl wor
 
 echo "== 6c. the one-time test-gate offer at launch (a real pseudo-terminal, a stand-in claude, a stand-in make) =="
 OD=/tmp/offerdir; rm -rf "$OD"; mkdir -p "$OD/bin"
-printf '#!/bin/sh\nexit 0\n' > "$OD/bin/make"; chmod +x "$OD/bin/make"      # the flow is under test, not GNU make
+printf '#!/bin/sh\ntouch "%s"\nexit 0\n' "$OD/bin/make.ran" > "$OD/bin/make"; chmod +x "$OD/bin/make"   # the flow is under test, not GNU make; it leaves a marker when it runs
 printf '#!/bin/sh\ncase "$1" in --help|--version) exec "%s" "$@";; esac\necho "FAKE-CLAUDE-STARTED $*"\n' "$(command -v claude)" > "$OD/fakeclaude"; chmod +x "$OD/fakeclaude"
 new_repo() { rm -rf "$1"; mkdir -p "$1"; git -C "$1" init -q; printf 'test:\n\t@echo ok\n' > "$1/Makefile"; }
 claude_trusts() { "$PY_TOOL" -c "import json, sys; from claude_hr import paths; p = paths.claude_global_json(); d = json.loads(p.read_text(encoding='utf-8')) if p.exists() else {}; d.setdefault('projects', {})[sys.argv[1]] = {'hasTrustDialogAccepted': True}; p.write_text(json.dumps(d), encoding='utf-8')" "$1"; }
@@ -123,7 +123,7 @@ new_repo "$R1"; new_repo "$R2"; new_repo "$R3"
 t_untrusted()   { offer "$R1" --answers y -- claude-hr; ! asked && started FAKE-CLAUDE-STARTED && [ ! -e "$R1/.claude" ]; }
 t_first()       { offer "$R1" --answers y -- claude-hr; asked && started 'make test' && started FAKE-CLAUDE-STARTED && started 'EXIT=0'; }
 t_written()     { [ -s "$R1/.claude/hr-verify.toml" ] && grep -q 'hr-verify.toml' "$R1/.git/info/exclude" && [ -z "$(git -C "$R1" status --porcelain | grep -v Makefile)" ] && [ "$(trust_of "$R1")" = trusted ]; }
-t_gate_runs()   { printf '{"cwd":"%s","hook_event_name":"Stop"}' "$R1" | PATH="$OD/bin:$PATH" claude-hr-hook stop > "$OD/stop.out"; [ ! -s "$OD/stop.out" ]; }
+t_gate_runs()   { rm -f "$OD/bin/make.ran"; printf '{"cwd":"%s","hook_event_name":"Stop"}' "$R1" | PATH="$OD/bin:$PATH" claude-hr-hook stop > "$OD/stop.out"; [ ! -s "$OD/stop.out" ] && [ -e "$OD/bin/make.ran" ]; }
 t_second()      { offer "$R1" -- claude-hr; ! asked && started FAKE-CLAUDE-STARTED; }
 t_print()       { offer "$R2" -- claude-hr -p hi; ! asked && started 'FAKE-CLAUDE-STARTED -p hi'; }
 t_claude_shell(){ offer "$R2" --env CLAUDECODE=1 -- claude-hr; ! asked && started FAKE-CLAUDE-STARTED; }

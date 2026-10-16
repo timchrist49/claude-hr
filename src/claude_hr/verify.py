@@ -16,6 +16,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 import stat
 import time
 from collections import Counter
@@ -2269,6 +2270,17 @@ def _has_py_files(directory: Path) -> bool:
     return False
 
 
+def _default_python() -> str:
+    """The interpreter a proposed `<python> -m pytest` runs with when nothing in the repo names one: `python` on Windows,
+    `python3` elsewhere (macOS and current Debian and Ubuntu have no `python`) unless only `python` is on PATH. The bare name
+    stays bare: the gate runs the recipe later and finds the program then, not now."""
+    if _WIN:
+        return "python"
+    if shutil.which("python") and not shutil.which("python3"):
+        return "python"
+    return "python3"
+
+
 def _discover_python(root: Path, b: _Builder) -> None:
     markers = (
         "pyproject.toml",
@@ -2297,7 +2309,7 @@ def _discover_python(root: Path, b: _Builder) -> None:
             runner = argv
             break
     documented = None if runner else _documented_python(root)
-    py = documented or "python"
+    py = documented or _default_python()
     used_bare_python = False
 
     def module(name: str, *args: str) -> list[str]:
@@ -2339,7 +2351,7 @@ def _discover_python(root: Path, b: _Builder) -> None:
         b.sources.append(", ".join(present[:2]))
     if used_bare_python and documented is None:
         b.notes.append(
-            "Python commands use 'python -m ...': confirm the executable on your machines "
+            f"Python commands use '{py} -m ...': confirm the executable on your machines "
             "('python3', 'uv run', 'poetry run' or a venv path)"
         )
 

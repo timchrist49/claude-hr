@@ -390,6 +390,16 @@ def _dump_toml(data: dict, prefix: tuple = ()) -> str:
     return "\n".join(lines).strip("\n") + "\n"
 
 
+def _running_sessions() -> int:
+    """How many claude-hr sessions are running (the launcher's session registry); 0 when that cannot be told."""
+    try:
+        from . import resources
+
+        return len(resources.live_sessions())
+    except Exception:  # noqa: BLE001 - a warning is never worth failing the command it is for
+        return 0
+
+
 def cmd_headroom(a, cfg) -> int:
     hr = Headroom(cfg)
     if a.action == "status":
@@ -406,6 +416,12 @@ def cmd_headroom(a, cfg) -> int:
         out("stopped" if hr.stop() else "nothing to stop")
         return 0
     if a.action == "restart":
+        running = _running_sessions()
+        if running:
+            out(
+                f"warning: {running} claude-hr session{'s' if running != 1 else ''} running; "
+                "they are without Headroom until the proxy is back (up to ~1 minute). Restarting anyway."
+            )
         hr.stop()
         h = hr.ensure(wait_s=a.wait, announce=out)
         out("healthy" if h.ok else f"not ready ({h.status})")

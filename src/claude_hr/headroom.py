@@ -39,6 +39,15 @@ QUIET_CLI_ENV = {
     "NEXT_TELEMETRY_DISABLED": "1",
     "HOMEBREW_NO_ENV_HINTS": "1",
 }
+# The variables of Headroom.server_env() that a setting decides: they are fixed when the proxy starts, so they are part
+# of what settings_hash() records.
+SETTINGS_ENV = (
+    "HEADROOM_SAVINGS_PROFILE",
+    "HEADROOM_OUTPUT_SHAPER",
+    "HEADROOM_OUTPUT_HOLDOUT",
+    "HEADROOM_BEACON",
+    "HEADROOM_UPDATE_CHECK",
+)
 
 
 def pick_release(
@@ -232,6 +241,35 @@ class Headroom:
         env.pop("HEADROOM_WRAP_OWNED", None)
         return env
 
+    def settings_hash(self) -> str:
+        """A short hash of what start() launches the proxy with: its argument list plus the environment that comes from
+        the settings (the output shaper, the savings profile ...). Not the ambient environment and not what depends on the
+        machine's state (`offline_models = auto` flips once a model is cached): only a settings change should differ."""
+        import hashlib
+
+        env = self.server_env({})
+        basis = json.dumps(
+            [self.proxy_args(), {k: env.get(k) for k in SETTINGS_ENV}], sort_keys=True
+        )
+        return hashlib.sha256(basis.encode("utf-8")).hexdigest()[:12]
+
+    def settings_state(self) -> str:
+        """Was the running proxy started with the settings it would get now?
+
+        "current"; "changed" (started with other arguments: a setting was changed, or a release changed a default);
+        "older" (the record of the start has no hash: an older claude-hr started it); "unknown" (no record of a start by
+        claude-hr, or one that cannot be read: a proxy somebody else started is not judged)."""
+        try:
+            st = read_json(self._state_file(), {}) or {}
+        except Exception:  # noqa: BLE001 - a corrupt record is "unknown", never a reason to stop doctor
+            return "unknown"
+        if not isinstance(st, dict) or not st:
+            return "unknown"
+        recorded = st.get("args")
+        if not recorded:
+            return "older"
+        return "current" if recorded == self.settings_hash() else "changed"
+
     def _offline_models(self) -> bool:
         """true / false / "auto" (default): go offline once the Kompress model is cached, which removes a
         ~10s HuggingFace round-trip from every cold start and makes the proxy independent of huggingface.co."""
@@ -255,6 +293,7 @@ class Headroom:
         if not b:
             return None
         paths.ensure_dirs()
+        settings = self.settings_hash()  # before the spawn: a started proxy always gets its record
         try:
             log = self._open_log()
         except (
@@ -292,7 +331,15 @@ class Headroom:
                 log.close()  # the child has its own copy of the handle
         atomic_write_text(
             self._state_file(),
-            json.dumps({"pid": proc.pid, "port": self.port, "started": time.time()}) + "\n",
+            json.dumps(
+                {
+                    "pid": proc.pid,
+                    "port": self.port,
+                    "started": time.time(),
+                    "args": settings,  # doctor compares it with what the config asks for now
+                }
+            )
+            + "\n",
             follow_symlinks=False,
         )
         return proc
