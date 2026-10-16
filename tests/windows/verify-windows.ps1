@@ -1,7 +1,7 @@
 # Windows end-to-end verification of claude-hr from a clean, isolated sandbox (Windows PowerShell 5.1 or 7):
 #   powershell -NoProfile -ExecutionPolicy Bypass -File tests\windows\verify-windows.ps1
 # Installs into %TEMP%\esb3 (own uv tool dir, Claude config dir and claude-hr home), runs ~30 checks incl. the real Headroom
-# install and ONE tiny `claude -p` call with your real login, then uninstalls and deletes the sandbox. It never writes
+# install and TWO tiny `claude -p` calls (haiku) with your real login, then uninstalls and deletes the sandbox. It never writes
 # to your real ~/.claude or ~/.claude-hr, and it verifies that afterwards. Takes ~3-5 minutes (about 0.5 GB download, 2 GB on disk).
 $ErrorActionPreference = 'Continue'
 $repo = (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path
@@ -46,7 +46,8 @@ Check "CLAUDE.md import block" ((Get-Content "$sb\h\.claude\CLAUDE.md" -Raw) -ma
 $gj = Get-Content "$sb\h\.claude\.claude.json" -Raw | ConvertFrom-Json
 Check "headroom + serena MCP registered" (($gj.mcpServers.PSObject.Properties.Name -contains 'headroom') -and ($gj.mcpServers.PSObject.Properties.Name -contains 'serena'))
 $pl = claude plugin list --json 2>&1 | Out-String | ConvertFrom-Json
-Check "standard profile plugins installed (>=8)" (@($pl | Where-Object { $_.scope -eq 'user' }).Count -ge 8) "$(@($pl).Count) found"
+$names = @($pl | Where-Object { $_.scope -eq 'user' } | ForEach-Object { $_.id })
+Check "standard profile plugins installed (lean: >=6, incl. hr-gates)" (($names.Count -ge 6) -and ($names -match '^hr-gates@')) ($names -join ', ')
 
 "== 4. launcher + hooks =="
 Check "passthrough --version" ((claude-hr --version 2>&1) -match 'Claude Code')
@@ -64,6 +65,47 @@ Check "bash guard blocks cat .env (exit 2)" ($LASTEXITCODE -eq 2)
 '{"tool_input":{"command":"cp .env.example .env"}}' | claude-hr-hook bash-guard 2>&1 | Out-Null
 Check "bash guard allows cp .env.example .env" ($LASTEXITCODE -eq 0)
 
+"== 4b. end-of-turn gate in a REAL session (format + trusted check + audit trail) =="
+$py = (Get-ChildItem "$sb\tooldir\claude-hr\Scripts\python.exe").FullName
+$pyToml = $py -replace '\\', '/'
+uv tool install ruff 2>&1 | Out-Null
+Check "ruff available for the repo's formatter" ((ruff --version 2>&1) -match 'ruff \d')
+$gp = "$sb\gateproj"
+New-Item -ItemType Directory -Force -Path "$gp\.claude" | Out-Null
+git -C $gp init -q 2>&1 | Out-Null
+git -C $gp config user.email t@example.com; git -C $gp config user.name t; git -C $gp config commit.gpgsign false
+[IO.File]::WriteAllText("$gp\pyproject.toml", "[tool.ruff]`nline-length = 88`n")
+$recipe = @"
+[[fast]]
+name = "needs-done-file"
+argv = ["$pyToml", "-c", "import os,sys; ok=os.path.exists('done.txt'); print('' if ok else 'done.txt is missing: create it containing the word done'); sys.exit(0 if ok else 1)"]
+timeout_s = 60
+"@
+[IO.File]::WriteAllText("$gp\.claude\hr-verify.toml", $recipe)
+git -C $gp add -A 2>&1 | Out-Null
+git -C $gp commit -q -m init 2>&1 | Out-Null
+Push-Location $gp
+$env:CLAUDECODE = '1'
+$o = claude-hr-ctl verify trust 2>&1 | Out-String; $rc = $LASTEXITCODE
+Remove-Item Env:CLAUDECODE
+Check "verify trust refuses a Claude Code shell (no --yes exists)" (($rc -eq 1) -and ($o -match 'refusing to trust')) $o
+$o = claude-hr-ctl verify status 2>&1 | Out-String
+Check "recipe is NOT trusted before a person approves it" ($o -match 'NOT trusted') $o
+'{"cwd":"' + ($gp -replace '\\', '\\') + '","hook_event_name":"Stop"}' | claude-hr-hook stop 2>&1 | Out-Null
+Check "the gate never ran the untrusted recipe" (-not (Test-Path "$gp\done.txt"))
+& $py -c "from pathlib import Path; from claude_hr import verify, paths; verify.trust(Path(r'$gp'), paths.state_dir())"
+$o = claude-hr-ctl verify status 2>&1 | Out-String
+Check "recipe trusted (what a person does with `verify trust` in a terminal)" ($o -match 'TRUSTED' -and $o -notmatch 'NOT trusted') $o
+Check "fmt lists the repo's own formatter" ((claude-hr-ctl fmt 2>&1 | Out-String) -match 'ruff')
+$out = claude-hr -p "Create the file hello.py containing exactly the single line: x   =   1   (three spaces around the equals sign). Nothing else. If a hook tells you something is missing, fix it." --model haiku --plugin-dir "$repo\plugins\hr-gates" --permission-mode acceptEdits --allowedTools "Write,Edit" --no-session-persistence --max-turns 10 --output-format json 2>$null | Out-String
+Pop-Location
+$hello = ''; if (Test-Path "$gp\hello.py") { $hello = (Get-Content "$gp\hello.py" -Raw) -replace "`r`n", "`n" }
+Check "the hook formatted the file Claude wrote with the repo's ruff" ($hello -eq "x = 1`n") ("got: " + ($hello -replace "`n", '\n'))
+Check "Claude was told the trusted check failed and fixed it" (Test-Path "$gp\done.txt") $out
+$trail = claude-hr-ctl trail --tail 10 2>&1 | Out-String
+Check "audit trail shows a block, then a pass" (($trail -match 'verify=block') -and ($trail -match 'verify=pass')) $trail
+Check "the trail holds no paths or code" (($trail -notmatch 'hello\.py') -and ($trail -notmatch [regex]::Escape($gp)))
+
 "== 5. management commands =="
 $env:CLAUDE_CONFIG_DIR = "$sb\h\.claude"; $env:CLAUDE_HR_USER_HOME = "$sb\h"
 Set-Location $repo
@@ -75,7 +117,16 @@ Check "claudemd lint" ((claude-hr-ctl claudemd lint 2>&1 | Out-String) -match 'a
 Check "update --check" ((claude-hr-ctl update --check --only claude headroom 2>&1 | Out-String) -match 'claude')
 git -C "$sb\proj" init -q 2>&1 | Out-Null
 $wf = claude-hr-ctl workflows install --dir "$sb\proj" 2>&1 | Out-String
-Check "workflows install" (Test-Path "$sb\proj\.claude\workflows\hr-review-changes.js") $wf
+Check "workflows install (both workflows)" ((Test-Path "$sb\proj\.claude\workflows\hr-review-changes.js") -and (Test-Path "$sb\proj\.claude\workflows\hr-plan-execute.js")) $wf
+$fp = claude-hr-ctl footprint 2>&1 | Out-String
+Check "footprint is within the standard budget" (($fp -match 'Estimated always-on') -and ($fp -match ': OK')) $fp
+Push-Location "$sb\proj"
+[IO.File]::WriteAllText("$sb\proj\pyproject.toml", "[project]`nname = `"x`"`nversion = `"0`"`n")
+$ir = claude-hr-ctl init-repo --only docs,editor 2>&1 | Out-String
+Check "init-repo is a dry run" (($ir -match 'dry run') -and -not (Test-Path "$sb\proj\docs\plans")) $ir
+claude-hr-ctl audit 2>&1 | Out-Null
+Check "audit runs (exit 0)" ($LASTEXITCODE -eq 0)
+Pop-Location
 Check "monitor tick" ((claude-hr-ctl monitor tick 2>&1 | Out-String) -match 'alerts')
 
 "== 6. shim round-trip with hostile arguments =="

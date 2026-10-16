@@ -632,7 +632,7 @@ def cmd_workflows(a, cfg) -> int:
             summary = first.split("description:", 1)[-1].strip().strip(",").strip("'")
             out(f"{s.stem:<24} {summary}")
         out(
-            "\nInstall into a project:  claude-hr-ctl workflows install    then in Claude: ask it to run the 'hr-review-changes' workflow"
+            "\nInstall into a project:  claude-hr-ctl workflows install    then in Claude: ask it to run the 'hr-review-changes' or 'hr-plan-execute' workflow"
         )
         return 0
     root = worktree.repo_root(Path(a.dir) if a.dir else None) or (
@@ -697,6 +697,14 @@ def cmd_job(a, cfg) -> int:
             p = maintenance.plan(cfg)
             n, freed = maintenance.apply(p)
             msg = f"cleanup removed {n} items ({freed / 1024:.2f} GB)"
+            try:
+                from . import auditlog
+
+                dropped = auditlog.prune(int(cfg.get("gates.trail_days", 90)))
+                if dropped:
+                    msg += f"; audit trail: dropped {dropped} old month file(s)"
+            except Exception:  # noqa: BLE001 - housekeeping must not fail the job
+                pass
             if cfg.flag("maintenance.usage_snapshot", True):
                 led = usage.collect(3)
                 d = paths.state_dir() / "usage"

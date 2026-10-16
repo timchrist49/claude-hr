@@ -1,6 +1,6 @@
 ---
 name: hr-status
-description: Show claude-hr health: Headroom proxy, token savings, plugin cost, CLAUDE.md size, running sessions and RAM. Use when the user asks about token usage, cost, or whether Headroom is working.
+description: Show claude-hr health (Headroom proxy, token savings, plugin cost, CLAUDE.md size, running sessions and RAM). Use when the user asks about token usage, cost, or whether Headroom is working.
 disable-model-invocation: true
 allowed-tools: Bash(claude-hr-ctl *)
 ---

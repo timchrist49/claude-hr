@@ -11,7 +11,7 @@
 #   --repo URL        git URL of the claude-hr repo            (env CLAUDE_HR_REPO_URL)
 #   --ref REF         branch or tag to install            (env CLAUDE_HR_REF, default main)
 #   --local PATH      use an existing checkout instead of cloning
-#   --profile NAME    plugin profile: minimal | standard | full | lean-output
+#   --profile NAME    plugin profile: minimal | standard | process | audit | full | lean-output
 #   --no-headroom-install   skip the (large) Headroom download; run `claude-hr-ctl headroom install` later
 #   --skip-schedule   do not register scheduled jobs (warm/monitor/update/maintain)
 #   --shim            create a `claude` shim in ~/.claude-hr/bin (put that folder first on PATH to make plain `claude` run claude-hr)

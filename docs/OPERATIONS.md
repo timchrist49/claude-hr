@@ -18,6 +18,36 @@ claude-hr-ctl doctor --deep     # also measures ~/.claude size (time-boxed)
 | Undo all managed config | `claude-hr-ctl uninstall` (your own settings/plugins/CLAUDE.md content stay) |
 | Also delete Headroom and `~/.claude-hr` | `claude-hr-ctl uninstall --purge` |
 
+## The development loop (`hr-gates`, `verify`, `audit`, `init-repo`, `footprint`)
+```
+claude-hr-ctl verify status            # is this repository's recipe trusted? what would the gate run?
+claude-hr-ctl verify init --write      # propose .claude/hr-verify.toml from what the repo declares; then read it
+claude-hr-ctl verify trust             # in a normal terminal, never inside Claude Code
+claude-hr-ctl trail --tail 20          # what the end-of-turn gate did (metadata only)
+claude-hr-ctl audit [--strict]         # read-only repository audit, zero tokens
+claude-hr-ctl init-repo [--apply]      # scaffold CI, Dependabot, issue/PR templates, docs/plans, REVIEW.md
+claude-hr-ctl footprint                # always-on token cost of the plugins, against footprint.budget_standard_tokens
+```
+The gate runs once per turn, only for a git repository, and not at all in plan mode or for subagents. It skips a working
+tree that did not change since it last passed. A failing trusted check blocks the turn's end at most `verify.gate_max_blocks`
+(2) times for the same tree, then lets Claude stop and names the failure (Claude Code itself gives up after 8 consecutive
+blocks). Turn it off: `CLAUDE_HR_GATES=off` for one session, `gates.enabled = false` everywhere, `format.enabled` or
+`verify.gate` for one step, `claude-hr-ctl verify untrust` for one repository.
+
+`hr-plan-execute` runs the independent steps of an approved plan in parallel git worktrees. Commit the plan first (worktrees
+start from the last commit; the run stops when tracked files are dirty). Run `claude-hr-ctl workflows install`, then ask Claude to
+run the `hr-plan-execute` workflow with args `{plan: 'docs/plans/<file>.md', dryRun: true}` to see the groups, and again
+without `dryRun`. It uses up to about 25 agents (`maxParallel` 4 by default, 8 at most). Passing groups are merged one by
+one on the current branch; failed or conflicting groups are reported and left on their `hr/<planslug>-<group>` branches
+(clean up with `claude-hr-ctl wt rm` or `git branch -d`). Its LLM review findings are advisory; CI is the gate.
+
+`init-repo` writes the CI job `verify` (use that name in a branch-protection rule). Its actions are referenced by tag with a
+comment to pin them to a commit SHA; the Dependabot file it also writes keeps them updated. Review it before committing.
+A token that lacks the `workflow` scope cannot push `.github/workflows/*`.
+
+`doctor` reports: the recipe state of the current repository, a missing `claude-hr-hook` on PATH, a foreign proxy or Headroom
+Desktop, and `security-guidance` reviews that were skipped for lack of API credentials.
+
 ## Updates
 ```
 claude-hr-ctl update --check                 # what is available, changes nothing
@@ -76,6 +106,10 @@ CPU quotas on Linux need the `cpu` controller delegated to user managers (one-ti
 | High RAM | Proxy ~1.2 GB + ~0.3–0.7 GB per session. `footprint = "lite"`, fewer sessions. |
 | `~/.claude` huge | `claude-hr-ctl cleanup` (dry-run) then `--apply`. |
 | Plugin token cost too high | `claude-hr-ctl plugins audit`; move big ones to project scope (`plugins suggest`). |
+| Claude shows a non-blocking hook notice every turn | `claude-hr-hook` is not on PATH in the shell Claude runs in: `uv tool update-shell`, open a new terminal (`doctor` says so). |
+| The gate never runs the tests | `verify status`: no recipe, not trusted, or changed since trusted. `verify init --write`, read it, `verify trust` in a terminal. `trail` shows what the last turns did. |
+| The gate blocks again and again | After `verify.gate_max_blocks` blocks for the same tree it stops and names the failure; fix it or `verify untrust`. A check that is flaky or slow belongs in the `full` tier, not `fast`. |
+| A file was not formatted | `fmt` lists the formatter the repo configures; a tracked file whose committed version was never formatted is left alone on purpose (`format.clean_gate = false` to change that); `trail` records skips. |
 | Hook errors after uninstalling claude-hr | None expected: hook commands exit 0 when `claude-hr-hook` is absent. |
 | Windows: long-path clone failures in plugin install | `git config --system core.longpaths true`, or shorten `CLAUDE_CONFIG_DIR`. |
 

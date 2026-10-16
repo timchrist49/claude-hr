@@ -49,11 +49,17 @@ def test_plugin_and_marketplace_manifests_are_consistent():
 
 
 def test_versions_agree():
+    """__init__, pyproject, every plugin.json and the marketplace move together (CLAUDE.md: version bumps)."""
     init = (ROOT / "src" / "claude_hr" / "__init__.py").read_text(encoding="utf-8")
     py = (ROOT / "pyproject.toml").read_text(encoding="utf-8")
-    assert re.search(r'__version__ = "([^"]+)"', init).group(1) == re.search(
-        r'(?m)^version = "([^"]+)"', py
-    ).group(1)
+    version = re.search(r'__version__ = "([^"]+)"', init).group(1)
+    assert version == re.search(r'(?m)^version = "([^"]+)"', py).group(1)
+    for manifest in (ROOT / "plugins").glob("*/.claude-plugin/plugin.json"):
+        assert json.loads(manifest.read_text(encoding="utf-8"))["version"] == version, manifest
+    mk = json.loads((ROOT / ".claude-plugin" / "marketplace.json").read_text(encoding="utf-8"))
+    own = [e for e in mk["plugins"] if isinstance(e["source"], str)]
+    assert {e["name"] for e in own} == {p.name for p in (ROOT / "plugins").iterdir() if p.is_dir()}
+    assert all(e["version"] == version for e in own)
 
 
 def test_every_skill_and_agent_has_frontmatter_description():
@@ -88,14 +94,70 @@ def test_agents_do_not_list_bash_command_filters_in_tools():
         assert tools and "Bash" not in tools.group(1), f"{md.name}: grants the Bash tool"
 
 
-def test_side_effecting_skills_are_manual_only():
-    for name in ("hr-status", "hr-parallel-worktrees"):
-        fm = (
-            (ROOT / "plugins" / "hr-core" / "skills" / name / "SKILL.md")
-            .read_text(encoding="utf-8")
-            .split("---", 2)[1]
-        )
-        assert re.search(r"(?m)^disable-model-invocation:\s*true", fm), name
+# The only skill the model may pick by itself: it is cheap, read-only and what keeps CLAUDE.md small.
+MODEL_INVOKED_SKILLS = {"hr-claudemd-hygiene"}
+
+
+def skill_frontmatter(md: Path) -> str:
+    return md.read_text(encoding="utf-8").split("---", 2)[1]
+
+
+def test_every_skill_but_one_is_manual_only():
+    """A manual-only skill (disable-model-invocation) is not in the skill listing: zero always-on tokens, and the
+    model cannot start a side effect on its own. Add a model-invoked skill only by extending MODEL_INVOKED_SKILLS."""
+    skills = {md.parent.name: md for md in (ROOT / "plugins").rglob("SKILL.md")}
+    assert MODEL_INVOKED_SKILLS <= set(skills)
+    for name, md in skills.items():
+        manual = re.search(r"(?m)^disable-model-invocation:\s*true", skill_frontmatter(md))
+        assert bool(manual) == (name not in MODEL_INVOKED_SKILLS), name
+
+
+def test_skill_descriptions_are_short_and_calm():
+    """Listed descriptions cost tokens on every turn, and Claude 5 over-triggers on shouted instructions."""
+    for md in (ROOT / "plugins").rglob("SKILL.md"):
+        fm = skill_frontmatter(md)
+        desc = re.search(r"(?m)^description:\s*(.+)$", fm).group(1)
+        assert len(desc) <= 300, f"{md.parent.name}: description is {len(desc)} characters"
+        assert not re.search(r"\b(ALWAYS|NEVER|MUST|CRITICAL|IMPORTANT)\b", desc), md.parent.name
+        assert ": " not in desc and " #" not in desc, f"{md.parent.name}: not a safe YAML scalar"
+
+
+def test_hr_gates_is_one_silent_stop_hook_and_nothing_else():
+    """The gate plugin must cost no tokens (no skills, agents, commands) and one process per turn."""
+    base = ROOT / "plugins" / "hr-gates"
+    assert not list(base.rglob("SKILL.md")) and not (base / "agents").exists()
+    assert not (base / "commands").exists() and not (base / ".mcp.json").exists()
+    hooks = json.loads((base / "hooks" / "hooks.json").read_text(encoding="utf-8"))["hooks"]
+    assert list(hooks) == ["Stop"], "any other event would spawn a process per tool call or prompt"
+    (group,) = hooks["Stop"]
+    (hook,) = group["hooks"]
+    assert hook["type"] == "command" and hook["command"] == "claude-hr-hook"
+    assert hook["args"] == ["stop"], (
+        "exec form: no shell, so it also works under PowerShell and cmd"
+    )
+    assert 60 <= hook["timeout"] <= 180
+
+
+def test_our_plugins_stay_inside_the_always_on_token_budget():
+    """The admission rule in docs/ADDONS.md, measured with the same estimator `claude-hr-ctl footprint` uses."""
+    from claude_hr import footprint
+
+    entries = [
+        {"id": f"{p.name}@claude-hr", "installPath": str(p), "enabled": True, "scope": "user"}
+        for p in sorted((ROOT / "plugins").iterdir())
+        if p.is_dir()
+    ]
+    fps = {f.name.split("@")[0]: f for f in footprint.scan_installed(entries)}
+    assert fps["hr-gates"].always_on_tokens_est == 0
+    assert fps["hr-core"].always_on_tokens_est <= 250
+    assert not any(f.injects_context for f in fps.values()), "our hooks must not add context"
+
+
+def test_the_hook_binary_is_called_by_name_with_no_shell_in_hr_gates():
+    cmd = json.loads(
+        (ROOT / "plugins" / "hr-gates" / "hooks" / "hooks.json").read_text(encoding="utf-8")
+    )["hooks"]["Stop"][0]["hooks"][0]
+    assert "sh -c" not in cmd["command"] and "powershell" not in cmd["command"].lower()
 
 
 def test_no_stray_control_characters_in_text_files():

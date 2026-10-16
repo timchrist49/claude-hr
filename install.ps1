@@ -16,7 +16,7 @@ param(
   [string]$Repo = $(if ($env:CLAUDE_HR_REPO_URL) { $env:CLAUDE_HR_REPO_URL } else { 'https://github.com/timchrist49/claude-hr.git' }),
   [string]$Ref = $(if ($env:CLAUDE_HR_REF) { $env:CLAUDE_HR_REF } else { 'main' }),
   [string]$Local = '',
-  [ValidateSet('', 'minimal', 'standard', 'full', 'lean-output')][Alias('Profile')][string]$PluginProfile = '',
+  [ValidateSet('', 'minimal', 'standard', 'process', 'audit', 'full', 'lean-output')][Alias('Profile')][string]$PluginProfile = '',
   [switch]$NoHeadroomInstall,
   [switch]$SkipSchedule,
   [switch]$Shim,

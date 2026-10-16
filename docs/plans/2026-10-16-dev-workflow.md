@@ -1,5 +1,5 @@
 ---
-status: in-progress
+status: done (0.2.0); the final design differs where noted in DESIGN.md section 13
 date: 2026-10-16
 owner: timchrist49
 ---
@@ -115,7 +115,7 @@ def probe(claude: str, *, runner) -> dict      # one tiny `claude -p ... --outpu
 
 ## Stop dispatcher (`claude-hr-hook stop`, plugin `hr-gates`, exec form, no shell)
 stdin: `cwd`, `stop_hook_active`, `permission_mode`, `last_assistant_message`, `agent_id` (subagents). Flow: exit 0 silently if gates are
-off / not a git repo / `stop_hook_active` / plan mode / subagent; fingerprint unchanged -> exit 0; (1) `fmt.format_changed`; (2) `verify.gate`
+off / not a git repo / plan mode / subagent (NOT `stop_hook_active`: the gate counts its own blocks per working-tree state, see DESIGN.md 13); fingerprint unchanged -> exit 0; (1) `fmt.format_changed`; (2) `verify.gate`
 (trusted recipe only; on failure print `{"decision":"block","reason":...}` at most `max_blocks` times per fingerprint, well under Claude
 Code's cap of 8); (3) append a metadata-only audit record. Everything fails open.
 

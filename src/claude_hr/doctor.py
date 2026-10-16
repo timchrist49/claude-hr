@@ -60,6 +60,16 @@ def _security_guidance() -> dict | None:
     return security_guidance_health(security_log_path())
 
 
+def _verify_state(cwd: Path) -> str | None:
+    """no-config | invalid | untrusted | modified | trusted for the repository in `cwd`; None if it cannot be told."""
+    try:
+        from . import verify
+
+        return verify.trust_state(cwd, paths.state_dir())
+    except Exception:  # noqa: BLE001 - doctor must never crash on an optional check
+        return None
+
+
 def run(cfg: Config, cwd: Path, deep: bool = False) -> list[Check]:
     out: list[Check] = []
     hr = Headroom(cfg)
@@ -162,6 +172,32 @@ def run(cfg: Config, cwd: Path, deep: bool = False) -> list[Check]:
                 "uv tool update-shell, then open a new terminal",
             )
         )
+    if cfg.flag("gates.enabled", True) and cfg.flag("verify.gate", True):
+        state = _verify_state(cwd)
+        if state == "trusted":
+            out.append(
+                Check(
+                    "verify recipe",
+                    OK,
+                    ".claude/hr-verify.toml is trusted: the end-of-turn test gate runs it",
+                )
+            )
+        elif state in ("untrusted", "modified", "invalid"):
+            why = {
+                "untrusted": "has not been trusted",
+                "modified": "changed since you trusted it",
+                "invalid": "is not valid",
+            }[state]
+            out.append(
+                Check(
+                    "verify recipe",
+                    WARN,
+                    f".claude/hr-verify.toml {why}: the end-of-turn test gate does nothing in this repository",
+                    "review the file, then in a normal terminal (not a Claude Code session): claude-hr-ctl verify trust"
+                    if state != "invalid"
+                    else "claude-hr-ctl verify status shows what is wrong",
+                )
+            )
     sg = _security_guidance()
     if sg and sg.get("skipped_reviews") and not sg.get("completed_reviews"):
         out.append(

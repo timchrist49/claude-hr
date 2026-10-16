@@ -4,6 +4,9 @@ A managed Claude Code distribution. `claude-hr` is a drop-in replacement for `cl
 subcommand passes straight through, but sessions run through a local [Headroom](https://github.com/headroomlabs-ai/headroom)
 proxy, under a resource governor, with vetted plugins, a lean CLAUDE.md baseline, credential guards, and
 scheduled, smoke-tested upgrades. One installer sets up a new VM; one command repairs or updates it.
+Since 0.2.0 it also gives Claude a verified development loop that costs no tokens: changed files are formatted with the
+formatter your repo already uses, the repo's own tests run before a turn can finish, and a failing check goes straight back to
+Claude (see [The development loop](#the-development-loop)).
 
 ```
 claude-hr                                        # interactive, same as `claude`
@@ -41,7 +44,7 @@ powershell -ExecutionPolicy Bypass -File .\install.ps1 -Local .   # plain .\inst
 
 Useful flags (bash spelling / PowerShell spelling):
 
-- `--profile minimal|standard|full|lean-output` / `-Profile`: which plugins to install (default `standard`, see [Plugins](#what-it-does-about-each-concern)). Saved to `~/.claude-hr/config.toml`, so later `setup` / `plugins sync` runs keep it.
+- `--profile minimal|standard|process|audit|full|lean-output` / `-Profile`: which plugins to install (default `standard`, see [Plugins](#what-it-does-about-each-concern)). Saved to `~/.claude-hr/config.toml`, so later `setup` / `plugins sync` runs keep it.
 - `--no-headroom-install` / `-NoHeadroomInstall`: skip the Headroom install for now. It is large: a download of about 0.5 GB on Windows and about 3.4 GB on Linux x86_64 (it pulls the CUDA build of PyTorch), which is about 2 GB and 6.7 GB on disk. Until you run `claude-hr-ctl setup` without the flag, `claude-hr-ctl doctor` reports `FAIL headroom: not installed` and `claude-hr` runs Claude directly. For a small install (download about 0.2 GB, about 0.8 GB on disk on Linux, without the ML-based features) set `CLAUDE_HR_HEADROOM__FOOTPRINT=lite` before running the installer; setup saves the choice to `~/.claude-hr/config.toml`, and machines under 8 GB RAM get it automatically.
 - `--skip-schedule` / `-SkipSchedule`: do not register the scheduled jobs.
 - `--shim` / `-Shim`: create a `claude` shim in `~/.claude-hr/bin`. Plain `claude` runs claude-hr only after you put that folder first on your PATH (e.g. `export PATH="$HOME/.claude-hr/bin:$PATH"` in your shell profile; on Windows, in front of your user `Path`). Undo with `claude-hr-ctl shim remove` and delete that PATH entry.
@@ -88,12 +91,53 @@ someone is logged in.
 | **Quality** | No model, effort or thinking setting is written to `settings.json` or the launch environment (Headroom's output shaper, on by default, steers output verbosity and effort inside the proxy; `headroom.output_shaper = false` disables it). CLAUDE.md baseline is ~17 lines; linter enforces budgets, conflicts, dangling references, secrets, stale model scaffolding. Headroom never lossy-compresses file reads. `learn` suggestions are read-only until a human applies them. Subagents that don't need project instructions skip them | `claudemd lint`, `plugins/hr-core` |
 | **Parallel agents** | `claude agents` / `--bg` routed through the shared proxy (the Claude daemon freezes the env of whoever starts it; claude-hr detects a daemon started without the proxy and restarts it when idle, otherwise warns). Session limit from RAM and cores (default cap 6; going over it only warns unless `resources.enforce_sessions = "block"`, low free RAM blocks interactive launches). Git-worktree helper and skill. Subagent/tool fan-out caps. Unattended runs wait out 429/529 instead of dying | launcher, `wt`, `daemon` |
 | **VM/device resources** | Admission control (session count, free RAM). Linux: systemd cgroup scope per session (`MemoryMax/High`, tasks cap) and the same for Claude's own background spawns via `CLAUDE_CODE_PROCESS_WRAPPER`; needs a systemd user session with D-Bus (`apt install dbus-user-session` on minimal VMs and stock WSL), otherwise sessions run uncapped and `doctor` warns. Windows: Job Object memory cap + kill-on-exit for orphaned MCP servers. macOS: admission control only (CPU priority is lowered only if `resources.low_priority = true`). Disk janitor for what Claude's own sweep misses (`~/.claude/jobs` reached 22 GB here). Monitor with ntfy/webhook alerts | `resources`, `cleanup`, `monitor` |
-| **Skills** | `claude-hr-ctl skills` (description size, missing descriptions, name mismatch, listing budget); few skills, `disable-model-invocation` on those with side effects | `skills` |
+| **Skills** | `claude-hr-ctl skills` (description size, missing descriptions, name mismatch, listing budget); few skills, and all but one are manual-only (`disable-model-invocation`: not in the skill listing, no always-on tokens; a test enforces it) | `skills` |
+| **Code consistency, tests, security** | The end-of-turn gate of `hr-gates` (format changed files with the repo's own formatter, run the trusted fast checks, metadata-only audit trail), a read-only `audit`, scaffolding for CI / Dependabot / issue and PR templates, git-safety confirmations. See [The development loop](#the-development-loop) | `fmt`, `verify`, `audit`, `init-repo`, `trail` |
 | **CLAUDE.md** | Managed block that imports `~/.claude/claude-hr/baseline.md`; your own content is never touched; 13 lint rules (`claude-hr-ctl claudemd lint`) | `claudemd` |
-| **Plugins** | Declarative profiles applied idempotently (setup only adds; `--prune` also removes user-scope plugins outside the profile). `minimal` = `hr-core` only; `standard` (default) = `hr-core` + claude-md-management, feature-dev, security-guidance, code-simplifier, context7, superpowers, headroom-snip; `full` = `standard` + skill-creator; `lean-output` = `standard` + the third-party Ponytail plugin (it changes how the model writes code, evaluate first). Plugins come only from Anthropic's SHA-pinned catalog or this repo (the one exception is `headroom-snip` from Headroom's own marketplace; turn it off with `headroom.install_plugins = false`); project-scoped candidates (e.g. Vercel) are suggested, not installed globally; redundancy flags | `plugins` |
-| **Workflow routing** | Deliberately minimal: 3 read-only subagents with explicit models (`explorer`, `log-triage` on Haiku; `security-reviewer` on Opus; all limited to the Read/Grep/Glob tools), 3 skills, no meta-router. See [DESIGN.md](docs/DESIGN.md#10-routing) for why | `plugins/hr-core` |
-| **Credentials** | Deny rules for `.env`/ssh/cloud creds; a Bash guard hook that blocks printing secrets into the transcript; `creds doctor` (auth shadowing, plaintext stores) and `creds scan` (secrets already in transcripts, never printed); optional `op run` launch; repo PAT never stored | `creds`, hook |
+| **Plugins** | Declarative profiles applied idempotently (setup only adds; `--prune` also removes user-scope plugins outside the profile). `minimal` = `hr-core` only; `standard` (default, lean: about 160 always-on tokens for our own plugins, measured by `footprint`) = `hr-core` + `hr-gates` + claude-md-management, security-guidance, context7, headroom-snip; `process` = `standard` + superpowers + feature-dev (adds roughly 1.5-2k always-on tokens: only for that flow); `audit` = `standard` + claude-security (deep scans before a release); `full` = `process` + claude-security + skill-creator; `lean-output` = `standard` + the third-party Ponytail plugin (it changes how the model writes code, evaluate first). `security-guidance`'s per-turn Opus review is switched off (`security.stop_review`); its regex layer and commit review stay on. Plugins come only from Anthropic's SHA-pinned catalog or this repo (the one exception is `headroom-snip` from Headroom's own marketplace; turn it off with `headroom.install_plugins = false`); project-scoped candidates (e.g. Vercel) are suggested, not installed globally; redundancy flags | `plugins` |
+| **Workflow routing** | Deliberately minimal: 3 read-only subagents with explicit models (`explorer`, `log-triage` on Haiku; `security-reviewer` on Opus; all limited to the Read/Grep/Glob tools), 7 skills of which 6 are manual-only (`hr-plan`, `hr-done`, `hr-gh`, `hr-audit`, `hr-status`, `hr-parallel-worktrees`), 2 opt-in Workflows, no meta-router. See [DESIGN.md](docs/DESIGN.md#10-routing) for why | `plugins/hr-core` |
+| **Credentials** | Deny rules for `.env`/ssh/cloud creds; a Bash guard hook that blocks printing secrets into the transcript; `creds doctor` (auth shadowing, plaintext stores) and `creds scan` (secrets already in transcripts, never printed); optional `op run` launch; repo PAT never stored; confirmations (not blocks) for `--no-verify`, force-push of a protected branch, `reset --hard`, `clean -f`; a repository's own test commands run unattended only after you trust that file | `creds`, hook |
 | **Updates** | `claude-hr-ctl update` (daily job) updates Claude Code, Headroom, plugins and claude-hr itself. Never downgrades. Claude Code, Headroom and claude-hr itself wait while sessions run (plugin updates do not). Claude Code (native build only) and Headroom get a smoke test and an automatic rollback; Headroom also a 5-day cooldown on new releases (a fresh install takes the newest). claude-hr itself follows the newest `vX.Y.Z` tag with no cooldown, smoke test or rollback: its reinstall runs in the background after the update finishes (on Windows from a one-shot scheduled task) and logs to `~/.claude-hr/logs/self-update.log`; if it did not finish, `doctor` says so and the next update retries. Setup turns off Claude's own auto-updater, so if you installed Claude Code with npm/Homebrew/WinGet update it with that tool, or run `claude-hr-ctl config set claude.manage_updates false` and then `claude-hr-ctl setup --only settings` (the flag only reaches `settings.json` when setup runs) | `update` |
+
+## The development loop
+
+Built for one way of working: you plan with `opusplan` and run at Ultracode effort, and you want code that is consistent,
+tested, verified and security-checked without paying tokens for the machinery. Everything in this table is deterministic:
+it costs **no model tokens** unless something fails or you ask for a review. claude-hr never sets a model, effort or thinking value.
+
+| Step | What happens | Cost |
+|---|---|---|
+| **Format** | At the end of each turn the files Claude changed are formatted with a formatter the repo already configures (ruff/black, prettier/biome, gofmt, rustfmt; never one it does not set up, never a formatter binary the repo itself ships). A tracked file is rewritten only if its committed version was already clean, so you never get a whole-file drift diff. | none; one process per turn |
+| **Verify** | The same hook runs the repo's trusted fast checks. A failure goes back to Claude as the reason it cannot stop yet, at most twice per unchanged working tree. Possibly weakened tests (removed asserts, new skip markers) are named in that message. A tree that did not change since the last green run is not checked again. | tokens only when a check fails |
+| **Audit trail** | `claude-hr-ctl trail`: one metadata-only record per turn (what ran, when, pass or fail). Never code or output. Kept 90 days. | none |
+| **Plan, build, prove** | `/hr-core:hr-plan` (a plan file with a verify command per step, your approval, one step at a time), `/hr-core:hr-done` (evidence instead of "it works"), `/hr-core:hr-gh` (issue and PR recipes with the `gh` CLI, no MCP server). For independent steps the opt-in `hr-plan-execute` workflow runs them in parallel git worktrees and merges the passing ones one by one. | manual-only skills: nothing until you call them |
+| **Review ladder** | `/hr-core:hr-audit`: the free `claude-hr-ctl audit` first, then the bundled `/code-review`, `/security-review` only for changes at a trust boundary, and the opt-in `hr-review-changes` workflow for a risky release. LLM reviews are advisory; the repo's checks and CI are the gate. | on request |
+
+**Trusting a repository's checks.** `.claude/hr-verify.toml` is text from that repository (a clone, a PR, a dependency), so
+it never runs until you have trusted its exact bytes:
+
+```bash
+claude-hr-ctl verify init --write   # propose checks from what the repo already declares (package.json scripts, pyproject, Cargo, go.mod, Makefile, CI); nothing runs
+claude-hr-ctl verify status
+claude-hr-ctl verify trust          # in a normal terminal, after reading the file; shows anything `audit` flags first
+claude-hr-ctl verify run [--tier full]
+```
+
+Editing the file afterwards revokes the trust. There is no `--yes`: `verify trust` refuses to run inside a Claude Code session
+or without a terminal, the bash guard denies an agent that tries it anyway, and `verify run` will not run an untrusted recipe
+for an agent. Checks run without a shell, with a scrubbed environment (no tokens, no `ANTHROPIC_*`), a time limit and a kill of the
+whole process tree. A repo without a recipe is simply not gated; formatting still happens.
+
+The rest of the toolbox, all read-only or dry-run by default: `claude-hr-ctl audit` (hooks, MCP servers and skills that run or
+fetch code, hidden Unicode and prompt-injection text in CLAUDE.md and READMEs, GitHub workflow risks, masked secrets; `--tools` also
+runs gitleaks, pip-audit, npm audit and osv-scanner when installed), `claude-hr-ctl init-repo` (issue forms with an agent-task form,
+PR template, CODEOWNERS, Dependabot, `docs/plans`, `REVIEW.md`, `.editorconfig`, a hardened CI skeleton; never overwrites),
+`claude-hr-ctl footprint` (what each plugin costs in always-on context, including what `claude plugin details` does not count),
+`claude-hr-ctl fmt`.
+
+Switches: `CLAUDE_HR_GATES=off` in the environment (or `gates.enabled = false`) disables the hook, `format.enabled`,
+`verify.gate`, `gates.trail` switch single steps, `security.profile = "strict"` makes the git confirmations refusals. Everything fails
+open: a missing tool, a timeout or an error exits quietly and never blocks `claude`.
 
 ## Commands
 
@@ -104,7 +148,7 @@ They change routing and limits only, not the managed settings or plugins. `claud
 
 | `claude-hr-ctl …` | |
 |---|---|
-| `setup [--only\|--skip headroom settings claude-md mcp plugins schedule] [--profile minimal\|standard\|full\|lean-output] [--dry-run] [--force] [--prune] [--no-headroom-install]` | install/repair everything; idempotent; keeps your own settings (`--force` overwrites keys you changed; `--prune` also uninstalls user-scope plugins outside the profile; `--profile` is saved) |
+| `setup [--only\|--skip headroom settings claude-md mcp plugins schedule] [--profile minimal\|standard\|process\|audit\|full\|lean-output] [--dry-run] [--force] [--prune] [--no-headroom-install]` | install/repair everything; idempotent; keeps your own settings (`--force` overwrites keys you changed; `--prune` also uninstalls user-scope plugins outside the profile; `--profile` is saved) |
 | `doctor [--deep] [--json]` / `status` | health with fixes / dashboard |
 | `headroom start\|stop\|restart\|status\|logs\|bench\|upgrade` | the shared proxy (`bench` is a compression smoke test; `upgrade` is a plain reinstall of the newest release without cooldown or rollback: prefer `update --only headroom`) |
 | `plugins sync\|audit\|update\|suggest\|list` , `skills` | plugin and skill management |
@@ -115,7 +159,13 @@ They change routing and limits only, not the managed settings or plugins. `claud
 | `cleanup [--apply]` | reclaim `~/.claude` scratch, MCP logs, oversized daemon log |
 | `creds doctor\|scan` | credential hygiene, secrets in transcripts |
 | `wt new <name> [--base ref]\|list\|rm <name> [--force] [--delete-branch]` | git worktrees for parallel agents (`.claude/worktrees/<name>` on branch `hr/<name>`; `rm` keeps the branch; `--delete-branch` deletes it only if it is fully merged, otherwise it is kept and the command says so) |
-| `workflows list\|install` | copies the opt-in `hr-review-changes` Workflow (parallel review + adversarial verification, ~10-25 agents) into a project's `.claude/workflows/`; it only runs when you ask Claude to run it |
+| `workflows list\|install` | copies the opt-in Workflows `hr-review-changes` (parallel review + adversarial verification, ~10-25 agents) and `hr-plan-execute` (independent plan steps in parallel worktrees, up to ~25 agents, `dryRun` first) into a project's `.claude/workflows/`; they only run when you ask Claude to |
+| `fmt [paths] [--changed] [--check]` | no arguments: which formatter this repo configures. With paths or `--changed`: format them (`--check` only reports and exits 1 if something needs formatting) |
+| `verify init [--write] [--force]\|status\|trust\|untrust\|run [--tier fast\|full]` | the repo's verify recipe `.claude/hr-verify.toml`: propose it from what the repo declares, trust its exact bytes (a person in a terminal only), run it |
+| `audit [path] [--json] [--strict] [--tools]` | read-only, zero-token audit of a repository (agent-config attack surface, hidden Unicode, workflow lint, masked secrets); `--strict` exits 1 on any high or medium finding |
+| `init-repo [path] [--apply] [--only github,docs,editor,dependabot,codeowners,review,ci]` | scaffold the files an agent workflow relies on; a dry run unless `--apply`, creates only files that do not exist, never touches git or the network |
+| `footprint [--probe] [--strict]` | estimated always-on tokens per enabled plugin and the hidden costs; `--probe` measures one real turn (spends tokens) |
+| `trail [--tail N] [--prune]` | the metadata-only audit trail of the end-of-turn gate |
 | `daemon status\|restart` | status: is the Claude background service routed through Headroom? restart: stops the service (without checking for running background sessions); the next `claude-hr agents` / `--bg` starts a new one routed through Headroom |
 | `shim install\|remove` | create/remove a `claude` shim in `~/.claude-hr/bin` so plain `claude` runs claude-hr. It does not edit PATH: put that folder first on PATH yourself (the command prints the line). On Windows the shim is a real `claude.exe` copy: a `.cmd` file would mangle shell metacharacters and newlines in prompts |
 | `config show\|get <key>\|set <key> <value>\|path` | layered config (defaults < `/etc/claude-hr/config.toml` (Windows `%ProgramData%\claude-hr\config.toml`) < `~/.claude-hr/config.toml` < `CLAUDE_HR_<SECTION>__<KEY>` env, e.g. `CLAUDE_HR_HEADROOM__PORT=9000`) |
@@ -165,6 +215,14 @@ if you want it gone), any PATH line you added for the shim, and Headroom's downl
   workspace, so it also wrote `ccr_store.db` and `session_stats.jsonl` to `~/.headroom` (Headroom's default workspace, which also
   holds `memory.db` and your Headroom config if you use Headroom on its own): delete those two files, or the whole folder only if
   you never used Headroom outside claude-hr, then run `claude-hr-ctl setup` to re-register the tool.
+- The end-of-turn gate is best-effort: a hook can be disabled (`disableAllHooks`), and it runs while Claude Code waits (up to
+  `verify.gate_timeout_s`, 120 s, on a turn that changed something). CI is the authoritative gate; `init-repo` scaffolds one.
+  The hook calls `claude-hr-hook` by name, so it must be on PATH (`doctor` warns when it is not).
+- Pattern checks are not proof: the bash guard, `audit` and the trust-refusal checks catch the common cases and raise the
+  cost of the rest (a determined agent can allocate a pty or obfuscate a command). They sit on top of Claude Code's own
+  permission prompts; see [SECURITY.md](docs/SECURITY.md).
+- [Headroom Desktop](docs/ADDONS.md) (a separate paid tray app) and claude-hr cannot both route Claude: it writes
+  `ANTHROPIC_BASE_URL` into `settings.json`, which overrides claude-hr's per-launch routing. `doctor` warns when it sees it.
 - `CLAUDE_CODE_PROCESS_WRAPPER`/cgroup caps were verified on WSL2 Ubuntu 22.04 (systemd 249) with `dbus-user-session`
   installed, not on macOS. Without that package the caps are silently skipped (timers still work); `doctor` says so.
 
@@ -198,6 +256,7 @@ if you want it gone), any PATH line you added for the shim, and Headroom's downl
 ```bash
 uv run --with pytest pytest -q            # unit tests
 uv run --with ruff ruff check src
+uv run --with ruff ruff format --check .   # the repo formats itself with the formatter it configures
 # fresh-VM install test in a container (needs Docker; downloads Headroom, takes minutes; never run the script directly on your own machine)
 docker build -f tests/docker/Dockerfile.linux -t claude-hr-linux-test tests/docker
 docker run --rm -v "$PWD:/src:ro" -e SRC_DIR=/src claude-hr-linux-test bash /src/tests/docker/run-linux-e2e.sh

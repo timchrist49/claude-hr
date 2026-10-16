@@ -80,6 +80,32 @@ check "usage"                       claude-hr-ctl usage --days 1
 check "update --check"              claude-hr-ctl update --check --only claude headroom
 check "bash guard blocks .env"      bash -c "echo '{\"tool_input\":{\"command\":\"cat .env\"}}' | claude-hr-ctl hook bash-guard; test \$? -eq 2"
 
+echo "== 6b. development loop: end-of-turn gate, trust, audit, scaffolding, footprint =="
+PY_TOOL="$HOME/.local/share/uv/tools/claude-hr/bin/python"
+check "hr-gates plugin installed (standard profile)" bash -c "claude plugin list --json | grep -q hr-gates"
+check "footprint is within the standard budget"      bash -c "claude-hr-ctl footprint | grep -q ': OK'"
+GP=/tmp/gateproj; rm -rf "$GP"; mkdir -p "$GP/.claude"; git -C "$GP" init -q
+git -C "$GP" config user.email t@example.com; git -C "$GP" config user.name t
+cat > "$GP/.claude/hr-verify.toml" <<'TOML'
+[[fast]]
+name = "needs-done-file"
+argv = ["sh", "-c", "test -e done.txt || { echo 'done.txt is missing'; exit 1; }"]
+timeout_s = 30
+TOML
+stop_json() { printf '{"cwd":"%s","hook_event_name":"Stop"}' "$GP" | claude-hr-hook stop; }
+check "verify trust refuses a Claude Code shell"      bash -c "cd $GP && CLAUDECODE=1 claude-hr-ctl verify trust; test \$? -eq 1"
+check "verify trust refuses without a terminal"       bash -c "cd $GP && env -u CLAUDECODE -u CLAUDE_CODE_ENTRYPOINT claude-hr-ctl verify trust </dev/null; test \$? -eq 1"
+check "bash guard denies an agent running verify trust" bash -c "echo '{\"tool_input\":{\"command\":\"claude-hr-ctl verify trust\"}}' | claude-hr-hook bash-guard; test \$? -eq 2"
+check "untrusted recipe: the gate prints nothing"     bash -c "$(declare -f stop_json); GP=$GP; test -z \"\$(stop_json)\""
+check "recipe trusted (what a person does in a terminal)" "$PY_TOOL" -c "from pathlib import Path; from claude_hr import verify, paths; verify.trust(Path('$GP'), paths.state_dir())"
+check "trusted failing recipe: the gate blocks with the reason" bash -c "$(declare -f stop_json); GP=$GP; stop_json | grep -q '\"decision\": \"block\"' && stop_json | grep -q 'needs-done-file failed'"
+check "after the fix the gate passes silently"        bash -c "$(declare -f stop_json); GP=$GP; touch $GP/done.txt; test -z \"\$(stop_json)\""
+check "audit trail has the block and the pass"        bash -c "claude-hr-ctl trail --tail 10 | grep -q 'verify=block' && claude-hr-ctl trail --tail 10 | grep -q 'verify=pass'"
+check "fmt reports no formatter in a bare repo"       bash -c "cd $GP && claude-hr-ctl fmt | grep -q 'no formatter'"
+check "audit runs"                                    bash -c "cd $GP && claude-hr-ctl audit"
+check "init-repo is a dry run"                        bash -c "cd $GP && claude-hr-ctl init-repo --only docs,editor | grep -q 'dry run' && test ! -e docs"
+check "both workflows installable"                    bash -c "claude-hr-ctl workflows install --dir $GP && test -e $GP/.claude/workflows/hr-plan-execute.js && test -e $GP/.claude/workflows/hr-review-changes.js"
+
 echo "== 7. scheduler ($([ $HAVE_SYSTEMD = 1 ] && echo systemd || echo cron fallback)) =="
 check "schedule install"            claude-hr-ctl schedule install
 if [ "$HAVE_SYSTEMD" = 1 ]; then

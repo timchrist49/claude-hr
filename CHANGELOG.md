@@ -1,5 +1,45 @@
 # Changelog
 
+## 0.2.0 (2026-10-16)
+A verified development loop with no always-on token cost, for sessions run at Ultracode effort on `opusplan` (claude-hr still sets
+no model, effort or thinking value). Plan: `docs/plans/2026-10-16-dev-workflow.md`; reasons: `docs/DESIGN.md` section 13.
+- **New plugin `hr-gates`** (in the `standard` profile): one `Stop` hook, `claude-hr-hook stop`, once per turn. It formats the files
+  Claude changed with the formatter the repo already configures (ruff/black, prettier/biome, gofmt, rustfmt), runs the repo's trusted
+  fast checks and returns a failure to Claude, and appends a metadata-only audit trail. It adds no context unless a trusted check
+  failed, skips plan mode and subagents, and fails open on every error.
+- **New commands:** `fmt`, `verify init|status|trust|untrust|run`, `audit`, `init-repo`, `footprint`, `trail`. `verify` runs only a
+  recipe (`.claude/hr-verify.toml`) whose exact bytes a person trusted; `audit` is a read-only, zero-token audit of a repository's
+  agent surface, workflows and secrets; `init-repo` scaffolds CI (job `verify`), Dependabot, issue forms, a PR template,
+  CODEOWNERS, `docs/plans`, `REVIEW.md` and `.editorconfig` (dry run by default, never overwrites); `footprint` estimates each
+  plugin's always-on tokens including the costs `claude plugin details` does not count.
+- **New skills in `hr-core`, all manual-only (no always-on tokens):** `hr-plan`, `hr-done`, `hr-gh` (the `gh` CLI, no MCP server),
+  `hr-audit`. New opt-in workflow `hr-plan-execute` (independent plan steps in parallel git worktrees, merged one by one).
+- **Leaner `standard` profile.** It now holds `hr-core`, `hr-gates`, claude-md-management, security-guidance, context7 and
+  headroom-snip. Superpowers and feature-dev moved to the new `process` profile, code-simplifier is listed as redundant with the
+  bundled `/simplify`; new profiles `process` and `audit`; `full` extends `process`. Existing machines keep what they have until you
+  run `claude-hr-ctl plugins sync --prune`.
+- **security-guidance's per-turn Opus review is off by default** (`env.ENABLE_STOP_REVIEW=0` in the managed baseline; its regex layer
+  and commit review stay on). `security.stop_review = "plugin-default"` restores it. Audit on demand with `/security-review` or
+  `claude-hr-ctl audit`.
+- **Git safety:** the bash guard asks before `--no-verify`, force-push of a protected branch, `reset --hard`, `clean -f` and
+  `checkout .` (`security.profile = "strict"` refuses); `gh auth status --show-token` is blocked next to `gh auth token`. The managed
+  baseline pre-approves read-only `gh` calls, asks before Claude edits `.claude/hr-verify.toml` or `.claude/settings*.json`, and
+  denies edits of `~/.claude-hr/state`.
+- **Hardened trust path:** `verify trust` has no `--yes` and refuses a Claude Code shell or a non-terminal; `verify run` of an untrusted
+  recipe is refused for an agent; the bash guard denies an agent running `verify trust` / `untrust` or touching the trust record.
+- `doctor` now reports a foreign `ANTHROPIC_BASE_URL` proxy and Headroom Desktop (they override claude-hr's per-launch routing; it
+  used to say OK), a missing `claude-hr-hook` on PATH, the current repository's verify recipe state, and security-guidance reviews that
+  were skipped for lack of API credentials.
+- New config sections `[gates]`, `[format]`, `[verify]`, `[audit]`, `[github]`, `[footprint]` and key `security.stop_review`
+  (see `src/claude_hr/data/defaults.toml`). The weekly `maintain` job prunes the audit trail.
+- `hr-status`'s description is now a safe YAML scalar. The repo itself is formatted with `ruff format` (line endings LF,
+  `.git-blame-ignore-revs`), `.editorconfig` added.
+- Tests: every test now runs sandboxed by default (a hook test had written a crash log into the real `~/.claude-hr`); integration
+  tests drive the real stop gate, formatter and verify runner in a git repository.
+- Rejected after research, with reasons in `docs/ADDONS.md`: Headroom Desktop (mutually exclusive with claude-hr), `bun fmt` as a
+  dependency, spec-driven frameworks, a GitHub MCP server by default, an LLM review Action on untrusted PRs, per-edit hooks,
+  model-judged Stop hooks. Deferred: unattended LLM routines.
+
 ## 0.1.3 (2026-10-16)
 - License is now MIT.
 - **Windows self-update fixed.** `update` running `self` and then `plugins` in one process left the tool environment without

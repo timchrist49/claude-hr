@@ -80,8 +80,11 @@ feature-flag fetching (removing `/skill-doctor`, plugin sync and other flagged f
 Third-party plugins come only from Anthropic's catalog, where every external entry is pinned to a 40-character SHA, or
 from this repo (the single exception is `headroom-snip` from Headroom's own marketplace, installed when
 `headroom.install_plugins` is true). `plugins sync` treats a plugin as installed if the same *name* is installed from any marketplace (no
-duplicate skills) and never removes anything without `--prune`. Measured always-on cost with `claude plugin details`:
-`standard` profile ≈ **1.3k tokens**/session (superpowers 703, hr-core 269, feature-dev 194, claude-md-management 116).
+duplicate skills) and never removes anything without `--prune`. Measured always-on cost with `claude plugin details`
+(0.1.x `standard`, with Superpowers): ≈ **1.3k tokens**/session (superpowers 703, hr-core 269, feature-dev 194,
+claude-md-management 116), plus about 0.8-1k tokens of Superpowers' SessionStart injection that `plugin details` does not
+count. 0.2.0's `standard` is lean (`claude-hr-ctl footprint`: our own two plugins about 160 tokens); Superpowers and feature-dev
+moved to the opt-in `process` profile.
 The Vercel plugin (35 skills, 200+ MCP tools) is *suggested per project*, not installed globally. Headroom's own
 `headroom` hooks plugin is **not** installed: it spawns a Python process on every Bash/PowerShell tool call to
 ensure a `headroom init` deployment that claude-hr already manages. `headroom-snip` (live savings band) is.
@@ -98,7 +101,7 @@ applies. The user's own CLAUDE.md content is never edited; claude-hr owns one ma
 Anthropic's current guidance for Claude 5 models is that heavy routing scaffolding, "ALWAYS use skill X", and
 verification-subagent instructions over-trigger and cost more. So: no meta-router skill, no routing table in CLAUDE.md.
 `hr-core` ships three read-only subagents with an explicit model and `omitClaudeMd` where appropriate (the model/tool
-difference is the reason they exist), one skill per genuinely repeated workflow, and relies on skill/agent
+difference is the reason they exist), one skill per genuinely repeated workflow (7 skills, 6 of them manual-only so they cost nothing until called), and relies on skill/agent
 `description` fields for selection. Measure with `claude plugin eval` if you add more.
 
 ### 11. Resource governor
@@ -121,6 +124,25 @@ reinstall runs, so a failed or killed reinstall is detected by comparing the ins
 retried by the next update; `doctor` warns about it. Claude release channels are read from
 `downloads.claude.ai/claude-code-releases/{stable,latest}`.
 
+### 13. The development loop (0.2.0)
+Plan: `docs/plans/2026-10-16-dev-workflow.md`; evidence and rejected options: `docs/ADDONS.md`.
+- *One hook, once per turn.* Formatting and checks run in a single `Stop` hook (`hr-gates`), not per edit: a hook spawns a
+  Python process (0.11-0.16 s on Windows), so per-tool-call hooks multiply that by hundreds of calls. A per-turn gate sees the
+  finished change, which is also what a test run needs. The hook adds no context unless a trusted check failed.
+- *Deterministic gates are authoritative, LLM review is advisory.* Hooks are best-effort (a user can disable them), so CI is the
+  gate and `init-repo` scaffolds it. No model-judged Stop hooks (they add a model call every turn; `/goal` already covers
+  per-task completion), no unattended LLM routines (deferred: they need a stored credential and share the subscription window).
+- *Repo-aware, never imposing.* The formatter and the checks come from what the repository already declares. `bun fmt` merged
+  2026-10-12 and is canary-only, it does not cover Python, Go or Rust; ruff/prettier/gofmt/rustfmt do.
+- *Trust by hash.* A recipe is repository text. The gate runs it only after a person approved its exact bytes, and the approval
+  path is hardened against an agent approving itself (SECURITY.md): no `--yes`, `verify run` of an untrusted recipe needs a
+  person, the trust command is refused in every spelling the guard recognises (`claude-hr-ctl`, `claude-hr ctl`, `python -m
+  claude_hr.ctl`, the trust record file), and each of these has a test.
+- *Failure modes.* Every path exits 0 on error. The fingerprint of the working tree plus the recipe's trust state decides
+  whether an idle `Stop` does any work; a blocked or errored tree is never remembered, so a fix is verified for real.
+- *Parallel work.* Independent plan steps run in worktrees (`hr-plan-execute`, up to 8 at once, merged one by one with the
+  checks run before each merge commit); steps that touch the same files are forced sequential.
+
 ## Failure modes
 
 | Failure | Behaviour |
@@ -135,9 +157,10 @@ retried by the next update; `doctor` warns about it. Claude release channels are
 | Daemon started without the route | Restarted if idle, loud warning otherwise |
 | Update smoke test fails | Previous version reinstalled, logged to `logs/update.jsonl` |
 | claude-hr itself uninstalled | Plain `claude` unaffected (no global base URL); hook commands exit 0 if `claude-hr-hook` is missing |
+| Formatter missing, slow or failing; check times out or cannot start; state file unwritable; any bug in the gate | The turn ends normally, the reason is in `trail` / `logs/crash.log`; a timed-out or inconclusive check never blocks |
 
 ## Decisions confirmed with the owner (2026-10-15)
-MIT license (switched from all-rights-reserved when the repo went public); default plugin profile `standard` including Superpowers; `claude.privacy = standard` (error reporting off, telemetry left on so flag-gated features work); one saved Workflow, `hr-review-changes`, installed per project on request and never run automatically (validated by a stubbed harness, `tests/workflow_harness.js`, not by spawning agents).
+MIT license (switched from all-rights-reserved when the repo went public); default plugin profile `standard` including Superpowers; `claude.privacy = standard` (error reporting off, telemetry left on so flag-gated features work); two saved Workflows, `hr-review-changes` and `hr-plan-execute`, installed per project on request and never run automatically (both validated offline by stubbed drivers, not by spawning agents). 2026-10-16, owner delegated all decisions for 0.2.0 ("I trust your judgement"): lean `standard` profile (Superpowers and feature-dev to `process`), `hr-gates`, manual-only workflow skills, trusted verify recipes, per-turn security review off.
 
 ## Not verified
 macOS end to end (launchd plists and BSD tools are unit-tested only); Windows `statusLine` shell behaviour in an

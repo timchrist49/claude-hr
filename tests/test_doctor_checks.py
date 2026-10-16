@@ -127,3 +127,23 @@ def test_doctor_reads_the_security_guidance_log_from_the_claude_home(sandbox, fa
     log.parent.mkdir(parents=True, exist_ok=True)
     log.write_text("LLM review disabled or no API credentials\n" * 3, encoding="utf-8")
     assert checks()["security-guidance"].status == "warn"
+
+
+def test_verify_recipe_states_are_reported(sandbox, fake_claude, monkeypatch, tmp_path):
+    from claude_hr import verify
+
+    repo = tmp_path / "proj"
+    (repo / ".claude").mkdir(parents=True)
+    assert "verify recipe" not in checks(repo)  # no recipe: nothing to say
+    recipe = repo / ".claude" / "hr-verify.toml"
+    recipe.write_text('[[fast]]\nname = "t"\nargv = ["pytest", "-q"]\n', encoding="utf-8")
+    got = checks(repo)["verify recipe"]
+    assert got.status == "warn" and "has not been trusted" in got.detail and "terminal" in got.fix
+    verify.trust(repo, paths.state_dir())
+    assert checks(repo)["verify recipe"].status == "ok"
+    recipe.write_text(recipe.read_text(encoding="utf-8") + "# edited\n", encoding="utf-8")
+    assert "changed since you trusted it" in checks(repo)["verify recipe"].detail
+    recipe.write_text('[[fast]]\nname = "t"\nargv = ["a && b"]\n', encoding="utf-8")
+    assert "not valid" in checks(repo)["verify recipe"].detail
+    monkeypatch.setenv("CLAUDE_HR_VERIFY__GATE", "false")
+    assert "verify recipe" not in checks(repo)
