@@ -205,7 +205,7 @@ def cmd_uninstall(a, cfg) -> int:
         _print_step(st)
         step_failed = step_failed or not st.ok
     if claude and not a.dry_run:
-        for pid in ("hr-core@claude-hr",):
+        for pid in ("hr-core@claude-hr", "hr-gates@claude-hr"):
             procutil.run(
                 [str(claude), "plugin", "uninstall", pid, "--scope", "user", "-y"], timeout=120
             )
@@ -1345,7 +1345,11 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument(
         "--probe", action="store_true", help="also measure one real first message (spends tokens)"
     )
-    s.add_argument("--strict", action="store_true", help="exit 1 when over the profile's budget")
+    s.add_argument(
+        "--strict",
+        action="store_true",
+        help="exit 1 when over footprint.budget_standard_tokens (standard profile only)",
+    )
     s.set_defaults(fn=cmd_footprint)
 
     s = sub.add_parser("trail", help="metadata-only audit trail of the end-of-turn gate")

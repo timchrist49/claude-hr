@@ -135,9 +135,36 @@ def test_a_blocked_tree_is_looked_at_again_even_if_nothing_changed(fakes, repo):
     assert stop_gate.handle(payload(repo)) is not None
     assert len(fakes.gate_calls) == 2
     fakes.gate_result = NS(
-        action="skip", reason="block cap reached", results=[]
-    )  # verify.gate's own cap
+        action="skip",
+        reason="block cap reached (2/2) for this change; last failure: claude-hr verify: pytest failed (exit 1)",
+        results=[],
+    )  # verify.gate's own cap: Claude may stop, but the USER is told the failure is still there
+    out = stop_gate.handle(payload(repo))
+    assert "decision" not in out and "block cap reached (2/2)" in out["systemMessage"]
+    assert "pytest failed (exit 1)" in out["systemMessage"]
+    assert "block cap reached" in auditlog.tail(1)[0]["reason"]
+
+
+def test_skip_and_error_outcomes_leave_a_one_line_reason_in_the_trail(fakes, repo):
+    fakes.gate_result = NS(
+        action="skip", reason="no .claude/hr-verify.toml\nsecond line is dropped", results=[]
+    )
+    assert stop_gate.handle(payload(repo)) is None  # nothing to tell Claude or the user: no recipe
+    assert auditlog.tail(1)[0]["reason"] == "no .claude/hr-verify.toml"
+    fakes.tree = "B"
+    fakes.gate_result = NS(
+        action="error", reason="claude-hr verify: cannot run pytest: " + "x" * 500, results=[]
+    )
     assert stop_gate.handle(payload(repo)) is None
+    row = auditlog.tail(1)[0]
+    assert row["verify"] == "error" and row["reason"].startswith(
+        "claude-hr verify: cannot run pytest"
+    )
+    assert len(row["reason"]) <= 110
+    fakes.tree = "C"
+    fakes.gate_result = NS(action="pass", reason="1 check(s) passed", results=[NS(name="pytest")])
+    stop_gate.handle(payload(repo))
+    assert "reason" not in auditlog.tail(1)[0]  # a pass needs no explanation
 
 
 def test_trusting_the_recipe_reruns_the_gate_even_if_no_file_changed(fakes, repo):

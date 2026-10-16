@@ -19,7 +19,10 @@ default_flags = []           # extra flags always prepended to interactive/headl
 env = {}                     # extra env vars written into settings.json `env`
 
 [plugins]
-profile = "standard"         # minimal | standard | full | lean-output  (see src/claude_hr/data/plugins.toml); `setup --profile X` saves X here
+profile = "standard"         # minimal | standard | process | audit | full | lean-output  (see src/claude_hr/data/plugins.toml); `setup --profile X` saves X here
+
+[skills]
+max_description_chars = 400   # `claude-hr-ctl skills` / `plugins audit` flag an installed skill whose listed description is longer than this
 
 [headroom]
 enabled = true

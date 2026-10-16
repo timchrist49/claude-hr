@@ -2,7 +2,7 @@
   "name": "hr-gates",
   "displayName": "claude-hr Gates",
   "version": "0.2.0",
-  "description": "One end-of-turn hook for claude-hr: format the files Claude changed with the repo's own formatter, run the repo's trusted fast checks, keep a metadata-only audit trail. No skills, no agents, no context cost.",
+  "description": "One end-of-turn hook for claude-hr: format the files git reports as changed with the repo's own formatter, run the repo's trusted fast checks, keep a metadata-only audit trail. No skills, no agents, no context cost.",
   "author": { "name": "timchrist49" },
   "license": "MIT",
   "keywords": ["claude-hr", "format", "verify", "gates"]

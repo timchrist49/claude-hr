@@ -140,7 +140,17 @@ def handle(payload: dict) -> dict | None:
 
     if blocked:
         return {"decision": "block", "reason": outcome.reason}
+    if action == "skip" and "block cap reached" in str(getattr(outcome, "reason", "")):
+        # the cap ended the blocking: tell the USER (systemMessage is shown to them, it is not a block and adds nothing
+        # to the model's context) that the failure is still there, instead of stopping silently with failing tests
+        return {"systemMessage": f"claude-hr: {_first_line(outcome.reason, 300)}"}
     return None
+
+
+def _first_line(text: object, limit: int) -> str:
+    """One short line of `text` (a skip/error reason names a check and an exit code, never the check's output)."""
+    line = str(text or "").strip().splitlines()[0:1]
+    return (line[0] if line else "")[:limit]
 
 
 def _trail(
@@ -151,6 +161,10 @@ def _trail(
     checks = [r.name for r in getattr(outcome, "results", []) or []] if outcome else []
     # e.g. note="time budget": the hook's deadline cut the checks short (or left no time to start them)
     extra = {"note": note} if note else {}
+    if outcome is not None and getattr(outcome, "action", "") in ("skip", "error"):
+        extra["reason"] = _first_line(
+            getattr(outcome, "reason", ""), 110
+        )  # why nothing ran / what went wrong
     auditlog.record(
         "gate",
         repo=auditlog.repo_id(root),

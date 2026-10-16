@@ -15,7 +15,7 @@ claude-hr-ctl doctor --deep     # also measures ~/.claude size (time-boxed)
 | Reinstall while sessions are open (Windows) | blocked on purpose: replacing the tool env under a running launcher breaks it. Close sessions, or `$env:CLAUDE_HR_FORCE_INSTALL=1` |
 | Run without Headroom routing | use `claude` (claude-hr never edits its binary; only the optional `shim` shadows it: `claude-hr-ctl shim remove`). Plain `claude` still reads the managed `settings.json`, the CLAUDE.md block, the plugins and the MCP servers: only the Headroom routing is skipped. To remove those too, run `claude-hr-ctl uninstall`. |
 | Stop scheduled jobs | `claude-hr-ctl schedule remove` |
-| Undo all managed config | `claude-hr-ctl uninstall` (your own settings/plugins/CLAUDE.md content stay) |
+| Undo all managed config | `claude-hr-ctl uninstall` (your own settings/plugins/CLAUDE.md content stay; an unparsable `settings.json` or `~/.claude.json` is reported and that step skipped, everything else still runs, the exit status is 1 and the output says the uninstall is INCOMPLETE; with `--purge` the claude-hr home is kept in that case because it holds the ownership record: fix the file and run it again) |
 | Also delete Headroom and `~/.claude-hr` | `claude-hr-ctl uninstall --purge` |
 
 ## The development loop (`hr-gates`, `verify`, `audit`, `init-repo`, `footprint`)
@@ -39,14 +39,41 @@ start from the last commit; the run stops when tracked files are dirty). Run `cl
 run the `hr-plan-execute` workflow with args `{plan: 'docs/plans/<file>.md', dryRun: true}` to see the groups, and again
 without `dryRun`. It uses up to about 25 agents (`maxParallel` 4 by default, 8 at most). Passing groups are merged one by
 one on the current branch; failed or conflicting groups are reported and left on their `hr/<planslug>-<group>` branches
-(clean up with `claude-hr-ctl wt rm` or `git branch -d`). Its LLM review findings are advisory; CI is the gate.
+(clean up with `claude-hr-ctl wt rm` or `git branch -d`). Its LLM review findings are advisory; CI is the gate. `dryRun` defaults to a real run only when omitted: only `false` / `'false'` opts in to a real run, any other value is a dry run and the report says so; the dry run prints the plan's whole-change checks and follow-ups. A detached HEAD stops the run before any merge (status `detached-head`); a crashed or partial integrator is reported as `needsInspection` (merges may already be on your branch: look at it before anything else).
 
 `init-repo` writes the CI job `verify` (use that name in a branch-protection rule). Its actions are referenced by tag with a
 comment to pin them to a commit SHA; the Dependabot file it also writes keeps them updated. Review it before committing.
 A token that lacks the `workflow` scope cannot push `.github/workflows/*`.
 
-`doctor` reports: the recipe state of the current repository, a missing `claude-hr-hook` on PATH, a foreign proxy or Headroom
-Desktop, and `security-guidance` reviews that were skipped for lack of API credentials.
+### Configuration reference for the development loop
+All keys live in `~/.claude-hr/config.toml` (or `/etc/claude-hr/config.toml`, or `CLAUDE_HR_<SECTION>__<KEY>` in the environment); defaults and comments are in `src/claude_hr/data/defaults.toml`.
+
+| Key | Default | What it does |
+|---|---|---|
+| `gates.enabled` | true | the Stop hook runs at all (also `CLAUDE_HR_GATES=off`) |
+| `gates.protect_config` | true | the settings baseline asks before Claude edits `.claude/hr-verify.toml`, `.claude/settings*.json` and claude-hr's `config.toml`, and denies edits of its `state/`; off removes those rules |
+| `gates.trail`, `gates.trail_days` | true, 90 | the metadata-only audit trail; month files older than this are pruned by `trail --prune` and the weekly job |
+| `format.enabled` | true | the formatter step |
+| `format.timeout_s` | 30 | cap for the formatter inside the hook's 150 s budget (it gets at most half of what is left) |
+| `format.max_files`, `format.max_file_kb` | 40, 512 | files formatted per turn, largest file formatted |
+| `format.skip_globs`, `format.allow` | [], [] | paths never formatted, formatter names allowed (empty = any detected) |
+| `format.clean_gate` | true | rewrite a tracked file only if its committed version was already formatted |
+| `format.repo_tools` | "trusted" | in-repo formatter binaries and prettier need a trusted repository; "always" lifts that |
+| `verify.gate` | true | run the trusted recipe at the end of the turn |
+| `verify.tier` | "fast" | which tier runs unattended (`full` runs the whole list on every turn) |
+| `verify.gate_max_blocks` | 2 | blocks per unchanged tree before the gate lets Claude stop and tells you |
+| `verify.gate_timeout_s` | 120 | cap for all checks together inside the 150 s budget (`format.timeout_s` + this above about 150 s buys nothing) |
+| `verify.test_guard` | true | mention removed asserts and new skip markers in a failing gate's message |
+| `audit.tools`, `audit.timeout_s` | true, 60 | `audit --tools` may run installed scanners, per-scanner limit |
+| `github.readonly_allow` | true | the baseline pre-approves read-only `gh` calls |
+| `security.stop_review` | "off" | `off` (also false, 0, no, disabled) sets `ENABLE_STOP_REVIEW=0`; `plugin-default` (also on, true, 1, yes, enabled) leaves security-guidance's per-turn Opus review on |
+| `footprint.budget_standard_tokens` | 1500 | `footprint --strict` and `doctor` compare the standard profile's always-on estimate with it |
+| `skills.max_description_chars` | 400 | `skills` and `plugins audit` flag longer listed descriptions |
+
+`doctor` reports, among the existing checks: the recipe state of the current repository (from any subdirectory), a missing `claude-hr-hook` on PATH, a foreign proxy or Headroom
+Desktop, `security-guidance` reviews that were skipped for lack of API credentials, `managed settings` (WARN when the baseline was applied by another claude-hr version or
+`setup --only settings` would still change something; FAIL on an unparsable `state/settings-merge.json`), `footprint` (the always-on token estimate against
+`footprint.budget_standard_tokens`, standard profile only), an unparsable `~/.claude.json` and an unrecognised `security.stop_review` value.
 
 ## Updates
 ```
@@ -58,6 +85,8 @@ Daily job: 03:17 local (`updates.at`). Log: `~/.claude-hr/logs/update.jsonl`. Pi
 `claude-hr-ctl config set claude.pin 2.1.292` / `headroom.version 0.40.0`. Release channel for Claude: `claude.channel`
 (`stable` ≈ a week behind `latest`; the updater never downgrades you off a newer build unless `--allow-downgrade`).
 claude-hr itself updates to the newest `vX.Y.Z` tag (`self.update_ref`); cut a release with `git tag vX.Y.Z && git push --tags`.
+
+**After a self-update:** the daily `update` job (and a full `claude-hr-ctl update`, not `--check` or `--only`) re-applies the managed settings, the CLAUDE.md block and the plugin set once, the first time it runs after claude-hr itself was upgraded (never `--prune`, never a Headroom install, never the scheduler). It is keyed on `state/applied-version.json`, which `setup` writes; a failure is shown as a `baseline` row in `logs/update.jsonl` / `job-update.log` and retried at the next run.
 
 **Rollback by hand:** `claude install <version> --force`; `uv tool install --python 3.13 "headroom-ai[all]==<ver>"`;
 `git -C ~/.claude-hr/repo checkout <tag> && uv tool install --force --reinstall ~/.claude-hr/repo`.
@@ -108,6 +137,7 @@ CPU quotas on Linux need the `cpu` controller delegated to user managers (one-ti
 | Plugin token cost too high | `claude-hr-ctl plugins audit`; move big ones to project scope (`plugins suggest`). |
 | Claude shows a non-blocking hook notice every turn | `claude-hr-hook` is not on PATH in the shell Claude runs in: `uv tool update-shell`, open a new terminal (`doctor` says so). |
 | The gate never runs the tests | `verify status`: no recipe, not trusted, or changed since trusted. `verify init --write`, read it, `verify trust` in a terminal. `trail` shows what the last turns did. |
+| `trail` shows `note=time budget` | The hook's one 150 s budget (git, formatter and checks together; the plugin kills the hook at 170 s) ran out. If no check started the turn is retried next time; a run that was cut short is remembered, so an over-long suite is not started again on every Stop. Move slow checks to the `full` tier. |
 | The gate blocks again and again | After `verify.gate_max_blocks` blocks for the same tree it stops and names the failure; fix it or `verify untrust`. A check that is flaky or slow belongs in the `full` tier, not `fast`. |
 | A file was not formatted | `fmt` lists the formatter the repo configures and marks one as `NOT USED` with the reason. A formatter inside the repo (`.venv`, `node_modules/.bin`) or prettier (its configuration can load code) is used only after `verify trust` for that repository (or `format.repo_tools = always`). A tracked file whose committed version was never formatted is left alone on purpose (`format.clean_gate = false` to change that); `trail` records skips. |
 | Hook errors after uninstalling claude-hr | `hr-core` hook commands exit 0 when `claude-hr-hook` is absent. The `hr-gates` Stop hook (exec form, no shell) shows a non-blocking notice each turn until the plugin is removed: `claude-hr-ctl uninstall` does that, or `claude plugin uninstall hr-gates@claude-hr`. |

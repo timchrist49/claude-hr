@@ -1,7 +1,7 @@
 export const meta = {
   name: 'hr-review-changes',
   description: 'Review the current branch diff across several dimensions, then try to refute every finding before reporting it',
-  whenToUse: 'Before merging a non-trivial change. Opt-in only: it spawns roughly 10 to 25 agents. Not for the checkout of an untrusted pull request: the agents read that diff with your permissions.',
+  whenToUse: 'Before merging a non-trivial change. Opt-in only: typically 10 to 40 agents and up to about 85 with the defaults; votes and maxPerDimension raise it. Not for the checkout of an untrusted pull request: the agents read that diff with your permissions.',
   phases: [
     { title: 'Scope', detail: 'find the diff and the changed files' },
     { title: 'Review', detail: 'one finder per dimension, then skeptics try to refute each finding' },

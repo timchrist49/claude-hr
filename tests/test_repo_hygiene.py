@@ -311,3 +311,27 @@ def test_license_is_present_and_consistent():
         )
     )
     assert plugin["license"] == "MIT"
+
+
+def test_markdown_table_rows_have_the_headers_cell_count():
+    """A literal backslash-n once glued two rows of the SECURITY table together; the second row vanished when rendered."""
+
+    def cells(line: str) -> int:
+        return (
+            len(re.split(r"(?<!\\)\|", line.strip())) - 2
+        )  # drop the empty parts before the first and after the last |
+
+    bad = []
+    for md in [ROOT / "README.md", ROOT / "CHANGELOG.md", *sorted((ROOT / "docs").glob("*.md"))]:
+        width = None
+        for no, line in enumerate(md.read_text(encoding="utf-8").splitlines(), 1):
+            if not line.startswith("|"):
+                width = None
+                continue
+            if width is None:
+                width = cells(line)
+            elif cells(line) != width:
+                bad.append(
+                    f"{md.relative_to(ROOT)}:{no} has {cells(line)} cells, the table has {width}"
+                )
+    assert not bad, bad

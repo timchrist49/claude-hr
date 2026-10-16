@@ -39,6 +39,26 @@ no model, effort or thinking setting; Headroom's own output shaper stays a separ
   `.git-blame-ignore-revs`), `.editorconfig` added.
 - Tests: every test now runs sandboxed by default (a hook test had written a crash log into the real `~/.claude-hr`); integration
   tests drive the real stop gate, formatter and verify runner in a git repository.
+- Found by independent adversarial reviews of this release (a 97-finding multi-agent review with reproduction and refutation, plus per-commit
+  security reviews), all fixed unless noted:
+  - **Trust path:** `verify trust` shows both tiers in full (a `[[full]]` check that shares a name with a `[[fast]]` one is no longer hidden), escapes terminal and
+    bidi characters, and hashes exactly the bytes it showed; `verify untrust` works on an invalid or missing recipe; `hr-status` no longer pre-approves every
+    `claude-hr-ctl` subcommand (an explicit read-only list, enforced by a test).
+  - **Planted binaries:** a `git.exe` committed to a cloned repository ran when `init-repo`, `audit`, `fmt` or the stop gate called git on Windows. Bare commands
+    are now resolved through absolute PATH entries only (`procutil.resolve_exe`), `taskkill` by absolute path.
+  - **Formatter:** in-repo formatter binaries and prettier (its configuration can load code) need a trusted repository; writes are atomic; config reads are bounded; the clean
+    gate follows renames and compares line endings like with like; wider environment scrub.
+  - **Gate:** the block cap holds when a failing check writes files; one 150 s budget for the whole hook (the plugin's 170 s kill dropped blocks silently); the untracked-file
+    fingerprint cap is gone; leftover children of a check are ended; after the cap the user is told the failure is still there (`systemMessage`) and the trail records why a
+    gate skipped or errored; hooks read stdin as UTF-8 and tolerate a BOM (a Windows PowerShell 5.1 pipe made the secret guard silently allow everything).
+  - **Audit:** case-insensitive on every OS, per-file isolation (one hostile JSON no longer hides the rest), agent-surface files are never lost to the 50,000-file cap,
+    linear regexes, tag-character and hidden-Unicode coverage, exit code 2 when it could not run, file names no longer echoed, many more settings keys and hook patterns.
+  - **init-repo / workflows:** generated CI installs what it runs and no longer fails on a fresh repo; `.gitattributes` / `.editorconfig` respect CRLF scripts and tabs;
+    existing issue templates win; `dryRun` is fail-safe; a crashed integrator is reported as needing inspection; wildcard file lists make groups conflict.
+  - **Wiring:** after a self-update the next update job re-applies the managed settings and plugins (and `doctor` says when they are stale); the state-directory deny rule
+    follows `CLAUDE_HR_HOME` and `config.toml` asks; `uninstall`, `doctor` and `footprint` no longer crash or mislead on corrupt files; the audit trail append is locked on Windows.
+  - Accepted and documented: the formatter formats every file git reports as changed (your own uncommitted work included); an edit made by someone else while the checks run
+    is verified on the next change; `config set` and the `CLAUDE_HR_*` switches are protected by Claude Code's permission prompts only (the audit flags them in project settings).
 - Rejected after research, with reasons in `docs/ADDONS.md`: Headroom Desktop (mutually exclusive with claude-hr), `bun fmt` as a
   dependency, spec-driven frameworks, a GitHub MCP server by default, an LLM review Action on untrusted PRs, per-edit hooks,
   model-judged Stop hooks. Deferred: unattended LLM routines.

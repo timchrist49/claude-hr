@@ -508,7 +508,20 @@ def test_a_failing_check_that_writes_a_file_every_run_blocks_at_most_twice(repo)
     write_recipe_text(repo, recipe, trusted=True)
     (repo / "app.py").write_text("x = 2\n", encoding="utf-8", newline="\n")  # Claude's change
     results = [stop(repo) for _ in range(6)]
-    assert [bool(r) for r in results] == [True, True, False, False, False, False]
+    assert [bool(r and r.get("decision") == "block") for r in results] == [
+        True,
+        True,
+        False,
+        False,
+        False,
+        False,
+    ]
+    # the third Stop is let through, and the user (not the model) is told the failure is still there
+    assert (
+        "block cap reached" in results[2]["systemMessage"]
+        and "noisy failed" in results[2]["systemMessage"]
+    )
+    assert results[3:] == [None, None, None]
     assert (repo / "test.log").read_text() == "xx", "the check ran twice and not again"
     (repo / "app.py").write_text(
         "x = 3\n", encoding="utf-8", newline="\n"
