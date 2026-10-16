@@ -764,6 +764,74 @@ def _repo_binary_refusal(f: Formatter, root: Path, cache: dict[str, str | None])
     return reason
 
 
+_MAX_CONFIG_READ = 256 * 1024
+_JS_CONFIG = re.compile(r"^(?:prettier\.config|\.prettierrc)\.(?:js|cjs|mjs|ts|cts|mts)$")
+_TRUST_HINT = "allowed only for a trusted repository (claude-hr-ctl verify trust) or format.repo_tools = always"
+
+
+def _config_runs_code(p: Path) -> str | None:
+    """Why this prettier configuration file can execute code (a JS/TS config, plugins, a shared config package)."""
+    import json
+
+    if _JS_CONFIG.match(p.name):
+        return f"{p.name} is an executable prettier config"
+    try:
+        with open(p, "rb") as fh:
+            text = fh.read(_MAX_CONFIG_READ).decode("utf-8-sig", errors="replace")
+    except OSError:
+        return None
+    if p.name == "package.json":
+        try:
+            data = json.loads(text)
+        except ValueError:
+            return None
+        conf = data.get("prettier") if isinstance(data, dict) else None
+        if conf is None:
+            return None
+        if isinstance(conf, str):
+            return "package.json names a shared prettier config package"
+        text = json.dumps(conf)
+    elif p.name == "package.yaml" and "prettier" not in text.lower():
+        return None
+    if re.search(r"plugins", text, re.I) or text.lstrip().startswith(('"', "'")):
+        return f"{p.name} loads prettier plugins or a shared config package"
+    return None
+
+
+def _prettier_code_reason(path: Path, root: Path) -> str | None:
+    """Prettier runs JS from a repo's configuration, so every config it could pick up is checked, not just the first."""
+    for d in _dirs_up(path.parent, root):
+        for name in (*_PRETTIER_CONFIGS, "package.json", "package.yaml"):
+            p = d / name
+            try:
+                if p.is_file():
+                    why = _config_runs_code(p)
+                    if why:
+                        return why
+            except OSError:
+                continue
+    return None
+
+
+def _repo_code_refusal(f: Formatter, path: Path, root: Path, trusted: bool) -> str | None:
+    """The gate runs unattended, so it must not turn "Claude (or a clone) wrote a file" into "that file runs": a formatter
+    binary that lives inside the repository (.venv, node_modules/.bin: untracked, so a write-only agent can create one) and
+    prettier configuration that executes code are used only for a trusted repository."""
+    if trusted:
+        return None
+    try:
+        rel = Path(os.path.abspath(f.exe)).relative_to(os.path.abspath(root)).as_posix()
+    except ValueError:
+        rel = None
+    if rel is not None:
+        return f"{f.name} lives inside the repository ({rel}); {_TRUST_HINT}"
+    if f.name == "prettier":
+        why = _prettier_code_reason(path, root)
+        if why:
+            return f"{why}; {_TRUST_HINT}"
+    return None
+
+
 def _per_file_timeout(deadline: float) -> float:
     return min(_PER_FILE_MAX_S, deadline - _now())
 
@@ -874,6 +942,7 @@ def _process(
     clean_gate: bool,
     check: bool,
     detector: Callable[[Path, Path], Formatter | None],
+    trusted: bool = False,
 ) -> None:
     root_res = root.resolve()
     allowed = {a.lower() for a in ([allow] if isinstance(allow, str) else allow or ())}
@@ -897,7 +966,9 @@ def _process(
         if allowed and f.name not in allowed:
             report.skipped.append((c.rel, f"{f.name} is not in the allowed formatters"))
             continue
-        reason = _repo_binary_refusal(f, root, refusals)
+        reason = _repo_code_refusal(f, c.path, root, trusted) or _repo_binary_refusal(
+            f, root, refusals
+        )
         if reason:
             report.skipped.append((c.rel, reason))
             continue
@@ -919,6 +990,7 @@ def format_changed(
     allow=None,
     clean_gate: bool = True,
     check: bool = False,
+    trusted: bool = False,
 ) -> FormatReport:
     """Format the files git reports as changed, with the formatter each repo configures. Never raises.
 
@@ -926,6 +998,8 @@ def format_changed(
     change never turns into a whole-file drift diff; untracked/new files are always formatted.
     allow: formatter names to use; empty/None = any detected one. timeout_s bounds the whole call.
     check=True writes nothing and lists in `formatted` the files that would change.
+    trusted: the repository is trusted (the user approved its verify recipe, or chose format.repo_tools = always): only then
+    may a formatter that lives inside the repository, or prettier configuration that executes code, run. Default False.
     """
     started = _now()
     report = FormatReport()
@@ -944,6 +1018,7 @@ def format_changed(
             clean_gate=clean_gate,
             check=check,
             detector=lambda p, r: detect(p, r),
+            trusted=trusted,
         )
     except Exception as exc:  # noqa: BLE001 - a hook must survive anything; the failure is reported, not raised
         report.errors.append((".", f"internal error: {type(exc).__name__}: {exc}"))
@@ -962,6 +1037,7 @@ def format_paths(
     allow=None,
     clean_gate: bool = False,
     check: bool = False,
+    trusted: bool = False,
 ) -> FormatReport:
     """Deliberate `claude-hr-ctl fmt <paths>`: format the given files (directories expand to the files git knows
     about). Relative targets are resolved against `root`. The clean gate is off by default because the user asked."""
@@ -982,6 +1058,7 @@ def format_paths(
             clean_gate=clean_gate,
             check=check,
             detector=lambda p, r: detect(p, r),
+            trusted=trusted,
         )
     except Exception as exc:  # noqa: BLE001
         report.errors.append((".", f"internal error: {type(exc).__name__}: {exc}"))
@@ -992,7 +1069,7 @@ def format_paths(
 # ---- reporting -------------------------------------------------------------------------------------------------
 
 
-def describe(root: Path) -> list[dict]:
+def describe(root: Path, trusted: bool = False) -> list[dict]:
     """Which formatter handles which extensions at the repo root (for `claude-hr-ctl fmt`).
 
     Each entry: {name, exe, extensions, configured_by}, plus `usable: False` and `reason` when a run would refuse
@@ -1009,7 +1086,10 @@ def describe(root: Path) -> list[dict]:
         out = []
         for (name, exe, cfg), exts in groups.items():
             entry: dict = {"name": name, "exe": exe, "extensions": exts, "configured_by": cfg}
-            reason = _repo_binary_refusal(Formatter(name, exe), root, refusals)
+            f = Formatter(name, exe)
+            reason = _repo_code_refusal(f, root / f"x{exts[0]}", root, trusted) or (
+                _repo_binary_refusal(f, root, refusals)
+            )
             if reason:
                 entry.update(usable=False, reason=reason)
             out.append(entry)

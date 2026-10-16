@@ -464,11 +464,89 @@ def test_a_formatter_binary_committed_to_the_repo_is_refused(repo):
     git(repo, "add", "-f", "-A")
     git(repo, "commit", "-q", "-m", "ship a binary")
     f = put(repo / "a.py", "x = 1  \n")
-    report = fmt.format_changed(repo)
+    report = fmt.format_changed(
+        repo, trusted=True
+    )  # even a trusted repo may not ship its own formatter binary
     assert report.formatted == [] and report.errors == []
     assert report.skipped[0][0] == "a.py" and "tracked in git" in report.skipped[0][1]
     assert f.read_bytes() == b"x = 1  \n"
-    assert fmt.describe(repo)[0]["usable"] is False
+    assert fmt.describe(repo, trusted=True)[0]["usable"] is False
+
+
+def test_an_untrusted_repo_may_not_run_a_formatter_that_lives_inside_it(repo):
+    """An agent with write access only can create .venv/bin/ruff or node_modules/.bin/prettier: the gate must not run it."""
+    win = paths.IS_WINDOWS
+    put(repo / "pyproject.toml", "[tool.ruff]\nline-length = 100\n")
+    local = repo / ".venv" / ("Scripts" if win else "bin") / ("ruff.exe" if win else "ruff")
+    put(local, b"")
+    local.chmod(0o755)
+    f = put(repo / "a.py", "x = 1  \n")
+    report = fmt.format_changed(repo)  # trusted defaults to False
+    assert report.formatted == [] and report.errors == []
+    assert "lives inside the repository" in report.skipped[0][1]
+    assert "verify trust" in report.skipped[0][1]
+    assert f.read_bytes() == b"x = 1  \n"
+    got = fmt.describe(repo)[0]
+    assert got["usable"] is False and "lives inside the repository" in got["reason"]
+    assert "usable" not in fmt.describe(repo, trusted=True)[0]
+
+
+@pytest.mark.parametrize(
+    "name, content, why",
+    [
+        ("prettier.config.js", "module.exports = {};\n", "executable prettier config"),
+        (".prettierrc.cjs", "module.exports = {};\n", "executable prettier config"),
+        (".prettierrc.mjs", "export default {};\n", "executable prettier config"),
+        ("prettier.config.ts", "export default {};\n", "executable prettier config"),
+        (".prettierrc", '{"plugins": ["./local-plugin.js"]}\n', "plugins"),
+        (".prettierrc.json", '{"plugins":["prettier-plugin-x"]}\n', "plugins"),
+        (".prettierrc.yaml", "plugins:\n  - ./p.js\n", "plugins"),
+        (".prettierrc.toml", 'plugins = ["./p.js"]\n', "plugins"),
+        (".prettierrc", '"@company/prettier-config"\n', "plugins or a shared config"),
+        ("package.json", '{"prettier": "@company/prettier-config"}\n', "shared prettier config"),
+        ("package.json", '{"prettier": {"plugins": ["./p.js"]}}\n', "plugins"),
+    ],
+)
+def test_prettier_configuration_that_executes_code_needs_a_trusted_repo(
+    repo, fake, name, content, why
+):
+    fake("strip", "prettier")  # a prettier that is NOT inside the repo (a global install)
+    put(repo / name, content)
+    f = put(repo / "a.ts", "const a = 1;  \n")
+    report = fmt.format_changed(repo)
+    assert report.formatted == [] and why in report.skipped[0][1]
+    assert f.read_bytes() == b"const a = 1;  \n"
+    trusted = fmt.format_changed(repo, trusted=True)
+    assert trusted.formatted == ["a.ts"]  # the user vouched for this repository
+
+
+@pytest.mark.parametrize(
+    "name, content",
+    [
+        (
+            ".prettierrc",
+            '{"semi": false, "overrides": [{"files": "*.ts", "options": {"semi": true}}]}\n',
+        ),
+        (".prettierrc.yaml", "semi: false\ntabWidth: 4\n"),
+        ("package.json", '{"name": "x", "prettier": {"semi": false}}\n'),
+    ],
+)
+def test_data_only_prettier_configuration_is_fine_without_trust(repo, fake, name, content):
+    fake("strip", "prettier")
+    put(repo / name, content)
+    put(repo / "a.ts", "const a = 1;  \n")
+    assert fmt.format_changed(repo).formatted == ["a.ts"]
+
+
+def test_every_prettier_config_on_the_way_up_is_checked_not_just_the_first(repo, fake):
+    fake("strip", "prettier")
+    put(repo / ".prettierrc", '{"semi": false}\n')
+    put(
+        repo / "prettier.config.js", "module.exports = {};\n"
+    )  # prettier may pick either: refuse if one executes
+    put(repo / "sub" / "a.ts", "const a = 1;  \n")
+    report = fmt.format_changed(repo)
+    assert report.formatted == [] and "executable prettier config" in report.skipped[0][1]
 
 
 def test_entry_points_never_raise(repo, monkeypatch):
@@ -997,7 +1075,7 @@ def test_describe_lists_each_detected_formatter_with_its_extensions(proj, win):
     (proj / ".prettierrc").write_text("{}\n", encoding="utf-8")
     ruff = venv_tool(proj, "ruff", win)
     prettier = node_tool(proj, "prettier", win)
-    got = {d["name"]: d for d in fmt.describe(proj)}
+    got = {d["name"]: d for d in fmt.describe(proj, trusted=True)}
     assert set(got) == {"ruff", "prettier"}
     assert (
         got["ruff"]["extensions"] == [".py", ".pyi"]

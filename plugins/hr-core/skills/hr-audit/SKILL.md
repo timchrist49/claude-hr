@@ -2,7 +2,7 @@
 name: hr-audit
 description: Review the change with checks from cheap to costly. Run before merging; go further for risky changes.
 disable-model-invocation: true
-allowed-tools: Bash(claude-hr-ctl audit) Bash(claude-hr-ctl audit *)
+allowed-tools: Bash(claude-hr-ctl audit *)
 ---
 Start with the free, deterministic step and climb only as far as the risk of the change justifies. After each step, summarise what it found and what it did not check.
 

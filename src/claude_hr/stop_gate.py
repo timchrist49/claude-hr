@@ -24,9 +24,9 @@ STATE_KEEP = 50  # repositories remembered in state/gates.json
 def run() -> int:
     """Entry point used by hooks.main. Prints the block decision (JSON) only when a trusted check failed."""
     try:
-        payload = json.loads(sys.stdin.read() or "{}")
-        if not isinstance(payload, dict):
-            return 0
+        from .hooks import read_stdin_json
+
+        payload = read_stdin_json()
         result = handle(payload)
         if result:
             sys.stdout.write(json.dumps(result))
@@ -77,6 +77,7 @@ def handle(payload: dict) -> dict | None:
             skip_globs=tuple(cfg.get("format.skip_globs", []) or ()),
             allow=list(cfg.get("format.allow", []) or []) or None,
             clean_gate=cfg.flag("format.clean_gate", True),
+            trusted=repo_tools_allowed(cfg, root),
         )
         formatted, skipped, errors = list(rep.formatted), len(rep.skipped), len(rep.errors)
         formatters = list(rep.formatters)
@@ -129,6 +130,19 @@ def _trail(
         checks=checks,
         seconds=round(seconds, 2),
     )
+
+
+def repo_tools_allowed(cfg, root: Path) -> bool:
+    """May the formatter step use tools and configuration that live in the repository (a .venv or node_modules binary,
+    prettier config that runs code)? Only for a repository the user trusted, or when format.repo_tools = always."""
+    if str(cfg.get("format.repo_tools", "trusted")).strip().lower() == "always":
+        return True
+    try:
+        from . import verify
+
+        return verify.trust_state(root, paths.state_dir()) == "trusted"
+    except Exception:  # noqa: BLE001
+        return False
 
 
 def _signature(verify, root: Path) -> str:

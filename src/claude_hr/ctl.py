@@ -806,11 +806,12 @@ def _confirm(question: str) -> bool:
 
 def cmd_fmt(a, cfg) -> int:
     """Format (or, with --check, only report) files with a formatter the repo ALREADY configures. No arguments: say which."""
-    from . import fmt
+    from . import fmt, stop_gate
 
     root = _repo_root()
+    trusted = stop_gate.repo_tools_allowed(cfg, root)
     if not a.paths and not a.changed:
-        found = fmt.describe(root)
+        found = fmt.describe(root, trusted=trusted)
         if not found:
             out(
                 "no formatter is configured in this repository (claude-hr only uses one the repo already sets up: "
@@ -833,6 +834,7 @@ def cmd_fmt(a, cfg) -> int:
         "allow": list(cfg.get("format.allow", []) or []) or None,
         "check": bool(a.check),
         "clean_gate": False,  # deliberate command: format the whole file even if it had drifted
+        "trusted": trusted,
     }
     if a.paths:
         rep = fmt.format_paths(root, [Path(os.path.abspath(x)) for x in a.paths], **kw)
@@ -849,6 +851,11 @@ def cmd_fmt(a, cfg) -> int:
         f"{len(rep.errors)} error(s), {len(rep.skipped)} skipped"
         + (f" ({', '.join(rep.formatters)})" if rep.formatters else "")
     )
+    if any("verify trust" in why for _, why in rep.skipped):
+        out(
+            "some files were skipped because their formatter or its configuration runs code from this repository: "
+            "read it, then `claude-hr-ctl verify trust` in a terminal (or set format.repo_tools = always)"
+        )
     if rep.errors:
         return 2
     return 1 if (a.check and rep.formatted) else 0

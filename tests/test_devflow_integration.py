@@ -292,6 +292,21 @@ def test_fmt_lists_checks_and_formats(repo, capsys, fake_formatter):
     assert run(capsys, "fmt", "--check", "--changed")[0] == 0
 
 
+def test_fmt_refuses_a_repo_local_formatter_until_the_repo_is_trusted(repo, capsys):
+    win = paths.IS_WINDOWS
+    (repo / "pyproject.toml").write_text("[tool.ruff]\nline-length = 88\n", encoding="utf-8")
+    local = repo / ".venv" / ("Scripts" if win else "bin") / ("ruff.exe" if win else "ruff")
+    local.parent.mkdir(parents=True)
+    local.write_bytes(b"")
+    local.chmod(0o755)
+    (repo / "a.py").write_text("x = 1   \n", encoding="utf-8", newline="\n")
+    rc, text = run(capsys, "fmt", "--check", "--changed")
+    assert "lives inside the repository" in text and "verify trust" in text
+    assert "NOT USED" in run(capsys, "fmt")[1]
+    write_recipe(repo)  # a person trusted this repository
+    assert "NOT USED" not in run(capsys, "fmt")[1]
+
+
 def test_fmt_without_arguments_says_what_is_configured(repo, capsys):
     rc, text = run(capsys, "fmt")
     assert rc == 0 and "no formatter is configured" in text

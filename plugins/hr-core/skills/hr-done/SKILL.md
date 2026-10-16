@@ -2,7 +2,7 @@
 name: hr-done
 description: Prove a change is finished with evidence (checks, fix proof, diff vs plan). Run before opening a PR.
 disable-model-invocation: true
-allowed-tools: Bash(claude-hr-ctl verify run) Bash(claude-hr-ctl verify run *) Bash(claude-hr-ctl verify status) Bash(claude-hr-ctl fmt --check *)
+allowed-tools: Bash(claude-hr-ctl verify run *) Bash(claude-hr-ctl verify status *) Bash(claude-hr-ctl fmt --check *)
 ---
 Done means shown, not believed. For each item give the command, its exit code and the last lines of its output. If something could not be run, say so and why instead of reporting it as passing.
 

@@ -154,6 +154,26 @@ def test_an_error_is_not_remembered_so_it_is_retried(fakes, repo):
     assert len(fakes.gate_calls) == 2
 
 
+def test_the_formatter_step_gets_the_repo_trust_decision(fakes, repo, monkeypatch):
+    """Repo-local formatters and prettier configs that run code are used only for a trusted repository (fmt.py)."""
+    fakes.trust = "untrusted"
+    stop_gate.handle(payload(repo))
+    assert fakes.fmt_calls[-1]["trusted"] is False
+    fakes.tree = "B"
+    fakes.trust = "trusted"
+    stop_gate.handle(payload(repo))
+    assert fakes.fmt_calls[-1]["trusted"] is True
+    fakes.tree = "C"
+    fakes.trust = "modified"  # edited since it was trusted: not trusted
+    stop_gate.handle(payload(repo))
+    assert fakes.fmt_calls[-1]["trusted"] is False
+    fakes.tree = "D"
+    with monkeypatch.context() as m:
+        m.setenv("CLAUDE_HR_FORMAT__REPO_TOOLS", "always")
+        stop_gate.handle(payload(repo))
+    assert fakes.fmt_calls[-1]["trusted"] is True
+
+
 def test_stop_hook_active_still_evaluates_because_the_gate_has_its_own_cap(fakes, repo):
     stop_gate.handle(payload(repo, stop_hook_active=True))
     assert len(fakes.gate_calls) == 1

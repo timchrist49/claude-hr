@@ -80,6 +80,66 @@ def test_guard_fails_open_on_garbage(monkeypatch):
     assert hooks.bash_guard() == 0
 
 
+def stdin_bytes(monkeypatch, data: bytes, encoding: str = "cp1252"):
+    """sys.stdin as Python builds it for a Windows pipe: bytes decoded with the console code page."""
+    monkeypatch.setattr("sys.stdin", io.TextIOWrapper(io.BytesIO(data), encoding=encoding))
+
+
+def test_guard_still_blocks_when_powershell_5_prepends_a_bom(monkeypatch, capsys):
+    """Windows PowerShell 5.1 piped `{...}` to claude-hr-hook with a UTF-8 BOM in front; json.loads failed and the guard
+    silently allowed `cat .env` (found by the Windows end-to-end run)."""
+    payload = json.dumps({"tool_input": {"command": "cat .env"}}).encode("utf-8")
+    stdin_bytes(monkeypatch, b"\xef\xbb\xbf" + payload + b"\r\n")
+    assert hooks.bash_guard() == 2
+    assert "secret guard" in capsys.readouterr().err
+
+
+def test_guard_decodes_a_non_ascii_command_as_utf8_not_the_console_code_page(monkeypatch):
+    # cp1252 would turn the two UTF-8 bytes of "e-acute" into two other characters; the secret file name must still match
+    payload = json.dumps({"tool_input": {"command": "cat café/.env"}}, ensure_ascii=False)
+    stdin_bytes(monkeypatch, payload.encode("utf-8"))
+    assert hooks.bash_guard() == 2
+    stdin_bytes(
+        monkeypatch, json.dumps({"tool_input": {"command": "ls café"}}, ensure_ascii=False).encode()
+    )
+    assert hooks.bash_guard() == 0
+
+
+@pytest.mark.parametrize("raw", [b"", b"   \r\n", b"[]", b'"cat .env"', b"null"])
+def test_guard_allows_when_the_payload_is_not_an_object(monkeypatch, raw):
+    stdin_bytes(monkeypatch, raw)
+    assert hooks.bash_guard() == 0
+
+
+def test_stdin_json_reader_handles_text_streams_too(monkeypatch):
+    monkeypatch.setattr("sys.stdin", io.StringIO("﻿" + json.dumps({"a": 1})))
+    assert hooks.read_stdin_json() == {"a": 1}
+
+
+def test_a_real_hook_process_survives_a_bom(sandbox):
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    env = {
+        **__import__("os").environ,
+        "PYTHONPATH": str(Path(__file__).resolve().parents[1] / "src"),
+    }
+    body = b"\xef\xbb\xbf" + json.dumps({"tool_input": {"command": "cat .env"}}).encode() + b"\r\n"
+    r = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "from claude_hr import hooks; raise SystemExit(hooks.main(['bash-guard']))",
+        ],
+        input=body,
+        env=env,
+        capture_output=True,
+        timeout=60,
+    )
+    assert r.returncode == 2 and b"secret guard" in r.stderr
+
+
 def test_guard_can_be_disabled_by_the_user_only(monkeypatch):
     monkeypatch.setenv("CLAUDE_HR_GUARD_OFF", "1")
     assert run_guard(monkeypatch, "cat .env") == 0

@@ -137,12 +137,27 @@ def main(argv: list[str] | None = None) -> int:
     return 2
 
 
+def read_stdin_json() -> dict:
+    """The hook payload from stdin ({} when it is empty or not a JSON object; raises ValueError for broken JSON).
+
+    Claude Code sends UTF-8. Read the bytes and decode them as UTF-8 ourselves: Python decodes a Windows pipe with the
+    console code page (mangling non-ASCII commands), and Windows PowerShell 5.1 can prepend a BOM when it pipes text to a
+    native program, which made json.loads fail and the secret guard silently allow everything.
+    """
+    stream = sys.stdin
+    buf = getattr(stream, "buffer", None)
+    raw = buf.read() if buf is not None else stream.read()
+    text = raw.decode("utf-8-sig", errors="replace") if isinstance(raw, bytes) else raw.lstrip("﻿")
+    data = json.loads(text.strip() or "{}")
+    return data if isinstance(data, dict) else {}
+
+
 def bash_guard() -> int:
     """PreToolUse(Bash). Exit 2 blocks and returns stderr to the model; anything else lets it run."""
     if os.environ.get("CLAUDE_HR_GUARD_OFF") == "1":
         return 0
     try:
-        payload = json.loads(sys.stdin.read() or "{}")
+        payload = read_stdin_json()
         command = str(payload.get("tool_input", {}).get("command", ""))
     except Exception:
         return 0
@@ -227,7 +242,7 @@ def statusline() -> int:
     except Exception:
         pass
     try:
-        data = json.loads(sys.stdin.read() or "{}")
+        data = read_stdin_json()
     except Exception:
         data = {}
     parts: list[str] = []
