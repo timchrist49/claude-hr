@@ -541,14 +541,23 @@ def test_ctrl_c_at_the_offer_launches_claude_and_asks_again_next_time(offer_worl
 def test_nobody_at_the_terminal_does_not_hold_claude_back(offer_world, monkeypatch, capsys):
     from claude_hr import gate_offer, human
 
+    waits: list[float] = []
     monkeypatch.setattr(human, "_live_console", lambda: True)
     monkeypatch.setattr(human, "_discard_pending_input", lambda: None)
-    monkeypatch.setattr(human, "_wait_for_answer", lambda limit_s: False)  # the wait ran out
+    # the wait ran out
+    monkeypatch.setattr(human, "_wait_for_answer", lambda limit_s: waits.append(limit_s) or False)
     launcher.main(["--hr-no-limits"])
     err = capsys.readouterr().err
-    assert human.TIMEOUT_NOTE in err and offer_world.prompts == []
+    assert human.LAUNCHER_TIMEOUT_NOTE in err and "Claude starts without asking" in err
+    assert offer_world.prompts == [] and len(waits) == 1
     assert len(offer_world.launched) == 1  # claude started
-    assert gate_offer.decision_for(offer_world.repo) is None  # and nothing was decided
+    assert gate_offer.decision_for(offer_world.repo) is None  # and nothing was decided ...
+    entry = gate_offer._entry_for(offer_world.repo)  # ... only "ask again tomorrow"
+    assert entry["decision"] == "later" and entry["until_days"] == 1
+    # the next launch in the folder neither asks nor waits: a terminal nobody sits at costs one wait a day
+    launcher.main(["--hr-no-limits"])
+    assert len(waits) == 1 and len(offer_world.launched) == 2
+    assert "double-check" not in capsys.readouterr().err
 
 
 def test_dry_run_never_asks(offer_world, capsys):

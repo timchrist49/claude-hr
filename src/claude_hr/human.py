@@ -14,12 +14,16 @@ from __future__ import annotations
 import os
 import sys
 
-# How long a question waits for a person. After that Claude starts without an answer and nothing is recorded: a
-# terminal nobody is sitting at (a tmux pane an orchestrator started, `ssh -tt`, a CI job with a pty) must not hold
-# `claude` back. Tests lower it.
+# How long a question waits for a person. After that the question is "not now": a terminal nobody is sitting at (a tmux
+# pane an orchestrator started, `ssh -tt`, a CI job with a pty) must not hold `claude` back. The caller decides what is
+# remembered (the launcher's offer snoozes the folder for a day). Tests lower it.
 ANSWER_TIMEOUT_S = 300
-TIMEOUT_NOTE = (
-    "No answer, so Claude starts without asking; run claude-hr-ctl verify enable any time."
+# What a person is told when nobody answered: the neutral one is for a command they typed themselves, the launcher passes
+# the other (its question is asked on the way to starting Claude).
+TIMEOUT_NOTE = "No answer, so nothing was changed. Run claude-hr-ctl verify enable any time."
+LAUNCHER_TIMEOUT_NOTE = (
+    "No answer, so Claude starts without asking; it asks again in a day. "
+    "Run claude-hr-ctl verify enable any time."
 )
 
 
@@ -71,16 +75,25 @@ def not_a_person() -> str | None:
     return None
 
 
-def _answer(text: str, default: bool) -> bool | None:
-    """True / False for an answer we understand, None for anything else."""
-    word = text.strip().lower()
-    if not word:
-        return default
-    if word in ("y", "yes"):
-        return True
-    if word in ("n", "no"):
-        return False
-    return None
+# What a person may type (case, surrounding space and a trailing . or ! do not matter). Nothing is matched by its first
+# letter: text typed ahead for something else must not become a yes or a recorded no.
+_YES = frozenset({"y", "yes", "yeah", "yep", "ok", "okay", "sure"})
+_NO = frozenset({"n", "no", "nope", "nah", "no thanks", "no thank you"})
+_NOT_NOW = frozenset({"later", "skip", "not now"})
+
+
+def _classify(text: str) -> str:
+    """'enter' (nothing typed) | 'yes' | 'no' | 'not-now' | 'unclear'."""
+    if not text.strip():
+        return "enter"
+    word = " ".join(text.lower().split()).rstrip(".!").rstrip()
+    if word in _YES:
+        return "yes"
+    if word in _NO:
+        return "no"
+    if word in _NOT_NOW:
+        return "not-now"
+    return "unclear"
 
 
 # ---- the live console: what was typed too early, and nobody there -------------------------------------------------
@@ -159,14 +172,16 @@ def _show_prompt(prompt: str) -> None:
         pass
 
 
-def ask_yes_no(question: str, default: bool, *, tell=None) -> bool | None:
-    """Ask `question` with a [Y/n] / [y/N] suffix. True = yes, False = no, None = "not now": EOF, Ctrl-C, or nobody
-    answering within ANSWER_TIMEOUT_S (nothing is decided then).
+def ask(question: str, default: bool, *, tell=None, timeout_note: str = TIMEOUT_NOTE):
+    """Ask `question` with a [Y/n] / [y/N] suffix. Returns (answer, how): `answer` is True = yes, False = no, None = "not
+    now" (nothing is decided); `how` says what happened - 'typed' (an answer was typed), 'enter' (Enter took the
+    default), 'timeout' (nobody answered within ANSWER_TIMEOUT_S; `timeout_note` is printed) or 'not-now' (EOF, Ctrl-C,
+    the words later / skip / not now, or two answers nobody understands).
 
-    Enter gives `default`. An answer that is none of y / yes / n / no is asked once more; a second one is "not now" too
-    (the person did not decide; typed-ahead text meant for something else must not become a recorded "no"). Keys typed
-    before the question is on the screen are dropped. `tell` prints the "please answer" hint (default: stderr). The
-    caller has already checked not_a_person().
+    Accepted: y yes yeah yep ok okay sure / n no nope nah "no thanks" "no thank you" (see _classify). Anything else is
+    asked once more and then is "not now" too (the person did not decide; typed-ahead text meant for something else must
+    not become a recorded "no"). Keys typed before the question is on the screen are dropped. `tell` prints the "please
+    answer" hint (default: stderr). The caller has already checked not_a_person().
     """
     suffix = "[Y/n]" if default else "[y/N]"
     prompt = f"{question} {suffix} "
@@ -181,21 +196,32 @@ def ask_yes_no(question: str, default: bool, *, tell=None) -> bool | None:
                 if deadline is None:
                     deadline = time.monotonic() + ANSWER_TIMEOUT_S
                 if not _wait_for_answer(deadline - time.monotonic()):
-                    _stderr("\n" + TIMEOUT_NOTE)  # the prompt line has no newline yet
-                    return None
+                    _stderr("\n" + timeout_note)  # the prompt line has no newline yet
+                    return None, "timeout"
                 reply = input()
             else:
                 reply = input(prompt)
         except (EOFError, KeyboardInterrupt):
-            return None
+            return None, "not-now"
         except (OSError, ValueError):  # a terminal that vanished, or bytes it cannot decode
-            return None
-        verdict = _answer(reply, default)
-        if verdict is not None:
-            return verdict
+            return None, "not-now"
+        kind = _classify(reply)
+        if kind == "enter":
+            return default, "enter"
+        if kind in ("yes", "no"):
+            return kind == "yes", "typed"
+        if kind == "not-now":
+            return None, "not-now"
         if attempt == 0:
             (tell or _stderr)("Please answer y or n.")
-    return None
+    return None, "not-now"
+
+
+def ask_yes_no(
+    question: str, default: bool, *, tell=None, timeout_note: str = TIMEOUT_NOTE
+) -> bool | None:
+    """True = yes, False = no, None = "not now" (see ask, which also says how the answer came about)."""
+    return ask(question, default, tell=tell, timeout_note=timeout_note)[0]
 
 
 def _stderr(msg: str) -> None:

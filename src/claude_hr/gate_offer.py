@@ -14,10 +14,12 @@ session in a normal terminal: the question is short, the answer is one keystroke
 What may happen, and when (every one of these has a test):
   * nothing is asked in -p, agents, subcommands, a Claude Code shell, piped stdin, outside a git work tree, in a home
     directory, or for a repository that is trusted / invalid / already answered (or one that was turned on and then had
-    its file removed, or has nothing to propose);
+    its file removed, or has nothing to propose), or one the person said "later" about and that time has not passed
+    (a bare Enter on a screen whose default was No: a week; no check passes today: 3 days; nobody answered: a day);
   * a "yes" is only ever read from a terminal (human.not_a_person) - there is no flag or variable that answers;
-  * Enter means yes only when the audit preflight is clean and no script the screen shows looks like it fetches or
-    sends data; the screen shows what a task-runner check (npm run, make, just) will run;
+  * Enter means yes only when the audit preflight is clean, no script the screen shows looks like it fetches or sends
+    data, and what every task-runner check (npm run, make, just) runs could be shown in full; the screen shows it the
+    way make or npm reads it (the last rule that defines a target, its prerequisites, one level deep);
   * the generated recipe holds only the argv commands that were shown, written without following a symlink, hashed from
     the exact bytes and trusted with that hash;
   * the only things written into the repository are `.claude/hr-verify.toml` and one line in the git `info/exclude`.
@@ -37,7 +39,7 @@ from pathlib import Path
 
 from . import human, paths
 
-# state/: {repo_key: {decision, ts, recipe_sha?, reason?, marker_mtime?}}
+# state/: {repo_key: {decision, ts, recipe_sha?, reason?, marker_mtime?, at?, until_days?}}
 OFFER_FILE = "verify-offer.json"
 MAX_ENTRIES = 200
 CHECK_CAP_S = 60  # the longest one check may take while the person watches it run once
@@ -48,6 +50,16 @@ DECISIONS = ("enabled", "declined")  # what the person answered
 # a folder with a pyproject.toml and no tests from costing a discovery on every launch; older code ignores it
 # (decision_for only knows DECISIONS).
 _NOTHING = "nothing"
+# Also not an answer: "ask me again later" (a bare Enter on a screen whose default was No, no check that passes today, a
+# question nobody answered). `at` is when, `until_days` how long the launcher stays quiet about this folder; older code
+# ignores it like any decision it does not know. `verify enable` never looks at it.
+_LATER = "later"
+LATER_ENTER_DAYS = 7  # Enter on a screen whose default was No
+LATER_NONE_PASS_DAYS = 3  # none of the proposed checks passed today
+LATER_TIMEOUT_DAYS = 1  # nobody answered the question
+_MAX_LATER_DAYS = 365
+# an `at` further ahead than this was written by a wrong clock: the snooze is over
+_CLOCK_SKEW_S = 86_400
 
 # Mirrors of verify.py constants, so the "nothing to ask" answer needs no import of verify (tests/test_gate_offer.py
 # asserts they have not drifted).
@@ -143,10 +155,18 @@ def record(
     recipe_sha: str | None = None,
     reason: str | None = None,
     marker_mtime: int | None = None,
+    days: float | None = None,
 ) -> bool:
-    """Remember the answer (replacing an earlier one). At most MAX_ENTRIES repositories, oldest dropped. True if written."""
-    if decision not in (*DECISIONS, _NOTHING):
+    """Remember the answer (replacing an earlier one). At most MAX_ENTRIES repositories, oldest dropped. True if written.
+    A "later" is not an answer: the launcher stays quiet about the folder for `days` days from now (see _snoozed)."""
+    if decision not in (*DECISIONS, _NOTHING, _LATER):
         raise ValueError(f"unknown decision {decision!r}")
+    if decision == _LATER and not (
+        isinstance(days, (int, float))
+        and not isinstance(days, bool)
+        and 0 < days <= _MAX_LATER_DAYS
+    ):
+        raise ValueError(f"a 'later' needs a number of days between 0 and {_MAX_LATER_DAYS}")
     try:
         import json
 
@@ -156,7 +176,11 @@ def record(
         state = _json_dict(path)
         key = _repo_key(root)
         state.pop(key, None)  # re-insert last: dict order doubles as recency
-        entry: dict = {"decision": decision, "ts": int(time.time())}
+        now = int(time.time())
+        entry: dict = {"decision": decision, "ts": now}
+        if decision == _LATER:
+            entry["at"] = now
+            entry["until_days"] = days
         if recipe_sha:
             entry["recipe_sha"] = recipe_sha
         if reason:
@@ -199,11 +223,37 @@ def forget(root: str | Path) -> bool:
         return False
 
 
-def _when(entry: dict) -> str:
+def _when(entry: dict, key: str = "ts", plus_days: float = 0) -> str:
     try:
-        return time.strftime("%Y-%m-%d", time.localtime(int(entry.get("ts", 0))))
+        return time.strftime(
+            "%Y-%m-%d", time.localtime(int(entry.get(key, 0)) + int(plus_days * 86_400))
+        )
     except (TypeError, ValueError, OverflowError, OSError):
         return "earlier"
+
+
+def _snooze_days(entry: dict | None) -> float | None:
+    """How many days a "later" entry asks for, None when it is not a well-formed one (then it is not a snooze)."""
+    if not isinstance(entry, dict) or entry.get("decision") != _LATER:
+        return None
+    at, days = entry.get("at"), entry.get("until_days")
+    for number in (at, days):
+        if isinstance(number, bool) or not isinstance(number, (int, float)):
+            return None
+    return min(days, _MAX_LATER_DAYS) if days > 0 else None
+
+
+def _snoozed(entry: dict | None, now: float | None = None) -> bool:
+    """Is this a "later" that is still running: now < at + until_days. An `at` more than a day ahead of the clock
+    (a clock that was wrong when it was written) counts as over, so a bad date can never silence the offer for long."""
+    try:
+        days = _snooze_days(entry)
+        if days is None:
+            return False
+        now = time.time() if now is None else now
+        return entry["at"] - _CLOCK_SKEW_S <= now < entry["at"] + days * 86_400
+    except Exception:  # noqa: BLE001 - cannot tell: ask
+        return False
 
 
 # ---------------------------------------------------------------------------------------------------------------
@@ -350,7 +400,8 @@ def _quick_verdict(root: Path) -> str:
     """'quiet' when there is certainly nothing to ask, else 'look'. Imports neither verify nor audit.
 
     Quiet: the recipe is the one that was trusted (the trust record holds its sha256); the person said no to this
-    folder (and the recipe, if any, is the one they said no to); there is no recipe because the person removed the
+    folder (and the recipe, if any, is the one they said no to), or "later" and that time has not passed; there is no
+    recipe because the person removed the
     file they had turned on; there is no recipe and nothing in the folder that verify.discover could propose from (or
     it found nothing last time and the project files have not changed since); the recipe is not a readable regular
     file or is over the size limit (verify calls those invalid and nothing in them is ever run). Everything else -
@@ -362,6 +413,10 @@ def _quick_verdict(root: Path) -> str:
         entry = _entry_for(root)
         decision = entry.get("decision") if entry is not None else None
         if decision in DECISIONS:  # said no, or turned it on and then deleted the file
+            return "quiet"
+        if _snoozed(entry) and not entry.get(
+            "recipe_sha"
+        ):  # "later", asked while there was no recipe
             return "quiet"
         signature = _marker_signature(root)
         if signature is None:
@@ -375,9 +430,10 @@ def _quick_verdict(root: Path) -> str:
     trusted = _json_dict(paths.state_dir() / _TRUST_FILE).get(_repo_key(root))
     if isinstance(trusted, str) and trusted == sha:
         return "quiet"
-    entry = decision_for(root)
-    if entry is not None and entry.get("decision") == "declined" and entry.get("recipe_sha") == sha:
-        return "quiet"
+    entry = _entry_for(root)
+    if entry is not None and entry.get("recipe_sha") == sha:  # an answer about exactly this file
+        if entry.get("decision") == "declined" or _snoozed(entry):
+            return "quiet"
     return "look"
 
 
@@ -481,15 +537,27 @@ def gate_limits(cfg) -> tuple[float, str]:
 # ---- what a task-runner check really runs -------------------------------------------------------------------------
 # `npm run lint` or `make test` is only a name: the code is in package.json or the Makefile, which the repository
 # controls and the audit preflight does not read. The screens show it (a few lines, cut short), and the default answer
-# turns to No when it looks like it fetches or sends data.
-_BODY_LINES_SHOWN = 3  # script lines printed under one check
-_BODY_LINES_SCANNED = 30  # script lines looked at for the default answer
+# turns to No when it looks like it fetches or sends data, and when what runs could not be shown honestly (_View.notes).
+_BODY_LINES_SHOWN = (
+    3  # script lines printed under one check (plus the first line of each prerequisite)
+)
+_BODY_LINES_SCANNED = 30  # script lines of one recipe looked at for the default answer
 _BODY_CHARS_SHOWN = 100
-_SCAN_CHARS = 20_000  # a script line longer than this is not scanned: it is called what it is (very long) instead
+_WHERE_CHARS_SHOWN = 200  # the label in front of a script line ("Makefile test", "after build")
+_NAME_CHARS_SHOWN = 40  # one target name inside a label or a note
+_NOTE_CHARS_SHOWN = 300
+_SCAN_CHARS = 2_000  # a script line longer than this is not scanned: it is called what it is (very long) instead
+_SCAN_TEXTS = 1_000  # command and script lines looked at in one go
 _RUNNER_FILE_BYTES = 1_000_000
+_PREREQS_SCANNED = 6  # prerequisites of one make/just target whose recipes are read
+_RULE_LINES_COUNTED = (
+    50_000  # recipe lines of one rule that are counted (the count is only for "+N more lines")
+)
+_PARSE_BUDGET_S = 0.5  # one task file is read through in at most this long
 _NODE_TOOLS = frozenset({"npm", "pnpm", "yarn", "bun"})
+# GNU make reads the first of these that exists, so that is the one shown
 _TASK_FILES = {
-    "make": ("Makefile", "makefile", "GNUmakefile"),
+    "make": ("GNUmakefile", "makefile", "Makefile"),
     "just": ("justfile", "Justfile", ".justfile"),
 }
 RUNNER_NOTE = (
@@ -497,6 +565,8 @@ RUNNER_NOTE = (
     "and lets the end-of-turn formatter use tools and config from this folder (.venv, node_modules, prettier "
     "configuration)."
 )
+_AFTER = "after "  # the label of a prerequisite's lines ("after build"); a script file's own label never starts so
+_UNREADABLE = "could not read what this runs"
 
 
 def _tool_name(arg0: str) -> str:
@@ -507,34 +577,126 @@ def _tool_name(arg0: str) -> str:
     return base
 
 
-def _runner_target(argv) -> tuple[str, str] | None:
+class _View(list):
+    """What a task-runner check runs, as (where, text) pairs (a plain list of them to everything that only reads it),
+    and what could not be shown honestly: `notes` are plain sentences (any note turns the default answer to No) and
+    `unseen` counts the script lines that were counted but not kept."""
+
+    def __init__(self, lines=(), notes=None, unseen: int = 0):
+        super().__init__(lines)
+        self.notes: list[str] = list(notes or [])
+        self.unseen = unseen
+
+
+# What npm, pnpm, yarn and bun accept before the script name that is not a script: `npm install` runs no script of the
+# project's that could be shown here.
+_NODE_NOT_SCRIPTS = frozenset(
+    {
+        "install", "i", "ci", "add", "exec", "x", "dlx", "create", "init", "audit", "outdated", "update", "up",
+        "upgrade", "uninstall", "remove", "rm", "publish", "pack", "link", "unlink", "view", "info", "why", "ls",
+        "list", "config", "cache", "prune", "dedupe", "rebuild", "store", "help", "version",
+    }
+)  # fmt: skip
+# Flags that make a node tool run the script of another folder or of several packages: what runs is not in this folder's
+# package.json, so it cannot be shown.
+_NODE_REDIRECT = frozenset(
+    {
+        "--prefix", "--dir", "-C", "--cwd", "--workspace", "-w", "--workspaces", "-ws", "--filter", "-F",
+        "--recursive", "-r", "--include-workspace-root",
+    }
+)  # fmt: skip
+# The only flags of make and just that leave the file and the target alone (`-C dir`, `-f file`, --eval ... do not).
+_MAKE_FLAGS = frozenset(
+    {
+        "-k", "-s", "-B", "-n", "-w", "--silent", "--quiet", "--keep-going", "--no-print-directory",
+        "--print-directory", "--always-make", "--dry-run", "--just-print",
+    }
+)  # fmt: skip
+_JUST_FLAGS = frozenset({"-q", "--quiet", "--no-deps", "--unstable", "--no-highlight"})
+
+
+def _node_target(tool: str, args: list[str]) -> tuple[str, str | None] | None:
+    words: list[str] = []
+    for a in args:
+        if a == "--":
+            break
+        if a.startswith("-"):
+            if a.split("=", 1)[0] in _NODE_REDIRECT:
+                return tool, None
+            continue
+        words.append(a)
+    if not words:
+        return None
+    first = words[0]
+    if first in (
+        "workspace",
+        "workspaces",
+    ):  # yarn workspace foo test: the script of another package
+        return tool, None
+    if first in ("run", "run-script", "rum", "urn"):
+        return (tool, words[1]) if len(words) > 1 else None
+    if first in ("test", "t", "tst"):
+        return tool, "test"
+    if first in _NODE_NOT_SCRIPTS:
+        return None
+    if tool == "npm":
+        # `npm start` runs the script of that name; anything else here is something this does not know (a flag's value
+        # taken for the command, a subcommand): it is said so rather than guessed at
+        return (tool, first) if first in ("start", "stop", "restart") else (tool, None)
+    return tool, first  # `yarn lint`: shorthand for the script
+
+
+def _task_target(tool: str, args: list[str]) -> tuple[str, str | None]:
+    allowed = _MAKE_FLAGS if tool == "make" else _JUST_FLAGS
+    words: list[str] = []
+    i = 0
+    while i < len(args):
+        a = args[i]
+        i += 1
+        if a.startswith("-"):
+            if tool == "make" and a in ("-j", "--jobs") and i < len(args) and args[i].isdigit():
+                i += 1
+                continue
+            if a in allowed or (tool == "make" and a.startswith("-j") and a[2:].isdigit()):
+                continue
+            return tool, None  # -C, -f, --eval ...: another folder, another file, other rules
+        words.append(a)
+    # `make` alone runs whatever target comes first, and `make a b` or `make X=y` run more than the one named here
+    return (tool, words[0]) if len(words) == 1 and "=" not in words[0] else (tool, None)
+
+
+def _runner_target(argv) -> tuple[str, str | None] | None:
     """('npm', 'lint') for `npm run lint`, ('npm', 'test') for `npm test`, ('make', 'test') for `make test`; None for
-    anything else (a tool called directly runs no script of the project's that could be shown)."""
+    anything else (a tool called directly runs no script of the project's that could be shown). A task-runner call whose
+    script cannot be told from the command line (`npm --prefix x run lint`, `make -C sub test`, `yarn workspace a test`,
+    `make` alone) is (tool, None)."""
     if not argv:
         return None
     tool = _tool_name(argv[0])
-    words = [str(a) for a in argv[1:] if not str(a).startswith("-")]
-    if tool in _NODE_TOOLS and words:
-        if words[0] in ("run", "run-script"):
-            return (tool, words[1]) if len(words) > 1 else None
-        if words[0] == "test":
-            return tool, "test"
-        return (tool, words[0]) if tool != "npm" else None  # `yarn lint`: shorthand for the script
-    if tool in _TASK_FILES and len(argv) == 2 and words:
-        return tool, words[0]
+    args = [str(a) for a in argv[1:]]
+    if tool in _NODE_TOOLS:
+        return _node_target(tool, args)
+    if tool in _TASK_FILES:
+        return _task_target(tool, args)
     return None
 
 
-def _read_small(path: Path) -> str | None:
-    """A regular file up to _RUNNER_FILE_BYTES as text (a prefix is enough for a Makefile; a cut-off package.json does
-    not parse and shows nothing). None for anything else; never blocks on a FIFO."""
+def _read_small_more(path: Path) -> tuple[str, bool] | None:
+    """(text, more): a regular file up to _RUNNER_FILE_BYTES as text (a prefix is enough for a Makefile; a cut-off
+    package.json does not parse and shows nothing), and whether the file goes on past that. A BOM is not part of the text.
+    None for anything else; never blocks on a FIFO."""
     from . import verify
 
     try:
-        data, _more = verify._read_file(path, _RUNNER_FILE_BYTES)
+        data, more = verify._read_file(path, _RUNNER_FILE_BYTES)
     except OSError:
         return None
-    return data.decode("utf-8", errors="replace")
+    return data.decode("utf-8-sig", errors="replace"), more
+
+
+def _read_small(path: Path) -> str | None:
+    got = _read_small_more(path)
+    return None if got is None else got[0]
 
 
 def _clean(text: str) -> str:
@@ -544,116 +706,498 @@ def _clean(text: str) -> str:
     ]  # one more than is scanned, so "too long" can be told
 
 
-def _node_lines(base: Path, name: str) -> list[tuple[str, str]]:
+def _short(text: str, limit: int) -> str:
+    return text if len(text) <= limit else text[: limit - 3] + "..."
+
+
+def _names(names: list[str]) -> str:
+    shown = ", ".join(_short(n, _NAME_CHARS_SHOWN) for n in names[:3])
+    return shown + (f" and {len(names) - 3} more" if len(names) > 3 else "")
+
+
+def _node_lines(base: Path, name: str) -> _View | None:
     import json
 
     text = _read_small(base / "package.json")
     pkg = json.loads(text) if text else None
     scripts = pkg.get("scripts") if isinstance(pkg, dict) else None
     if not isinstance(scripts, dict):
-        return []
-    out = []
+        return None
+    out = _View()
     # npm runs the pre and post scripts of a script along with it
     for script in (f"pre{name}", name, f"post{name}"):
         body = scripts.get(script)
         if isinstance(body, str) and body.strip():
             out.append((f'package.json "{script}"', _clean(body)))
-    return out
+    return out or None
 
 
-def _task_lines(base: Path, tool: str, target: str) -> list[tuple[str, str]]:
+class _Rule:
+    """One rule head of a Makefile or justfile and the lines of its recipe (the first _BODY_LINES_SCANNED, and a count)."""
+
+    __slots__ = ("targets", "needs", "double", "lines", "total")
+
+    def __init__(self, targets: list[str], needs: list[str], double: bool):
+        self.targets = targets
+        self.needs = needs
+        self.double = double
+        self.lines: list[str] = []
+        self.total = 0
+
+    def add(self, line: str) -> None:
+        if self.total < _RULE_LINES_COUNTED:
+            self.total += 1
+            if len(self.lines) < _BODY_LINES_SCANNED:
+                self.lines.append(line)
+
+
+def _logical_lines(text: str):
+    """The lines of a task file the way make and just read them: split at newline only (a form feed or U+2028 does not end a
+    line for them, and must not end one here), and a line that ends in an odd number of backslashes goes on in the next."""
+    pending: list[str] | None = None
+    for raw in text.split("\n"):
+        line = raw[:-1] if raw.endswith("\r") else raw
+        if (len(line) - len(line.rstrip("\\"))) % 2 == 1:
+            if pending is None:
+                pending = [line[:-1]]
+            else:
+                pending.append(line[:-1].lstrip())
+            continue
+        if pending is not None:
+            pending.append(line.lstrip())
+            yield " ".join(pending)
+            pending = None
+        else:
+            yield line
+    if pending is not None:
+        yield " ".join(pending)
+
+
+def _rule_head(line: str, tool: str) -> tuple[list[str], str, bool] | None:
+    """(targets, what follows the colon, double colon) for a line that starts a rule, None for anything else (an
+    assignment, a directive, a line with no colon)."""
+    before, colon, after = line.partition(":")
+    if not colon:
+        return None
+    double = after.startswith(":")
+    if double:
+        after = after[1:]
+    if after.startswith("="):  # `a := b`, `a ::= b`
+        return None
+    names = before.split()
+    if tool == "just":
+        names = names[:1]  # the rest are parameters: `test *args:`
+    elif any("=" in n for n in names):  # `A = b:c`
+        return None
+    if not names or "=" in names[0]:
+        return None
+    return names, after, double
+
+
+def _parse_rules(text: str, tool: str) -> tuple[list[_Rule], list[str], bool]:
+    """(rules, hidden, cut) of a Makefile or justfile: every rule head in the file; what the file does that this reading
+    cannot follow, in plain words (it includes other files, changes the recipe prefix, makes rules with $(eval ...)); and
+    whether reading it was cut short (it took too long). Linear in the size of the file; no regular expression is run over
+    a whole line."""
     import re
 
-    path = next((base / n for n in _TASK_FILES[tool] if (base / n).is_file()), None)
-    text = _read_small(path) if path is not None else None
-    if not text:
-        return []
-    lines = text.splitlines()
-    head = re.compile(r"^" + re.escape(target) + r"[ \t]*:(?![=:])(.*)$")
-    start = next((i for i, ln in enumerate(lines) if head.match(ln)), None)
-    if start is None:
-        return []
-    # make allows `test: deps ; recipe` on one line
-    needs, _, inline = head.match(lines[start]).group(1).partition(";")
-    needs = needs.split("#", 1)[0].split()
-    where = f"{path.name} {target}" + (f" (after {' '.join(needs[:6])})" if needs else "")
-    out = [(where, _clean(inline))] if inline.strip() else []
-    for ln in lines[start + 1 :]:
-        if len(out) >= _BODY_LINES_SCANNED:
+    make = tool == "make"
+    directive = re.compile(
+        r"(?:-?include|sinclude)(?:[ \t]|$)" if make else r"(?:import|mod)\??[ \t]+\S"
+    )
+    conditional = re.compile(r"(?:ifeq|ifneq|ifdef|ifndef|else|endif)(?:[ \t(]|$)")
+    rules: list[_Rule] = []
+    hidden: list[str] = []
+    cur: _Rule | None = None
+    cut = False
+    if make and ("$(eval" in text or "${eval" in text):
+        hidden.append("makes rules with $(eval ...)")
+    deadline = time.monotonic() + _PARSE_BUDGET_S
+    for n, line in enumerate(_logical_lines(text)):
+        if n % 1024 == 1023 and time.monotonic() > deadline:
+            cut = True
             break
-        if not ln.strip() or ln.startswith("#"):
+        if not line.strip():
             continue
-        if ln[0] not in " \t":
-            break  # the next rule
-        out.append((where, _clean(ln)))
-    return out
+        if make:
+            if line[0] == "\t":  # a recipe line
+                if cur is not None and not line.lstrip().startswith("#"):
+                    cur.add(line)
+                continue
+            # spaces in front of a rule or a directive do not matter to make
+            line = line.lstrip(" ")
+        elif line[0] in " \t":  # the body of a justfile recipe
+            if cur is not None and not line.lstrip().startswith("#"):
+                cur.add(line)
+            continue
+        if line[0] == "#":
+            continue
+        if directive.match(line):
+            phrase = "includes other files" if make else "imports other files"
+            if phrase not in hidden:
+                hidden.append(phrase)
+        if make and line.startswith(".RECIPEPREFIX") and "changes .RECIPEPREFIX" not in hidden:
+            hidden.append("changes .RECIPEPREFIX")  # recipe lines no longer start with a tab
+        if make and conditional.match(line):
+            continue  # a conditional can sit inside a recipe: the recipe goes on after it
+        head = _rule_head(line, tool)
+        if head is None:
+            continue  # an assignment or a directive does not end a recipe for this purpose either
+        targets, rest, double = head
+        inline = ""
+        if make:
+            rest, _, inline = rest.partition(";")  # `test: deps ; recipe` on one line
+        # a word with = is a target-specific variable (`test: FOO=1`), and | and && only separate what comes before
+        needs = [w for w in rest.split("#", 1)[0].split() if w not in ("|", "&&") and "=" not in w]
+        cur = _Rule(targets, needs, double)
+        if inline.strip():
+            cur.add(inline)
+        rules.append(cur)
+    return rules, hidden, cut
 
 
-def _runner_lines(root: Path, chk) -> list[tuple[str, str]]:
-    """What a task-runner check will run, as (where, text) pairs (text whitespace-collapsed and bounded), at most
-    _BODY_LINES_SCANNED of them; [] for a check that is no such call or whose text cannot be found. Reads one small
-    regular file. Never raises."""
+def _defs(rules: list[_Rule], name: str) -> list[_Rule]:
+    return [r for r in rules if name in r.targets]
+
+
+def _recipes_of(defs: list[_Rule]) -> list[_Rule]:
+    """The rules whose recipe runs for a target: all of them for a `::` target, else the last one that has a recipe (GNU
+    make warns 'overriding recipe' and uses it), else the last rule."""
+    if any(r.double for r in defs):
+        return list(defs)
+    with_recipe = [r for r in defs if r.total]
+    return [with_recipe[-1]] if with_recipe else [defs[-1]]
+
+
+def _defined_note(fname: str, name: str, tool: str, defs: list[_Rule]) -> str:
+    if any(r.double for r in defs):
+        return f"{fname} defines {_short(name, _NAME_CHARS_SHOWN)} {len(defs)} times with '::'; {tool} runs all of them"
+    return (
+        f"{fname} defines {_short(name, _NAME_CHARS_SHOWN)} {len(defs)} times; {tool} runs the last recipe, "
+        "which is the one shown"
+    )
+
+
+def _read_task_file(base: Path, tool: str) -> tuple[str, str, bool] | None:
+    """(file name as it is on disk, text, more) of the file make or just reads in `base`: the first of _TASK_FILES that
+    exists, the way they pick one."""
+    import itertools
+
+    try:
+        wanted = next(n for n in _TASK_FILES[tool] if (base / n).is_file())
+        with os.scandir(
+            base
+        ) as it:  # the spelling on disk (a case-insensitive file system answers to any)
+            on_disk = [
+                e.name for e in itertools.islice(it, 20_000) if e.name.lower() == wanted.lower()
+            ]
+    except (StopIteration, OSError):
+        return None
+    fname = wanted if wanted in on_disk or not on_disk else on_disk[0]
+    got = _read_small_more(base / fname)
+    return None if got is None else (fname, got[0], got[1])
+
+
+def _is_file(base: Path, name: str) -> bool:
+    """Is there a file or folder of this name, so the name is something to build from and not a rule to run?"""
+    if any(c in name for c in "$%*?["):
+        return False
+    try:
+        return os.path.lexists(os.path.join(base, name))
+    except (OSError, ValueError):
+        return False
+
+
+def _task_lines(base: Path, tool: str, target: str) -> _View | None:
+    """What `make <target>` / `just <target>` runs: the recipe of the LAST rule that defines the target (also one of
+    several targets on a line), then one level of prerequisites (labelled "after <name>"). Whatever this cannot show
+    honestly - the target defined more than once, an include, a recipe that was cut short, a prerequisite it cannot read -
+    is said in the view's notes. None when the file or the target is not there."""
+    got = _read_task_file(base, tool)
+    if got is None:
+        return None
+    fname, text, more = got
+    rules, hidden, cut = _parse_rules(text, tool)
+    defs = _defs(rules, target)
+    if not defs:
+        return None
+    view = _View()
+    notes = view.notes
+    label = f"{fname} {_short(target, _NAME_CHARS_SHOWN)}"
+
+    def add(chosen: list[_Rule], where: str, what: str) -> None:
+        total = sum(r.total for r in chosen)
+        kept = 0
+        for r in chosen:
+            view.extend((where, _clean(ln)) for ln in r.lines)
+            kept += len(r.lines)
+        view.unseen += total - kept
+        if total > kept:
+            notes.append(
+                f"only the first {_BODY_LINES_SCANNED} of {total} lines of {what} were checked"
+            )
+
+    if len(defs) > 1:
+        notes.append(_defined_note(fname, target, tool, defs))
+    notes.extend(f"{fname} {phrase}, so what runs may not all be shown" for phrase in hidden)
+    if more:
+        notes.append(
+            f"{fname} is longer than {_RUNNER_FILE_BYTES} bytes and only the start of it was read"
+        )
+    if cut:
+        notes.append(f"{fname} took too long to read through")
+    add(_recipes_of(defs), label, _short(target, _NAME_CHARS_SHOWN))
+    needs = list(dict.fromkeys(n for r in defs for n in r.needs if n != target))
+    if len(needs) > _PREREQS_SCANNED:
+        notes.append(
+            f"{_short(target, _NAME_CHARS_SHOWN)} has {len(needs)} prerequisites; only the first "
+            f"{_PREREQS_SCANNED} were read"
+        )
+    seen = {target, *needs[:_PREREQS_SCANNED]}
+    unread: list[str] = []
+    for need in needs[:_PREREQS_SCANNED]:
+        pdefs = _defs(rules, need)
+        if not pdefs:
+            if not _is_file(base, need):
+                unread.append(
+                    need
+                )  # no rule here: an include, a pattern rule or a variable supplies it, or nothing
+            continue
+        if len(pdefs) > 1:
+            notes.append(_defined_note(fname, need, tool, pdefs))
+        chosen = _recipes_of(pdefs)
+        add(chosen, f"{_AFTER}{_short(need, _NAME_CHARS_SHOWN)}", _short(need, _NAME_CHARS_SHOWN))
+        deeper = [
+            n
+            for r in chosen
+            for n in r.needs
+            if n not in seen and any(d.total or d.needs for d in _defs(rules, n))
+        ]
+        if deeper:
+            seen.update(deeper)
+            notes.append(
+                f"{_short(need, _NAME_CHARS_SHOWN)} also depends on {_names(deeper)}, which are not shown"
+            )
+    if unread:
+        notes.append(
+            f"{_names(unread)} (before {_short(target, _NAME_CHARS_SHOWN)}) could not be read: {fname} has no rule "
+            f"for {'it' if len(unread) == 1 else 'them'}"
+        )
+    return view
+
+
+def _runner_lines(root: Path, chk) -> _View:
+    """What a task-runner check will run, as a _View of (where, text) pairs (text whitespace-collapsed and bounded; at
+    most _BODY_LINES_SCANNED per recipe). An empty view for a check that is no such call. For a task-runner check whose
+    text cannot be found or told (an unreadable or invalid manifest, `--prefix`, `-C`, a workspace, a missing target) the
+    view carries the note "could not read what this runs". Reads one small regular file. Never raises."""
+    view = _View()
     try:
         target = _runner_target(chk.argv)
-        if target is None:
-            return []
-        from . import verify
-
+    except Exception:  # noqa: BLE001
+        return view
+    if target is None:
+        return view
+    try:
         tool, name = target
-        base = verify._resolve_cwd(Path(root), chk.cwd)
-        return _node_lines(base, name) if tool in _NODE_TOOLS else _task_lines(base, tool, name)
-    except Exception:  # noqa: BLE001 - what cannot be shown is not shown
-        return []
+        if name is not None:
+            from . import verify
+
+            base = verify._resolve_cwd(Path(root), chk.cwd)
+            got = _node_lines(base, name) if tool in _NODE_TOOLS else _task_lines(base, tool, name)
+            if got is not None:
+                return got
+    except Exception:  # noqa: BLE001 - what cannot be shown is said, not shown
+        pass
+    view.notes.append(_UNREADABLE)
+    return view
 
 
-def _body_lines(view: list[tuple[str, str]], indent: str) -> list[str]:
-    """The first lines of a check's script as screen lines (through safe_text, each cut to 100 characters)."""
+def _body_lines(view, indent: str) -> list[str]:
+    """The first lines of a check's script as screen lines (through safe_text, each cut to 100 characters): the first
+    three of its own, the first of each prerequisite, how many more there are, and the view's notes in parentheses."""
     from . import verify
 
+    own = [e for e in view if not e[0].startswith(_AFTER)]
+    shown = own[:_BODY_LINES_SHOWN]
+    firsts: dict[str, tuple[str, str]] = {}
+    for entry in view:
+        if entry[0].startswith(_AFTER):
+            firsts.setdefault(entry[0], entry)
+    shown += list(firsts.values())
     lines = []
-    for where, text in view[:_BODY_LINES_SHOWN]:
-        shown = verify.safe_text(text)
-        if len(shown) > _BODY_CHARS_SHOWN:
-            shown = shown[: _BODY_CHARS_SHOWN - 3] + "..."
-        lines.append(f"{indent}{verify.safe_text(where)}: {shown}")
-    if lines and len(view) > _BODY_LINES_SHOWN:
-        lines[-1] += f"   (+{len(view) - _BODY_LINES_SHOWN} more lines in the file)"
+    for where, text in shown:
+        text = verify.safe_text(text)
+        text = _short(text, _BODY_CHARS_SHOWN)
+        lines.append(f"{indent}{_short(verify.safe_text(where), _WHERE_CHARS_SHOWN)}: {text}")
+    more = len(view) + getattr(view, "unseen", 0) - len(shown)
+    if lines and more > 0:
+        lines[-1] += f"   (+{more} more lines in the file)"
+    for note in getattr(view, "notes", None) or []:
+        lines.append(f"{indent}({_short(verify.safe_text(str(note)), _NOTE_CHARS_SHOWN)})")
     return lines
 
 
-_SUSPICIOUS: list = []  # (compiled pattern, what it means), built on first use
+def _unshown(views) -> bool:
+    """Is there a check whose script could not be shown in full (a note under it)?"""
+    return any(getattr(view, "notes", None) for view in views)
 
 
-def _suspicious_patterns() -> list:
+# ---- the suspicious-script scan ----------------------------------------------------------------------------------
+# Every check below is linear in the length of the text, whatever the text is: a regular expression has no nested
+# quantifier over a repeating token, and what needs more than a pattern (rm, .env) walks the words of the line once.
+# Each line is looked at up to _SCAN_CHARS characters, and one call has a time budget on top of that.
+_SUSPICION_BUDGET_S = 0.25
+_ENV_TEMPLATES = frozenset(
+    {"example", "sample", "template", "dist", "test", "tpl"}
+)  # ".env.example" holds no secret
+# commands that read a file's content (and so read the secrets in a .env file); cp, mv and the like do not
+_READERS = frozenset(
+    {
+        "cat", "type", "more", "less", "head", "tail", "tac", "nl", "source", ".", "get-content", "gc", "strings",
+        "xxd", "od", "hexdump", "grep", "egrep", "fgrep", "rg", "awk", "sed", "cut", "sort", "base64", "tar", "zip",
+        "scp", "rsync", "curl", "wget",
+    }
+)  # fmt: skip
+_SUSPICIOUS: list = []  # (what it means, find(text) -> index of the match or None), built on first use
+
+
+def _rx_find(rx):
+    def find(text: str) -> int | None:
+        m = rx.search(text)
+        return m.start() if m else None
+
+    return find
+
+
+def _env_file(word: str) -> bool:
+    """Is this word (a path, `@path` of curl -d, `key=@path`) a .env file with secrets in it, not a template of one?"""
+    word = word.strip("\"'").rpartition("@")[2].strip("\"'")
+    name = word.replace("\\", "/").rsplit("/", 1)[-1].lower()
+    return name == ".env" or (name.startswith(".env.") and name[5:] not in _ENV_TEMPLATES)
+
+
+def _find_env_read(text: str) -> int | None:
+    """Index of a .env file that a command reads (cat, type, source, Get-Content, curl -d @ ...), or None. `cp .env.example
+    .env`, `dotenv -e .env.test -- jest` and a mention in a comment read nothing."""
+    import re
+
+    for seg in re.finditer(r"[^;&|`()]+", text):
+        reading = False
+        for word in re.finditer(r"\S+", seg.group()):
+            w = word.group()
+            if w.startswith("<"):  # input redirection: `jest < .env`
+                reading = True
+                w = w.lstrip("<")
+                if not w:
+                    continue
+            if reading and _env_file(w):
+                return seg.start() + word.start()
+            if _tool_name(w.strip("\"'")) in _READERS:
+                reading = True
+    return None
+
+
+def _root_operand(word: str) -> bool:
+    """Is this word / or ~ or $HOME (a trailing / and * allowed), the places `rm -r` must never be pointed at?"""
+    w = word.strip("\"'")
+    if w.endswith("*"):
+        w = w[:-1]
+    if w.endswith("/") and len(w) > 1:
+        w = w[:-1]
+    return w.lower() in ("/", "~", "$home", "${home}")
+
+
+def _find_rm_everything(text: str) -> int | None:
+    """Index of an `rm` that is recursive and has / ~ or $HOME among its operands (`rm -rf /`, `rm -r -f ~/`, `rm
+    --recursive /*`, `sudo rm -rf $HOME`), or None. One pass over the words: the flags may come before or after the operand."""
+    import re
+
+    for seg in re.finditer(r"[^;&|`()]+", text):
+        start = recursive = root = None
+        done_with_flags = False
+        for word in re.finditer(r"\S+", seg.group()):
+            w = word.group().strip("\"'")
+            if start is None:
+                if _tool_name(w) == "rm":
+                    start = seg.start() + word.start()
+                continue
+            if w == "--":
+                done_with_flags = True
+            elif w.startswith("-") and not done_with_flags:
+                low = w.lower()
+                if low == "--recursive" or (
+                    not low.startswith("--")
+                    and low[1:].isascii()
+                    and low[1:].isalpha()
+                    and "r" in low[1:]
+                ):
+                    recursive = True
+            elif _root_operand(w):
+                root = True
+        if start is not None and recursive and root:
+            return start
+    return None
+
+
+def _suspicious_checks() -> list:
     if not _SUSPICIOUS:
         import re
 
-        tail = r"""(?=[\s;&|'"]|$)"""
-        for what, pattern in (
+        word = r"(?<![\w./\\$=-])(?:{})(?:\.exe)?(?![\w=./\\-])"
+        local = r"(?:localhost|127\.0\.0\.1|0\.0\.0\.0|\[::1\]|host\.docker\.internal)"
+        for what, find in (
             (
                 "fetches or sends data",
-                r"\b(?:curl|wget|invoke-webrequest|invoke-restmethod|iwr|irm|certutil|bitsadmin|nc|ncat|netcat)\b",
+                _rx_find(
+                    re.compile(
+                        r"\b(?:curl|wget|invoke-webrequest|invoke-restmethod|iwr|irm|certutil|bitsadmin)\b",
+                        re.IGNORECASE,
+                    )
+                ),
             ),
             (
                 "fetches or sends data",
-                r"""https?://(?!(?:localhost|127\.0\.0\.1)(?::\d+)?(?:[/?#\s'"]|$))[^\s'"]+""",
+                # nc, ncat, netcat as a program: not NC=1, not a file called nc.md, not part of a longer word
+                _rx_find(re.compile(word.format("nc|ncat|netcat"))),
+            ),
+            (
+                "fetches or sends data",
+                _rx_find(
+                    re.compile(
+                        r"https?://(?!" + local + r"""(?::\d+)?(?:[/?#\s'"]|$))[^\s'"]+""",
+                        re.IGNORECASE,
+                    )
+                ),
             ),
             (
                 "downloads or decodes code and runs it",
-                r"\|\s*(?:sh|bash|zsh|powershell|pwsh|iex)\b|\b(?:iex|invoke-expression|eval|base64)\b"
-                r"|\s-(?:enc|encodedcommand)\b",
+                _rx_find(
+                    re.compile(
+                        r"\|\s*(?:sh|bash|zsh|powershell|pwsh|iex)\b|\b(?:iex|invoke-expression|eval)\b"
+                        r"|\s-(?:enc|encodedcommand)\b",
+                        re.IGNORECASE,
+                    )
+                ),
+            ),
+            (
+                "downloads or decodes code and runs it",
+                # base64 as a program (or a module): not a file called base64.test.js
+                _rx_find(re.compile(word.format("base64"), re.IGNORECASE)),
             ),
             (
                 "reaches for credentials or keys",
-                r"\.(?:ssh|aws|gnupg|netrc|npmrc)\b|\bcredentials\b|\bid_(?:rsa|ed25519)\b|(?<!\w)\.env\b",
+                _rx_find(
+                    re.compile(
+                        r"\.(?:ssh|aws|gnupg|netrc|npmrc)\b|\bcredentials\b|\bid_(?:rsa|ed25519)\b",
+                        re.IGNORECASE,
+                    )
+                ),
             ),
-            (
-                "deletes everything under / or your home folder",
-                r"""\brm\s+(?:-[a-z-]+\s+)*?(?:-[a-z]*r[a-z]*|--recursive)\s+(?:-[a-z-]+\s+)*["']?"""
-                r"""(?:/|~|\$HOME|\$\{HOME\})/?\*?""" + tail,
-            ),
+            ("reaches for credentials or keys", _find_env_read),
+            ("deletes everything under / or your home folder", _find_rm_everything),
         ):
-            _SUSPICIOUS.append((re.compile(pattern, re.IGNORECASE), what))
+            _SUSPICIOUS.append((what, find))
     return _SUSPICIOUS
 
 
@@ -661,21 +1205,36 @@ def _suspicion(texts) -> str | None:
     """A plain clause ("A script below fetches or sends data (curl ...)") when one of the texts (script lines, command
     lines) looks like it fetches or sends data, runs what it decodes or downloads, reaches for credentials or deletes
     broadly, or is too long to look through; else None. Conservative on purpose: a match only turns the default answer
-    to No. Bounded (each text is looked at up to _SCAN_CHARS characters, and a longer one is itself the finding, so
-    padding cannot hide a command), never raises."""
+    to No. Bounded in every direction: each text is looked at up to _SCAN_CHARS characters (a longer one is itself the
+    finding, so padding cannot hide a command), at most _SCAN_TEXTS texts are looked at, and the whole call has
+    _SUSPICION_BUDGET_S seconds; running out of either is "too long to read" (the default answer is No). Never raises."""
     try:
         from . import verify
 
-        unique = list(dict.fromkeys(str(t) for t in list(texts)[:1000]))
-        bounded = [t[:_SCAN_CHARS] for t in unique]
-        for rx, what in _suspicious_patterns():
+        checks = _suspicious_checks()  # built (and its patterns compiled) before the budget starts
+        started = time.monotonic()
+        every = list(texts)
+        bounded: dict[str, None] = {}
+        too_long = False
+        for t in every[:_SCAN_TEXTS]:
+            s = str(t)
+            too_long = too_long or len(s) > _SCAN_CHARS
+            bounded.setdefault(s[:_SCAN_CHARS])
+        if len(every) > _SCAN_TEXTS:
+            return f"A script below is too long to read here (more than {_SCAN_TEXTS} lines)"
+        for what, find in checks:
             for text in bounded:
-                m = rx.search(text)
-                if m:
-                    snippet = text[m.start() : m.start() + 60]
-                    more = "..." if len(text) > m.start() + 60 else ""
+                if time.monotonic() - started > _SUSPICION_BUDGET_S:
+                    return (
+                        f"A script below is too long to read here (looking through it took more than "
+                        f"{_SUSPICION_BUDGET_S:g} seconds)"
+                    )
+                at = find(text)
+                if at is not None:
+                    snippet = text[at : at + 60]
+                    more = "..." if len(text) > at + 60 else ""
                     return f"A script below {what} ({verify.safe_text(snippet)}{more})"
-        if any(len(t) > _SCAN_CHARS for t in unique):
+        if too_long:
             return f"A script below is very long (over {_SCAN_CHARS} characters, more than can be read here)"
     except Exception:  # noqa: BLE001 - cannot tell is handled by the caller's other checks
         return None
@@ -883,6 +1442,7 @@ WHY_TIMEOUT = "did not finish within"
 WHY_FAILING = "failing today"
 WHY_EDITS = "it edits tracked files (a check that rewrites files cannot run after every turn)"
 _SIGNATURE_PATHS = 200
+_SIGNATURE_BYTES = 1024 * 1024
 _SIGNATURE_TIMEOUT_S = 5.0
 
 
@@ -899,11 +1459,36 @@ def _why_kind(why: str) -> str:
     return "skipped"
 
 
+def _file_picture(path: str):
+    """What one listed path holds: (size, sha256 of the first _SIGNATURE_BYTES bytes) for a regular file, the target for
+    a symbolic link, the kind for anything else; None for a path that is gone. Content, not modification time: a check
+    that only touches a file, or rewrites it with the same bytes, leaves it as it was."""
+    from . import verify
+
+    try:
+        st = os.lstat(path)
+    except OSError:
+        return None  # a deleted file is part of the picture
+    if stat.S_ISLNK(st.st_mode):
+        try:
+            return ("link", os.readlink(path))
+        except OSError:
+            return ("link", None)
+    if not stat.S_ISREG(st.st_mode):
+        return ("kind", stat.S_IFMT(st.st_mode))
+    try:
+        data, _more = verify._read_file(path, _SIGNATURE_BYTES)
+    except OSError:
+        return (st.st_size, None)
+    return (st.st_size, _sha256_hex(data))
+
+
 def _tracked_signature(root: Path):
-    """What the tracked part of the work tree looks like right now: `git status` without untracked files, plus the
-    (mtime, size) of the first _SIGNATURE_PATHS paths it lists. A rewritten tracked file moves it, whether it was clean
-    or already modified; a new untracked or ignored file (a cache, __pycache__) does not. None when it cannot be told
-    (no git, git failed or timed out, too much output): then nothing is detected. Never raises."""
+    """What the tracked part of the work tree looks like right now: `git status` without untracked files, plus what the
+    first _SIGNATURE_PATHS paths it lists hold (_file_picture: size and a hash of the start, not the modification time).
+    A rewritten tracked file moves it, whether it was clean or already modified; a file that was only touched, a new
+    untracked or ignored file (a cache, __pycache__) does not. None when it cannot be told (no git, git failed or timed
+    out, too much output): then nothing is detected. Never raises."""
     try:
         from . import verify
 
@@ -918,14 +1503,11 @@ def _tracked_signature(root: Path):
         )
         if got is None or got[1]:
             return None
-        stats = []
-        for _code, rel in verify._status_entries(got[0])[:_SIGNATURE_PATHS]:
-            try:
-                st = os.lstat(os.path.join(root, rel))
-                stats.append((rel, st.st_mtime_ns, st.st_size))
-            except OSError:
-                stats.append((rel, None, None))  # a deleted file is part of the picture
-        return got[0], tuple(stats)
+        pictures = [
+            (rel, _file_picture(os.path.join(root, rel)))
+            for _code, rel in verify._status_entries(got[0])[:_SIGNATURE_PATHS]
+        ]
+        return got[0], tuple(pictures)
     except Exception:  # noqa: BLE001
         return None
 
@@ -1212,12 +1794,13 @@ def disable(root: Path) -> bool:
 def offer_now(root: Path, cfg, say, *, explicit: bool = False) -> str:
     """Look at this repository's state, show the right screen, ask, act. Returns what happened:
 
-    enabled | declined | not-now (EOF / Ctrl-C / nobody answered) | already-on | nothing-to-offer |
-    declined-before (silent) | removed-before (silent: it was turned on and the file was deleted) | none-pass |
-    unavailable (invalid recipe) | failed | refused.
+    enabled | declined | later (Enter on a screen whose default was No: asked again in a week) |
+    not-now (EOF / Ctrl-C / nobody answered) | already-on | nothing-to-offer | declined-before (silent) |
+    snoozed (silent: a "later" that is still running) | removed-before (silent: it was turned on and the file was
+    deleted) | none-pass | unavailable (invalid recipe) | failed | refused.
 
-    `explicit` is `claude-hr-ctl verify enable`: the person asked, so an earlier "no" does not silence it and every
-    outcome is explained; the launcher passes False and stays quiet unless it really asks."""
+    `explicit` is `claude-hr-ctl verify enable`: the person asked, so an earlier "no" or "later" does not silence it
+    and every outcome is explained; the launcher passes False and stays quiet unless it really asks."""
     from . import verify
 
     sdir = paths.state_dir()
@@ -1241,17 +1824,23 @@ def offer_now(root: Path, cfg, say, *, explicit: bool = False) -> str:
                 f"{verify.config_path(root)} is not valid; fix it, then run claude-hr-ctl verify enable"
             )
         return "unavailable"
-    entry = decision_for(root)
-    declined = entry is not None and entry.get("decision") == "declined"
-    removed = entry is not None and entry.get("decision") == "enabled"
+    entry = _entry_for(root)
+    decision = entry.get("decision") if entry is not None else None
+    declined = decision == "declined"
+    removed = decision == "enabled"
     if state == "no-config":
         if (declined or removed) and not explicit:
             # a person who turned it on and then deleted the file (the README's way to remove it) is not asked again
             return "declined-before" if declined else "removed-before"
+        if not explicit and _snoozed(entry) and not entry.get("recipe_sha"):
+            return "snoozed"
         return _offer_new(root, cfg, say, explicit)
-    if declined and not explicit and entry.get("recipe_sha") == loaded.sha256:
-        return "declined-before"
-    return _offer_existing(root, cfg, say, loaded, state)
+    if not explicit and entry is not None and entry.get("recipe_sha") == loaded.sha256:
+        if declined:
+            return "declined-before"
+        if _snoozed(entry):
+            return "snoozed"
+    return _offer_existing(root, cfg, say, loaded, state, explicit)
 
 
 def _start_folder() -> str | None:
@@ -1289,6 +1878,27 @@ def _none_pass_text(left_out: list) -> tuple[str, str]:
     )
 
 
+def _timeout_note(explicit: bool) -> str:
+    """What is printed when nobody answers: the launcher's question is on the way to starting Claude, the command is not."""
+    return human.TIMEOUT_NOTE if explicit else human.LAUNCHER_TIMEOUT_NOTE
+
+
+def _later(root: Path, say, recipe_sha: str | None = None) -> str:
+    """A bare Enter on a screen whose default was No is "not now", not a no: ask again in LATER_ENTER_DAYS days (an
+    explicit n or no is the permanent decline)."""
+    reason = "Enter, and No was the default"
+    if recipe_sha:
+        record(root, _LATER, recipe_sha=recipe_sha, days=LATER_ENTER_DAYS, reason=reason)
+    else:
+        record(root, _LATER, days=LATER_ENTER_DAYS, reason=reason)
+    again = _when({"at": int(time.time())}, "at", LATER_ENTER_DAYS)
+    say(
+        f"Okay, not now. claude-hr asks again after {again}; "
+        "to turn it on sooner: claude-hr-ctl verify enable"
+    )
+    return "later"
+
+
 def _offer_new(root: Path, cfg, say, explicit: bool) -> str:
     from . import verify
 
@@ -1317,11 +1927,24 @@ def _offer_new(root: Path, cfg, say, explicit: bool) -> str:
         default_yes = False
         say("")
         say(f"{alarm}, so the default answer is No.")
-    answer = human.ask_yes_no("Turn it on?", default_yes, tell=say)
+    if _unshown(views):
+        default_yes = False
+        say("")
+        say(
+            "What at least one of these checks runs could not be shown in full (see the lines in parentheses), "
+            "so the default answer is No."
+        )
+    answer, how = human.ask(
+        "Turn it on?", default_yes, tell=say, timeout_note=_timeout_note(explicit)
+    )
     if answer is None:
+        if how == "timeout" and not explicit:
+            record(root, _LATER, days=LATER_TIMEOUT_DAYS, reason="nobody answered the question")
         say("")
         return "not-now"
     if not answer:
+        if how == "enter":
+            return _later(root, say)
         record(root, "declined")
         say("Okay, not turning it on. To change your mind later: claude-hr-ctl verify enable")
         return "declined"
@@ -1332,7 +1955,7 @@ def _offer_new(root: Path, cfg, say, explicit: bool) -> str:
         text, reason = _none_pass_text(result.left_out)
         say("")
         say(text)
-        record(root, "declined", reason=reason)
+        record(root, _LATER, days=LATER_NONE_PASS_DAYS, reason=reason)
         return "none-pass"
     if result.status == "failed":
         if verify.trust_state(root, paths.state_dir()) == "trusted":
@@ -1344,7 +1967,7 @@ def _offer_new(root: Path, cfg, say, explicit: bool) -> str:
     return "refused"
 
 
-def _offer_existing(root: Path, cfg, say, loaded, state: str) -> str:
+def _offer_existing(root: Path, cfg, say, loaded, state: str, explicit: bool = False) -> str:
     """A recipe exists in the folder but nobody approved these exact bytes: a clone that ships one, or an edit."""
     from . import verify
 
@@ -1375,18 +1998,33 @@ def _offer_existing(root: Path, cfg, say, loaded, state: str) -> str:
         say(f"{alarm}.")
     say(f"file sha256: {loaded.sha256}")
     # nothing is cut from the list above (a hidden command is worse than a long screen): with many checks the question
-    # says how many there are, so the length of what was printed is not a surprise
-    count = len(loaded.recipe.fast) + len(loaded.recipe.full)
+    # says how many there are, so the length of what was printed is not a surprise. A [[full]] check that repeats a
+    # [[fast]] one is one command, shown once
+    distinct: list = []
+    for chk in (*loaded.recipe.fast, *loaded.recipe.full):
+        if chk not in distinct:
+            distinct.append(chk)
+    count = len(distinct)
     question = (
         f"Run these {count} checks after every turn?"
         if count > 12
         else "Run these checks after every turn?"
     )
-    answer = human.ask_yes_no(question, False, tell=say)
+    answer, how = human.ask(question, False, tell=say, timeout_note=_timeout_note(explicit))
     if answer is None:
+        if how == "timeout" and not explicit:
+            record(
+                root,
+                _LATER,
+                recipe_sha=loaded.sha256,
+                days=LATER_TIMEOUT_DAYS,
+                reason="nobody answered the question",
+            )
         say("")
         return "not-now"
     if not answer:
+        if how == "enter":
+            return _later(root, say, loaded.sha256)
         record(root, "declined", recipe_sha=loaded.sha256)
         say("Okay, they will not run. To approve them later: claude-hr-ctl verify enable")
         return "declined"
@@ -1416,10 +2054,22 @@ def status_hint(root: Path, state: str, cfg=None) -> str | None:
     on (an earlier no, since changed by `verify trust` or a second terminal, is history)."""
     if state == "trusted":
         return None
-    entry = decision_for(root)
+    entry = _entry_for(root)
     if entry is not None and entry.get("decision") == "declined":
         reason = f" ({entry['reason']})" if entry.get("reason") else ""
         return f"declined on {_when(entry)}{reason}: run claude-hr-ctl verify enable to turn the checks on"
+    days = _snooze_days(entry)
+    if days is not None:
+        reason = f" ({entry['reason']})" if entry.get("reason") else ""
+        if _snoozed(entry):
+            return (
+                f"asked on {_when(entry, 'at')}{reason}, will ask again after {_when(entry, 'at', days)}: "
+                "run claude-hr-ctl verify enable to turn the checks on now"
+            )
+        return (
+            f"asked on {_when(entry, 'at')}{reason}, will ask again the next time you start Claude here in a "
+            "terminal: or run claude-hr-ctl verify enable now"
+        )
     if state == "no-config":
         if entry is not None and entry.get("decision") == "enabled":
             return "turned on earlier, the file was removed: claude-hr-ctl verify enable turns it on again"
