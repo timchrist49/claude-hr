@@ -50,6 +50,34 @@ def iter_which(name: str, path: str | None = None):
                 yield Path(cand)
 
 
+def _env_path(env: dict[str, str] | None) -> str:
+    """PATH of `env` (case-insensitive key on Windows, where os.environ's own key is `Path`), else of this process."""
+    if env is None:
+        return os.environ.get("PATH", "")
+    for key, value in env.items():
+        if key.upper() == "PATH":
+            return value
+    return ""
+
+
+def resolve_exe(name: str, env: dict[str, str] | None = None) -> str | None:
+    """Absolute path of the bare command `name`, searched ONLY through absolute PATH entries; a name that already has a
+    path separator is returned as given (the caller chose it).
+
+    Never the current directory: on Windows CreateProcess (and shutil.which) look there before PATH, and the current
+    directory of a hook or of `claude-hr-ctl` run from a freshly cloned repository is attacker-controlled (a committed
+    `git.exe` would run on every `git` call). Relative and empty PATH entries are skipped for the same reason on every OS.
+    """
+    if os.sep in name or (os.altsep and os.altsep in name):
+        return name
+    absolute = os.pathsep.join(
+        d for d in _env_path(env).split(os.pathsep) if d and os.path.isabs(d)
+    )
+    for found in iter_which(name, absolute):
+        return str(found)
+    return None
+
+
 def which_all(name: str, path: str | None = None) -> list[Path]:
     """Every executable called `name` on PATH, in order (shutil.which only returns the first)."""
     return list(iter_which(name, path))
@@ -122,6 +150,11 @@ def run(
         extra["creationflags"] = (
             0x08000000  # CREATE_NO_WINDOW: pythonw-run jobs would otherwise flash a console per call
         )
+    if cmd:
+        exe = resolve_exe(str(cmd[0]), env)  # never from the current directory (see resolve_exe)
+        if exe is None:
+            return subprocess.CompletedProcess(cmd, 127, "", f"{cmd[0]}: not found on PATH")
+        cmd = [exe, *cmd[1:]]
     try:
         return subprocess.run(
             cmd,

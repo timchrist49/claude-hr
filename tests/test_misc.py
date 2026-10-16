@@ -541,3 +541,45 @@ def test_doctor_flags_a_self_update_that_did_not_finish(sandbox, monkeypatch):
     )
     (d / "__init__.py").write_text('__version__ = "0.0.1"\n', encoding="utf-8")
     assert not [c for c in doctor.run(config.load(), Path.cwd()) if c.name == "claude-hr version"]
+
+
+def test_resolve_exe_never_searches_the_current_directory(tmp_path, monkeypatch):
+    """A cloned repo that commits git.exe must not get it run by `claude-hr-ctl` (CreateProcess looks in the cwd first)."""
+    import os
+    import stat
+    import sys
+
+    from claude_hr import procutil
+
+    exe = "planted.exe" if os.name == "nt" else "planted"
+    planted = tmp_path / "repo" / exe
+    planted.parent.mkdir()
+    planted.write_bytes(b"")
+    planted.chmod(planted.stat().st_mode | stat.S_IXUSR)
+    elsewhere = tmp_path / "bin"
+    elsewhere.mkdir()
+    monkeypatch.chdir(planted.parent)
+    for path_value in (str(elsewhere), "", os.pathsep.join([".", str(elsewhere)]), "relative/dir"):
+        monkeypatch.setenv("PATH", path_value)
+        assert procutil.resolve_exe("planted") is None, path_value
+    r = procutil.run(["planted", "--version"])
+    assert r.returncode == 127 and "not found on PATH" in r.stderr
+    monkeypatch.setenv("PATH", str(planted.parent))  # an ABSOLUTE PATH entry is a deliberate choice
+    assert procutil.resolve_exe("planted") == str(planted)
+    assert procutil.resolve_exe(str(planted)) == str(planted)  # explicit paths pass through
+    r = procutil.run([sys.executable, "-c", "print(1)"])  # and real commands still run
+    assert r.returncode == 0 and r.stdout.strip() == "1"
+
+
+def test_resolve_exe_uses_the_path_of_the_env_it_is_given(tmp_path):
+    import os
+    import stat
+
+    from claude_hr import procutil
+
+    exe = "tool.exe" if os.name == "nt" else "tool"
+    (tmp_path / exe).write_bytes(b"")
+    (tmp_path / exe).chmod((tmp_path / exe).stat().st_mode | stat.S_IXUSR)
+    key = "Path" if os.name == "nt" else "PATH"
+    assert procutil.resolve_exe("tool", {key: str(tmp_path)}) == str(tmp_path / exe)
+    assert procutil.resolve_exe("tool", {"UNRELATED": "x"}) is None
