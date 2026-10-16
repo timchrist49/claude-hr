@@ -2,7 +2,9 @@
 folders, editor settings, Dependabot, CODEOWNERS, REVIEW.md and a hardened CI skeleton.
 
 Why it is safe to run anywhere: plan() only reads the repository, and apply() only creates files that are absent, so
-a repo's own choices always win and a second run changes nothing. Nothing here touches git state or the network.
+a repo's own choices always win and a second run changes nothing. Nothing here touches git state or the network. The
+repository is untrusted input: git is found through PATH only (never the current directory), and package.json,
+pyproject.toml and setup.cfg are read only when they are regular files of at most 1 MB.
 
 Templates live in data/repo-template/ under non-dot names (wheels and some tools treat dot-directories specially);
 _FILES maps each template to the path it is written to.
@@ -15,6 +17,7 @@ import json
 import os
 import re
 import shlex
+import stat
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -22,8 +25,10 @@ from pathlib import Path
 from . import paths, procutil
 
 GROUPS = ("github", "docs", "editor", "dependabot", "codeowners", "review", "ci")
+# GitHub reads .github/ (issue forms, PR template, CODEOWNERS, Dependabot, workflows) only from the top level of the repository
+ROOT_ONLY_GROUPS = ("github", "dependabot", "codeowners", "ci")
 
-# group -> (destination in the repo, template under data/repo-template/); dependabot, codeowners and ci are built below
+# group ->(destination in the repo, template under data/repo-template/); dependabot, codeowners and ci are built below
 _FILES: dict[str, tuple[tuple[str, str], ...]] = {
     "github": (
         (".github/ISSUE_TEMPLATE/bug.yml", "github/ISSUE_TEMPLATE/bug.yml"),
@@ -61,9 +66,18 @@ _SETUP_TEMPLATES = {
     "node": "github/workflows/steps-node.yml",
     "go": "github/workflows/steps-go.yml",
 }
+# Tools the discovered commands may start with that the runner does not have: a setup action installs them
+_TOOL_SETUP_TEMPLATES = {
+    "uv": "github/workflows/steps-uv.yml",
+    "bun": "github/workflows/steps-bun.yml",
+}
+# Commands the skeleton cannot make work on a fresh runner; they are left out and a note says so
+_NOT_PROVISIONED = frozenset({"just"})
 _PIP_TOOLS = frozenset({"pytest", "ruff", "mypy", "pyright", "black", "flake8", "isort"})
 _REQUIREMENT_NAME = re.compile(r"^[A-Za-z0-9._-]*requirements[A-Za-z0-9._-]*\.txt$")
 _MAX_COMMANDS = 12
+# package.json / pyproject.toml / setup.cfg come from the repository being scaffolded, so they are read like untrusted input
+_MAX_MANIFEST_BYTES = 1_000_000
 # inherited when run from inside a git hook; they would point git at a different repository than `cwd`
 _GIT_ENV_DROP = ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_COMMON_DIR")
 
@@ -118,9 +132,60 @@ class _Repo:
 
     def __init__(self, root: Path):
         self.root = root
+        self.notes: list[
+            str
+        ] = []  # problems with the repository's own files; plan_with_notes shows them
 
     def has(self, rel: str) -> bool:
         return os.path.lexists(self.root / rel)
+
+    def _note(self, text: str) -> None:
+        if text not in self.notes:
+            self.notes.append(text)
+
+    def _read_manifest(self, name: str) -> bytes | None:
+        """The bytes of a top-level repository file, or None. Only a regular file of at most _MAX_MANIFEST_BYTES is read:
+        a committed symlink to /dev/zero (or a FIFO, or a multi-gigabyte file) must not hang or exhaust memory."""
+        path = self.root / name
+        try:
+            if not stat.S_ISREG(os.stat(path).st_mode):
+                self._note(f"ci: {name} is not a regular file, so it was not read")
+                return None
+            with open(path, "rb") as fh:
+                if not stat.S_ISREG(
+                    os.fstat(fh.fileno()).st_mode
+                ):  # it changed between the check and the open
+                    self._note(f"ci: {name} is not a regular file, so it was not read")
+                    return None
+                data = fh.read(_MAX_MANIFEST_BYTES + 1)
+        except (FileNotFoundError, NotADirectoryError):
+            return None
+        except OSError as exc:
+            self._note(
+                f"ci: {name} could not be read ({exc.__class__.__name__}), so it was ignored"
+            )
+            return None
+        if len(data) > _MAX_MANIFEST_BYTES:
+            self._note(
+                f"ci: {name} is larger than {_MAX_MANIFEST_BYTES // 1000} KB, so it was ignored"
+            )
+            return None
+        return data
+
+    def _parse(self, name: str, loader) -> dict:
+        """A hostile or broken file degrades to 'nothing detected' plus a note; it never raises."""
+        data = self._read_manifest(name)
+        if data is None:
+            return {}
+        try:
+            value = loader(data)
+        except RecursionError:  # deeply nested arrays: json and tomllib recurse
+            self._note(f"ci: {name} is nested too deeply to read, so it was ignored")
+            return {}
+        except ValueError:  # includes UnicodeDecodeError
+            self._note(f"ci: {name} is not valid, so it was ignored")
+            return {}
+        return value if isinstance(value, dict) else {}
 
     @functools.cached_property
     def requirements(self) -> list[str]:
@@ -132,23 +197,43 @@ class _Repo:
 
     @functools.cached_property
     def pyproject(self) -> dict:
-        try:
-            with open(self.root / "pyproject.toml", "rb") as fh:
-                import tomllib  # only when there is a file to parse
+        def load(data: bytes):
+            import tomllib  # only when there is a file to parse
 
-                data = tomllib.load(fh)
-        except (OSError, ValueError):
-            return {}
-        return data if isinstance(data, dict) else {}
+            return tomllib.loads(data.decode("utf-8"))
+
+        return self._parse("pyproject.toml", load)
 
     @functools.cached_property
     def package_json(self) -> dict:
-        try:
-            with open(self.root / "package.json", encoding="utf-8") as fh:
-                data = json.load(fh)
-        except (OSError, ValueError):
-            return {}
-        return data if isinstance(data, dict) else {}
+        return self._parse("package.json", json.loads)
+
+    @functools.cached_property
+    def setup_cfg(self) -> str:
+        data = self._read_manifest("setup.cfg")
+        return data.decode("utf-8", "replace") if data else ""
+
+    @functools.cached_property
+    def python_tool(self) -> dict:
+        tool = self.pyproject.get("tool")
+        return tool if isinstance(tool, dict) else {}
+
+    @functools.cached_property
+    def pytest_ready(self) -> bool:
+        """pytest has something to run: a tests directory with Python files, or its own configuration (`pytest` exits 5, a
+        failure, when it collects nothing)."""
+        from . import verify
+
+        return (
+            "pytest" in self.python_tool
+            or self.has("pytest.ini")
+            or "[tool:pytest]" in self.setup_cfg
+            or any(verify._has_py_files(self.root / d) for d in ("tests", "test"))
+        )
+
+    @functools.cached_property
+    def ruff_configured(self) -> bool:
+        return "ruff" in self.python_tool or self.has("ruff.toml") or self.has(".ruff.toml")
 
     @functools.cached_property
     def python(self) -> bool:
@@ -192,9 +277,40 @@ class _Repo:
 
     @functools.cached_property
     def node_pm(self) -> str:
-        if self.has("pnpm-lock.yaml"):
-            return "pnpm"
-        return "yarn" if self.has("yarn.lock") else "npm"
+        """The package manager the verify recipe discovery picks (lock files, bun, then the packageManager field): the
+        commands it proposes and the install step this workflow writes must name the same tool."""
+        from . import verify
+
+        return verify._node_pm(self.root, self.package_json)
+
+    @functools.cached_property
+    def has_issue_templates(self) -> bool:
+        """The repo already has issue templates GitHub would show: ISSUE_TEMPLATE/ (any .md/.yml/.yaml, config.yml included) or a
+        single ISSUE_TEMPLATE.md, at the root, in docs/ or in .github/. Names are matched case-insensitively."""
+        for base in (self.root, self.root / ".github", self.root / "docs"):
+            try:
+                with os.scandir(base) as it:
+                    for entry in it:
+                        low = entry.name.lower()
+                        if low in {
+                            "issue_template.md",
+                            "issue_template.yml",
+                            "issue_template.yaml",
+                        }:
+                            return True
+                        if low == "issue_template" and self._has_template_files(entry.path):
+                            return True
+            except OSError:
+                continue
+        return False
+
+    @staticmethod
+    def _has_template_files(directory: str) -> bool:
+        try:
+            with os.scandir(directory) as sub:
+                return any(s.name.lower().endswith((".md", ".yml", ".yaml")) for s in sub)
+        except OSError:
+            return False
 
     @functools.cached_property
     def has_workflows(self) -> bool:
@@ -337,13 +453,36 @@ def _pip_tools(commands: list[list[str]]) -> list[str]:
 
 
 def _default_commands(repo: _Repo, lang: str, notes: list[str]) -> list[list[str]]:
+    """What CI runs for a language when the verify recipe proposed nothing. Only what can pass on a fresh repository: a
+    placeholder test script, a watcher, or pytest with nothing to collect would turn the first push red (or hang it)."""
     if lang == "python":
-        return [["python", "-m", "pytest", "-q"], ["ruff", "check", "."]]
+        out = []
+        if repo.pytest_ready:
+            out.append(["python", "-m", "pytest", "-q"])
+        if repo.ruff_configured:
+            out.append(["ruff", "check", "."])
+        if not out:
+            notes.append(
+                "ci: no tests directory, pytest configuration or ruff configuration found, so the Python "
+                "part of the workflow only installs dependencies (add test and lint steps when they exist)"
+            )
+        return out
     if lang == "node":
+        from . import verify
+
         pm, scripts = repo.node_pm, repo.node_scripts
-        out = [[pm, "test"]] if "test" in scripts else []
-        if "lint" in scripts:
-            out.append([pm, "run", "lint"])
+        out = []
+        for script in ("test", "lint"):
+            body = scripts.get(script)
+            if not isinstance(body, str) or not body.strip():
+                continue
+            if "no test specified" in body or (script == "test" and verify._WATCH_RE.search(body)):
+                notes.append(
+                    f"ci: package.json script '{script}' is a placeholder or a watcher, so it is not run"
+                )
+                continue
+            # `bun test` is bun's own runner, not the package script, so bun always goes through `run`
+            out.append([pm, "test"] if script == "test" and pm != "bun" else [pm, "run", script])
         if not out:
             notes.append(
                 "ci: package.json has no test or lint script, so the workflow only installs dependencies"
@@ -354,26 +493,38 @@ def _default_commands(repo: _Repo, lang: str, notes: list[str]) -> list[list[str
     return [["cargo", "test"]]
 
 
-def _install_command(repo: _Repo, lang: str, commands: list[list[str]]) -> str | None:
+def _toolchain(repo: _Repo, lang: str, commands: list[list[str]]) -> tuple[list[str], str | None]:
+    """(setup actions for tools the runner lacks, install command) for one language; `commands` are what the workflow
+    runs, so a tool is provisioned exactly when something starts with it. Nothing here installs a tool the commands do not use."""
+    tools = {argv[0] for argv in commands}
     if lang == "node":
-        if repo.node_pm == "pnpm":
-            return "corepack enable && pnpm install --frozen-lockfile"
-        if repo.node_pm == "yarn":
-            return "corepack enable && yarn install"
-        return (
-            "npm ci"
-            if repo.has("package-lock.json") or repo.has("npm-shrinkwrap.json")
-            else "npm install"
-        )
+        pm = repo.node_pm
+        if pm == "pnpm":  # corepack ships with Node and reads the packageManager field
+            frozen = "--frozen-lockfile" if repo.has("pnpm-lock.yaml") else "--no-frozen-lockfile"
+            return [], f"corepack enable && pnpm install {frozen}"
+        if pm == "yarn":
+            return [], "corepack enable && yarn install"
+        if pm == "bun":
+            locked = repo.has("bun.lock") or repo.has("bun.lockb")
+            return ["bun"], "bun install --frozen-lockfile" if locked else "bun install"
+        locked = repo.has("package-lock.json") or repo.has("npm-shrinkwrap.json")
+        return [], "npm ci" if locked else "npm install"
     if lang != "python":
-        return None
+        return [], None
+    if (
+        "uv" in tools
+    ):  # uv.lock: uv sync builds the environment (project, dev group) from the lock file
+        return ["uv"], "uv sync --locked"
+    for tool, flags in (("poetry", " --no-interaction"), ("pdm", "")):
+        if tool in tools:
+            return [], f"python -m pip install {tool} && {tool} install{flags}"
     args: list[str] = []
     if repo.python_package:
         args += ["-e", ".[dev]" if repo.has_dev_extra else "."]
     for req in repo.requirements:
         args += ["-r", req]
-    args += _pip_tools(commands) if commands else ["pytest", "ruff"]
-    return shlex.join(["python", "-m", "pip", "install", *args]) if args else None
+    args += _pip_tools(commands)
+    return [], shlex.join(["python", "-m", "pip", "install", *args]) if args else None
 
 
 # ---- group builders: (repo, wanted groups, cleaned commands, notes) -> [(path, content)] ----------------------------
@@ -408,16 +559,33 @@ def _dependabot(repo: _Repo, wanted: frozenset[str], notes: list[str]) -> list[t
     ]
 
 
+def _github(repo: _Repo, notes: list[str]) -> list[tuple[str, str]]:
+    pairs = _static("github", repo)
+    if (
+        repo.has_issue_templates
+    ):  # the repo's own issue templates win: a second set would show up twice in the chooser
+        pairs = [(d, t) for d, t in pairs if not d.startswith(".github/ISSUE_TEMPLATE/")]
+        notes.append("github: issue templates already present, issue forms skipped")
+    return pairs
+
+
 def _codeowners(repo: _Repo, notes: list[str]) -> list[tuple[str, str]]:
     primary = ".github/CODEOWNERS"
+    exists = any(repo.has(p) for p in (primary, *_ALTERNATES[primary]))
     if repo.origin is None:
-        if not any(repo.has(p) for p in (primary, *_ALTERNATES[primary])):
+        if not exists:
             notes.append(
                 "codeowners: skipped, no github.com 'origin' remote to take the owner from "
                 "(add the remote, or write .github/CODEOWNERS by hand)"
             )
         return []
     owner, name = repo.origin
+    if not exists:
+        # offline there is no telling a user account from an organization, and GitHub ignores a bare organization name
+        notes.append(
+            f"codeowners: the owner @{owner} was taken from the origin URL; if {owner} is an organization, edit "
+            f".github/CODEOWNERS to @{owner}/team-name or a person's @username (GitHub ignores a bare organization name)"
+        )
     return [(primary, _render(_template("github/CODEOWNERS"), owner=owner, repo=name))]
 
 
@@ -426,11 +594,20 @@ def _ci(repo: _Repo, commands: list[list[str]], notes: list[str]) -> list[tuple[
     if not langs:
         notes.append("ci: no Python, Node, Go or Rust project found, workflow skipped")
         return []
+    chosen = commands or [c for lang in langs for c in _default_commands(repo, lang, notes)]
+    run_commands = [c for c in chosen if c[0] not in _NOT_PROVISIONED]
+    if len(run_commands) < len(chosen):
+        left_out = ", ".join(f"`{shlex.join(c)}`" for c in chosen if c[0] in _NOT_PROVISIONED)
+        notes.append(
+            f"ci: left out {left_out}: the workflow cannot install {'/'.join(sorted(_NOT_PROVISIONED))} on the runner; "
+            "add a setup step for it and the command to the workflow to run it in CI"
+        )
     blocks: list[str] = []
     for lang in langs:
         if lang in _SETUP_TEMPLATES:
             blocks.append(_template(_SETUP_TEMPLATES[lang]).rstrip("\n"))
-        install = _install_command(repo, lang, commands)
+        setup, install = _toolchain(repo, lang, run_commands)
+        blocks.extend(_template(_TOOL_SETUP_TEMPLATES[tool]).rstrip("\n") for tool in setup)
         if install:
             step = _render(
                 _template("github/workflows/step-install.yml"),
@@ -438,7 +615,6 @@ def _ci(repo: _Repo, commands: list[list[str]], notes: list[str]) -> list[tuple[
                 install_command=_yaml_scalar(install),
             )
             blocks.append(step.rstrip("\n"))
-    run_commands = commands or [c for lang in langs for c in _default_commands(repo, lang, notes)]
     run_tpl = _template("github/workflows/step-run.yml")
     for argv in run_commands:
         blocks.append(_render(run_tpl, run_command=_yaml_scalar(shlex.join(argv))).rstrip("\n"))
@@ -467,6 +643,20 @@ def parse_groups(only: str | Iterable[str] | None) -> list[str]:
             f"unknown group(s): {', '.join(unknown)}; valid groups: {', '.join(GROUPS)}"
         )
     return [g for g in GROUPS if g in names]
+
+
+def git_top_level(root: Path) -> Path | None:
+    """The top level of the git repository that contains `root` when `root` is a SUBDIRECTORY of it; None when `root` is the
+    top level itself, is not in a repository, or git is unavailable (nothing can be said, so nothing is warned about)."""
+    r = _git(Path(root), "rev-parse", "--show-toplevel")
+    top = r.stdout.strip() if r.returncode == 0 else ""
+    if not top:
+        return None
+
+    def same(a: str | Path, b: str | Path) -> bool:
+        return os.path.normcase(os.path.realpath(a)) == os.path.normcase(os.path.realpath(b))
+
+    return None if same(top, root) else Path(top)
 
 
 def _action(root: Path, group: str, path: str, content: str) -> Action:
@@ -499,12 +689,17 @@ def plan_with_notes(
                 pairs = _codeowners(repo, notes)
             elif group == "ci":
                 pairs = _ci(repo, cleaned, notes)
+            elif group == "github":
+                pairs = _github(repo, notes)
             else:
                 pairs = _static(group, repo)
         except OSError as exc:
             notes.append(f"{group}: skipped, a template could not be read ({exc})")
             continue
         actions.extend(_action(root, group, path, content) for path, content in pairs)
+    notes.extend(
+        n for n in repo.notes if n not in notes
+    )  # hostile or broken package.json / pyproject.toml
     return actions, notes
 
 
