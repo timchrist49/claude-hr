@@ -139,7 +139,7 @@ max_file_kb = 512
 skip_globs = []              # extra fnmatch patterns (posix-style relative paths) never to format
 allow = []                   # restrict to these formatter names; empty = any detected
 clean_gate = true            # only rewrite a tracked file whose HEAD version is already formatted (no whole-file drift diffs)
-repo_tools = "trusted"       # trusted: a formatter that lives inside the repo (.venv, node_modules/.bin) and prettier configuration that runs code (JS config, plugins)
+repo_tools = "trusted"       # trusted: a formatter that lives inside the repo (.venv, node_modules/.bin) and prettier (its config can load code)
                              #   are used only for a repo whose verify recipe you trusted; always: use them in every repo (the gate then runs code the repo or Claude wrote)
 
 [verify]

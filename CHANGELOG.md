@@ -28,7 +28,7 @@ no model, effort or thinking value). Plan: `docs/plans/2026-10-16-dev-workflow.m
 - **Hardened trust path:** `verify trust` has no `--yes` and refuses a Claude Code shell or a non-terminal; `verify run` of an untrusted
   recipe is refused for an agent; the bash guard denies an agent running `verify trust` / `untrust` or touching the trust record.
 - **The formatter step never runs repository-supplied code on its own:** a formatter that lives inside the repository (`.venv`,
-  `node_modules/.bin`) and prettier configuration that executes code (JS/TS config, `plugins`, a shared config package) need a trusted
+  `node_modules/.bin`) and prettier (its configuration can load code, and no check on it survived review) need a trusted
   repository (an approved verify recipe) or `format.repo_tools = "always"`; `claude-hr-ctl fmt` marks such a formatter `NOT USED`.
 - `doctor` now reports a foreign `ANTHROPIC_BASE_URL` proxy and Headroom Desktop (they override claude-hr's per-launch routing; it
   used to say OK), a missing `claude-hr-hook` on PATH, the current repository's verify recipe state, and security-guidance reviews that

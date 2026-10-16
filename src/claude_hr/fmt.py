@@ -764,141 +764,18 @@ def _repo_binary_refusal(f: Formatter, root: Path, cache: dict[str, str | None])
     return reason
 
 
-_MAX_CONFIG_READ = 256 * 1024
-_JS_CONFIG = re.compile(r"^(?:prettier\.config|\.prettierrc)\.(?:js|cjs|mjs|ts|cts|mts)$")
 _TRUST_HINT = "allowed only for a trusted repository (claude-hr-ctl verify trust) or format.repo_tools = always"
-
-# Prettier configuration is safe to use unattended only when it is plain data made of options we know. Anything else is
-# refused: an unknown key (`plugins`, `pluginSearchDirs`, ...), a `parser` that is a path, a bare string (a shared config
-# package), a file we cannot parse the way prettier does, or a file too big to read. An allowlist, because every denylist
-# (a substring search, a quote check) differs from prettier's own parser somewhere: JSON escapes, YAML scalars, padding.
-_PRETTIER_OPTIONS = frozenset(
-    (
-        "printWidth tabWidth useTabs semi singleQuote jsxSingleQuote quoteProps trailingComma bracketSpacing "
-        "objectWrap bracketSameLine jsxBracketSameLine arrowParens requirePragma insertPragma proseWrap "
-        "htmlWhitespaceSensitivity vueIndentScriptAndStyle endOfLine embeddedLanguageFormatting "
-        "singleAttributePerLine experimentalTernaries experimentalOperatorPosition parser filepath "
-        "rangeStart rangeEnd cursorOffset"
-    ).split()
-)
-_PRETTIER_PARSERS = frozenset(
-    (
-        "acorn angular babel babel-flow babel-ts css espree flow glimmer graphql html json json-stringify json5 jsonc "
-        "less lwc markdown mdx meriyah scss typescript vue yaml"
-    ).split()
-)
-_YAML_LINE = re.compile(
-    r"^(?P<key>[A-Za-z]+):[ ]+(?P<val>true|false|-?[0-9]+|\"[^\"\\]*\"|'[^'\\]*'|[A-Za-z0-9_.-]+)[ ]*(?:#.*)?$"
-)
-
-
-def _options_are_data(conf: object, *, top: bool = True) -> bool:
-    """True only for a mapping of known prettier options with scalar values (and, at the top level, `overrides`)."""
-    if not isinstance(conf, dict):
-        return False
-    for key, val in conf.items():
-        if key == "$schema" and isinstance(val, str):
-            continue
-        if top and key == "overrides":
-            if not isinstance(val, list):
-                return False
-            for item in val:
-                if not isinstance(item, dict) or set(item) - {"files", "excludeFiles", "options"}:
-                    return False
-                if "options" in item and not _options_are_data(item["options"], top=False):
-                    return False
-            continue
-        if key not in _PRETTIER_OPTIONS or isinstance(val, (dict, list)):
-            return False
-        if key == "parser" and val not in _PRETTIER_PARSERS:
-            return False
-    return True
-
-
-def _simple_yaml_options(text: str) -> dict | None:
-    """The flat `key: scalar` YAML subset of a prettier config, or None for anything else (nesting, anchors, tags,
-    flow collections, multi-line values, a bare string). No YAML parser in the standard library, so no guessing."""
-    out: dict = {}
-    for line in text.splitlines():
-        stripped = line.strip()
-        if not stripped or stripped.startswith("#") or stripped == "---":
-            continue
-        m = _YAML_LINE.match(line)
-        if not m:
-            return None
-        val = m.group("val")
-        if val[0] in "\"'":
-            val = val[1:-1]
-        elif val in ("true", "false"):
-            val = val == "true"
-        elif re.fullmatch(r"-?[0-9]+", val):
-            val = int(val)
-        out[m.group("key")] = val
-    return out
-
-
-def _config_runs_code(p: Path) -> str | None:
-    """Why this prettier configuration file cannot be assumed to be plain data (see the allowlist above), else None."""
-    import json
-    import tomllib
-
-    if _JS_CONFIG.match(p.name):
-        return f"{p.name} is an executable prettier config"
-    uncheckable = f"{p.name} is not plain prettier options that could be checked"
-    try:
-        with open(p, "rb") as fh:
-            raw = fh.read(_MAX_CONFIG_READ + 1)
-    except OSError:
-        return None  # nothing readable here: prettier cannot read it either
-    if len(raw) > _MAX_CONFIG_READ:
-        return f"{p.name} is too large to inspect"
-    try:
-        text = raw.decode("utf-8-sig")
-    except UnicodeDecodeError:
-        return f"{p.name} is not UTF-8 text"
-    try:
-        if p.name == "package.json":
-            data = json.loads(text)
-            conf = data.get("prettier") if isinstance(data, dict) else None
-            if conf is None:
-                return None
-            return None if _options_are_data(conf) else uncheckable
-        if p.name == "package.yaml":
-            return uncheckable if "prettier" in text.lower() else None
-        if p.suffix == ".toml":
-            return None if _options_are_data(tomllib.loads(text)) else uncheckable
-        try:
-            conf = json.loads(
-                text
-            )  # .json, .json5 written as strict JSON, and a .prettierrc that is JSON
-        except ValueError:
-            if p.suffix in (".json", ".json5"):
-                return uncheckable
-            conf = _simple_yaml_options(text)  # .yaml/.yml and a .prettierrc that is YAML
-        return None if _options_are_data(conf) else uncheckable
-    except (ValueError, RecursionError):
-        return uncheckable
-
-
-def _prettier_code_reason(path: Path, root: Path) -> str | None:
-    """Prettier runs JS from a repo's configuration, so every config it could pick up is checked, not just the first."""
-    for d in _dirs_up(path.parent, root):
-        for name in (*_PRETTIER_CONFIGS, "package.json", "package.yaml"):
-            p = d / name
-            try:
-                if p.is_file():
-                    why = _config_runs_code(p)
-                    if why:
-                        return why
-            except OSError:
-                continue
-    return None
 
 
 def _repo_code_refusal(f: Formatter, path: Path, root: Path, trusted: bool) -> str | None:
-    """The gate runs unattended, so it must not turn "Claude (or a clone) wrote a file" into "that file runs": a formatter
-    binary that lives inside the repository (.venv, node_modules/.bin: untracked, so a write-only agent can create one) and
-    prettier configuration that executes code are used only for a trusted repository."""
+    """The gate runs unattended, so it must not turn "Claude (or a clone) wrote a file" into "that file runs".
+
+    Two things can: a formatter binary that lives inside the repository (.venv, node_modules/.bin: untracked, so an agent
+    with write access only can create one), and prettier, whose configuration can load code (JS/TS configs, `plugins`,
+    shared config packages, a `parser` that is a path). Prettier's configuration cannot be vetted by reading it: every
+    check we wrote differed from prettier's own parsers somewhere (JSON escapes, YAML scalars, padding, duplicate keys),
+    so prettier runs unattended only for a trusted repository. The other formatters' configuration (ruff, black, biome,
+    gofmt, rustfmt) is data."""
     if trusted:
         return None
     try:
@@ -908,9 +785,7 @@ def _repo_code_refusal(f: Formatter, path: Path, root: Path, trusted: bool) -> s
     if rel is not None:
         return f"{f.name} lives inside the repository ({rel}); {_TRUST_HINT}"
     if f.name == "prettier":
-        why = _prettier_code_reason(path, root)
-        if why:
-            return f"{why}; {_TRUST_HINT}"
+        return f"prettier configuration can run code from this repository; {_TRUST_HINT}"
     return None
 
 

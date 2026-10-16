@@ -491,131 +491,60 @@ def test_an_untrusted_repo_may_not_run_a_formatter_that_lives_inside_it(repo):
     assert "usable" not in fmt.describe(repo, trusted=True)[0]
 
 
-UNCHECKABLE = "not plain prettier options"
-PAD = " " * (fmt._MAX_CONFIG_READ + 10)
+PRETTIER_CONFIGS = [
+    # executable
+    ("prettier.config.js", "module.exports = {};\n"),
+    (".prettierrc.cjs", "module.exports = {};\n"),
+    (".prettierrc.mjs", "export default {};\n"),
+    ("prettier.config.ts", "export default {};\n"),
+    # data that can still load code
+    (".prettierrc", '{"plugins": ["./local-plugin.js"]}\n'),
+    (".prettierrc.json", '{"parser": "./my-parser.js"}\n'),
+    (".prettierrc.yaml", "plugins:\n  - ./p.js\n"),
+    (".prettierrc.toml", 'plugins = ["./p.js"]\n'),
+    ("package.json", '{"prettier": "@company/prettier-config"}\n'),
+    (".prettierrc", "prettier-config-standard\n"),
+    (".prettierrc", '{"\\u0070lugins": ["./p.js"]}\n'),
+    # and plain data: prettier's configuration is never vetted by reading it, so even this needs a trusted repo
+    (".prettierrc", '{"semi": false}\n'),
+    (".prettierrc.yaml", "semi: false\ntabWidth: 4\n"),
+    ("package.json", '{"name": "x", "prettier": {"semi": false}}\n'),
+]
 
 
-@pytest.mark.parametrize(
-    "name, content, why",
-    [
-        ("prettier.config.js", "module.exports = {};\n", "executable prettier config"),
-        (".prettierrc.cjs", "module.exports = {};\n", "executable prettier config"),
-        (".prettierrc.mjs", "export default {};\n", "executable prettier config"),
-        ("prettier.config.ts", "export default {};\n", "executable prettier config"),
-        (".prettierrc", '{"plugins": ["./local-plugin.js"]}\n', UNCHECKABLE),
-        (".prettierrc.json", '{"plugins":["prettier-plugin-x"]}\n', UNCHECKABLE),
-        (".prettierrc.yaml", "plugins:\n  - ./p.js\n", UNCHECKABLE),
-        (".prettierrc.toml", 'plugins = ["./p.js"]\n', UNCHECKABLE),
-        ("package.json", '{"prettier": "@company/prettier-config"}\n', UNCHECKABLE),
-        ("package.json", '{"prettier": {"plugins": ["./p.js"]}}\n', UNCHECKABLE),
-        # a shared config package, in every spelling prettier accepts (a substring or quote check misses most of these)
-        (".prettierrc", '"@company/prettier-config"\n', UNCHECKABLE),
-        (".prettierrc", "prettier-config-standard\n", UNCHECKABLE),
-        (".prettierrc.yaml", "company-prettier-config\n", UNCHECKABLE),
-        (".prettierrc.yml", "'@company/prettier-config'\n", UNCHECKABLE),
-        # the same key written so that no substring search finds it
-        (".prettierrc", '{"\\u0070lugins": ["./p.js"]}\n', UNCHECKABLE),
-        (".prettierrc.json", '{"semi": true, "plug\\u0069ns": ["x"]}\n', UNCHECKABLE),
-        (".prettierrc.yaml", '"\\x70lugins": [./p.js]\n', UNCHECKABLE),
-        # padding past the read cap, then the dangerous key
-        pytest.param(
-            ".prettierrc",
-            '{"semi": true,' + PAD + '"plugins": ["./p.js"]}\n',
-            "too large",
-            id="padded-prettierrc",
-        ),
-        pytest.param(
-            ".prettierrc.json",
-            '{"semi": true,' + PAD + '"plugins": ["./p.js"]}\n',
-            "too large",
-            id="padded-prettierrc-json",
-        ),
-        # unknown keys, a parser that is a path, plugins hidden inside overrides, nesting where options are scalars
-        (".prettierrc", '{"semi": true, "somethingNew": 1}\n', UNCHECKABLE),
-        (".prettierrc", '{"parser": "./my-parser.js"}\n', UNCHECKABLE),
-        (
-            ".prettierrc",
-            '{"overrides": [{"files": "*.ts", "options": {"plugins": ["p"]}}]}\n',
-            UNCHECKABLE,
-        ),
-        (
-            ".prettierrc",
-            '{"overrides": [{"files": "*.ts", "options": {"semi": true}, "extra": 1}]}\n',
-            UNCHECKABLE,
-        ),
-        (".prettierrc", '{"semi": {"a": 1}}\n', UNCHECKABLE),
-        (".prettierrc.yaml", "parser: ./evil.js\n", UNCHECKABLE),
-        (".prettierrc.yaml", "parser: evil\n", UNCHECKABLE),
-        (".prettierrc.yaml", "semi: &a true\n", UNCHECKABLE),
-        (".prettierrc.yaml", "overrides:\n  - files: '*.ts'\n", UNCHECKABLE),
-        (
-            ".prettierrc.toml",
-            "[[overrides]]\nfiles = '*.ts'\n[overrides.options]\nplugins = ['p']\n",
-            UNCHECKABLE,
-        ),
-        (".prettierrc.json5", "{semi: true}\n", UNCHECKABLE),  # not strict JSON: cannot be checked
-        (".prettierrc.json", '{"semi": true,}\n', UNCHECKABLE),
-        ("package.yaml", "name: x\nprettier:\n  semi: false\n", UNCHECKABLE),
-    ],
-)
-def test_prettier_configuration_that_may_execute_code_needs_a_trusted_repo(
-    repo, fake, name, content, why
-):
+@pytest.mark.parametrize("name, content", PRETTIER_CONFIGS)
+def test_prettier_runs_only_for_a_trusted_repository(repo, fake, name, content):
+    """Whatever the configuration looks like, prettier may load code from it, and every attempt to vet a config by
+    reading it differed from prettier's own parsers somewhere (found by review, three times)."""
     fake("strip", "prettier")  # a prettier that is NOT inside the repo (a global install)
     put(repo / name, content)
     f = put(repo / "a.ts", "const a = 1;  \n")
     report = fmt.format_changed(repo)
-    assert report.formatted == [] and why in report.skipped[0][1], report.skipped
+    assert report.formatted == [] and "prettier configuration can run code" in report.skipped[0][1]
+    assert "verify trust" in report.skipped[0][1]
     assert f.read_bytes() == b"const a = 1;  \n"
-    trusted = fmt.format_changed(repo, trusted=True)
-    assert trusted.formatted == ["a.ts"]  # the user vouched for this repository
+    assert fmt.format_changed(repo, trusted=True).formatted == ["a.ts"]  # the user vouched for it
 
 
-def test_prettier_configuration_in_another_encoding_cannot_be_inspected_so_it_is_refused(
-    repo, fake
-):
-    fake("strip", "prettier")
-    put(repo / ".prettierrc", '{"semi": true}\n'.encode("utf-16"))
-    put(repo / "a.ts", "const a = 1;  \n")
-    assert "not UTF-8" in fmt.format_changed(repo).skipped[0][1]
+def test_prettier_is_described_as_not_used_until_the_repo_is_trusted(proj, win):
+    node_tool(proj, "prettier", win)
+    (proj / ".prettierrc").write_text('{"semi": false}\n', encoding="utf-8")
+    # a prettier installed outside the repository (PATH) is still refused: its configuration is the repo's
+    only = fmt._repo_code_refusal(
+        fmt.Formatter("prettier", sys.executable), proj / "a.ts", proj, False
+    )
+    assert only and "prettier configuration can run code" in only
+    assert (
+        fmt._repo_code_refusal(fmt.Formatter("prettier", sys.executable), proj / "a.ts", proj, True)
+        is None
+    )
 
 
-@pytest.mark.parametrize(
-    "name, content",
-    [
-        (
-            ".prettierrc",
-            '{"semi": false, "overrides": [{"files": "*.ts", "options": {"semi": true}}]}\n',
-        ),
-        (".prettierrc", '{"$schema": "https://json.schemastore.org/prettierrc", "tabWidth": 4}\n'),
-        (".prettierrc.json", '{"printWidth": 100, "parser": "typescript"}\n'),
-        (".prettierrc.yaml", "semi: false\ntabWidth: 4\n"),
-        (
-            ".prettierrc.yaml",
-            "# prettier\n---\nsingleQuote: true\ntrailingComma: 'all'\nprintWidth: 100 # wide\n",
-        ),
-        (".prettierrc", "semi: false\nuseTabs: true\n"),
-        (".prettierrc.toml", "semi = false\ntabWidth = 2\n"),
-        ("package.json", '{"name": "x", "prettier": {"semi": false}}\n'),
-        ("package.json", '{"name": "x", "scripts": {"test": "jest"}}\n'),
-    ],
-)
-def test_data_only_prettier_configuration_is_fine_without_trust(repo, fake, name, content):
-    fake("strip", "prettier")
-    put(repo / name, content)
+@pytest.mark.parametrize("name", ["ruff", "black", "biome", "gofmt", "rustfmt"])
+def test_other_formatters_configuration_is_data_and_needs_no_trust(repo, fake, name):
+    fake("strip", name)
     put(repo / "a.ts", "const a = 1;  \n")
     assert fmt.format_changed(repo).formatted == ["a.ts"]
-
-
-def test_every_prettier_config_on_the_way_up_is_checked_not_just_the_first(repo, fake):
-    fake("strip", "prettier")
-    put(repo / ".prettierrc", '{"semi": false}\n')
-    put(
-        repo / "prettier.config.js", "module.exports = {};\n"
-    )  # prettier may pick either: refuse if one executes
-    put(repo / "sub" / "a.ts", "const a = 1;  \n")
-    report = fmt.format_changed(repo)
-    assert report.formatted == [] and "executable prettier config" in report.skipped[0][1]
 
 
 def test_entry_points_never_raise(repo, monkeypatch):
@@ -812,7 +741,7 @@ def test_timeout_kills_the_whole_process_tree(repo, fake_script, monkeypatch, tm
     monkeypatch.setattr(fmt, "_PER_FILE_MAX_S", 1.0)
     put(repo / "a.py", "x = 1  \n")
     started = time.monotonic()
-    report = fmt.format_changed(repo)
+    report = fmt.format_changed(repo, trusted=True)
     took = time.monotonic() - started
     assert len(report.errors) == 1 and report.errors[0][1].startswith("timeout after")
     assert (
@@ -832,7 +761,7 @@ def test_cmd_shim_formatter_runs_with_spaces_and_refuses_unsafe_names(
     monkeypatch.setattr(fmt, "detect", lambda path, root: f)
     ok = put(repo / "dir with space" / "a.py", "x = 1  \n")
     unsafe = put(repo / "r&d.py", "x = 1  \n")
-    report = fmt.format_changed(repo)
+    report = fmt.format_changed(repo, trusted=True)
     assert report.formatted == ["dir with space/a.py"]
     assert ok.read_bytes() == b"x = 1\n"
     assert (
