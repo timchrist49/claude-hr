@@ -4,7 +4,7 @@ import time
 
 import pytest
 
-from claude_hr import hooks
+from claude_hr import hooks, paths
 
 BLOCK = [
     "cat .env",
@@ -215,16 +215,16 @@ def test_statusline_survives_a_headroom_cache_of_the_wrong_shape(monkeypatch, ca
     port = 8787
     monkeypatch.setenv("ANTHROPIC_BASE_URL", f"http://127.0.0.1:{port}")
     monkeypatch.setattr(
-        hooks, "_headroom_summary", lambda p: {"saved": "lots", "pct": "x", "five_hour": [3]}
+        hooks, "_headroom_summary", lambda p, *_: {"saved": "lots", "pct": "x", "five_hour": [3]}
     )
     monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps({"model": {"display_name": "Opus"}})))
     assert hooks.statusline() == 0
     assert capsys.readouterr().out.strip() == "Opus"
-    monkeypatch.setattr(hooks, "_headroom_summary", lambda p: ["not", "a", "dict"])
+    monkeypatch.setattr(hooks, "_headroom_summary", lambda p, *_: ["not", "a", "dict"])
     monkeypatch.setattr("sys.stdin", io.StringIO("{}"))
     assert hooks.statusline() == 0
     monkeypatch.setattr(
-        hooks, "_headroom_summary", lambda p: {"saved": 183000, "pct": 40.0, "five_hour": "3"}
+        hooks, "_headroom_summary", lambda p, *_: {"saved": 183000, "pct": 40.0, "five_hour": "3"}
     )
     monkeypatch.setattr("sys.stdin", io.StringIO("{}"))
     capsys.readouterr()
@@ -273,6 +273,75 @@ def test_statusline_entry_exits_zero_with_a_clean_stderr_on_bad_fields():
             timeout=60,
         )
         assert r.returncode == 0 and r.stderr == b"" and r.stdout.strip() == b"", (payload, r)
+
+
+class Headroom:
+    """A stand-in for Headroom's /stats: the answer, and how many times it was asked."""
+
+    def __init__(self, monkeypatch):
+        self.asked = 0
+        monkeypatch.setattr(hooks.procutil, "http_json", self.http_json)
+
+    def http_json(self, url, timeout=0.6, loopback=True):
+        self.asked += 1
+        return 200, {"savings": {"total_tokens": 1234}, "display_session": {}}
+
+
+def refresh_statusline(monkeypatch, capsys, payload=None):
+    monkeypatch.setenv("ANTHROPIC_BASE_URL", "http://127.0.0.1:8787")
+    monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(payload or {})))
+    assert hooks.statusline() == 0
+    return capsys.readouterr().out.strip()
+
+
+def test_the_statusline_cache_is_written_to_the_users_state_folder(monkeypatch, capsys, sandbox):
+    headroom = Headroom(monkeypatch)
+    assert refresh_statusline(monkeypatch, capsys) == "✂ 1k saved"
+    cache = paths.state_dir() / "statusline-headroom.json"
+    assert json.loads(cache.read_text(encoding="utf-8"))["saved"] == 1234
+    assert refresh_statusline(monkeypatch, capsys) == "✂ 1k saved"
+    assert headroom.asked == 1, "the second refresh came from the cache"
+
+
+@pytest.mark.parametrize("named", [None, "cwd", "current_dir", "project_dir"])
+def test_a_statusline_refresh_writes_nothing_into_a_state_folder_inside_the_working_folder(
+    monkeypatch, capsys, tmp_path, named
+):
+    """CLAUDE_HR_HOME can come from the repository's own .claude/settings.json: the refresh must not create folders or
+    write the cache there (the cache file may be a link the repository ships to a file of the user's)."""
+    project = tmp_path / "project"
+    project.mkdir()
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    monkeypatch.setenv("CLAUDE_HR_HOME", str(project / ".hr"))
+    payload = {}
+    if named is None:
+        monkeypatch.chdir(project)  # the process runs in the project
+    else:
+        monkeypatch.chdir(elsewhere)  # the payload says where the project is
+        folder = str(project)
+        payload = {"cwd": folder} if named == "cwd" else {"workspace": {named: folder}}
+    headroom = Headroom(monkeypatch)
+    assert (
+        refresh_statusline(monkeypatch, capsys, payload) == "✂ 1k saved"
+    )  # the line is still printed
+    assert not (project / ".hr").exists(), "nothing was created there"
+    assert refresh_statusline(monkeypatch, capsys, payload) == "✂ 1k saved"
+    assert headroom.asked == 2, "and a cache that is not trusted is not read either"
+
+
+def test_a_statusline_cache_in_a_state_folder_inside_the_working_folder_is_not_read(
+    monkeypatch, capsys, tmp_path
+):
+    project = tmp_path / "project"
+    (project / ".hr" / "state").mkdir(parents=True)
+    (project / ".hr" / "state" / "statusline-headroom.json").write_text(
+        json.dumps({"saved": 99_000_000}), encoding="utf-8"
+    )
+    monkeypatch.chdir(project)
+    monkeypatch.setenv("CLAUDE_HR_HOME", str(project / ".hr"))
+    Headroom(monkeypatch)
+    assert refresh_statusline(monkeypatch, capsys) == "✂ 1k saved"
 
 
 def test_hook_entry_point_dispatch(monkeypatch):

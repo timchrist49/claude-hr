@@ -243,10 +243,14 @@ def _fmt_tokens(n: float) -> str:
     return str(int(n))
 
 
-def _headroom_summary(port: int) -> dict | None:
+def _headroom_summary(port: int, named: tuple[str, ...] = ()) -> dict | None:
+    """Headroom's numbers for the status line, cached for 20 s in the state folder. `named`: the folders the payload names;
+    a state folder inside one of them (or inside the working folder) is the repository's to have chosen, so the cache is
+    neither read nor written (paths.hook_write)."""
     cache = paths.state_dir() / "statusline-headroom.json"
+    usable = not paths.inside_cwd(cache, *named)
     try:
-        if time.time() - cache.stat().st_mtime < 20:
+        if usable and time.time() - cache.stat().st_mtime < 20:
             return json.loads(cache.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         pass
@@ -262,11 +266,8 @@ def _headroom_summary(port: int) -> dict | None:
             ((body.get("subscription_window") or {}).get("latest") or {}).get("five_hour") or {}
         ).get("utilization_pct"),
     }
-    try:
-        paths.state_dir().mkdir(parents=True, exist_ok=True)
-        cache.write_text(json.dumps(out), encoding="utf-8")
-    except OSError:
-        pass
+    if usable:
+        paths.hook_write(cache, json.dumps(out), *named)
     return out
 
 
@@ -290,6 +291,16 @@ def _field(data, *keys):
     return data
 
 
+def _named_folders(data) -> tuple[str, ...]:
+    """The folders a status line payload names (`cwd`, `workspace.current_dir`, `workspace.project_dir`)."""
+    found = (
+        _field(data, "cwd"),
+        _field(data, "workspace", "current_dir"),
+        _field(data, "workspace", "project_dir"),
+    )
+    return tuple(f for f in found if isinstance(f, str) and f)
+
+
 def _statusline_parts(data, parts: list[str]) -> None:
     """Append the segments of the status line to `parts` one at a time, so a failure only loses the segments after it."""
     model = _field(data, "model", "display_name")
@@ -305,7 +316,7 @@ def _statusline_parts(data, parts: list[str]) -> None:
 
     port = int(config.load().get("headroom.port", 8787))
     if os.environ.get("ANTHROPIC_BASE_URL", "").endswith(f":{port}"):
-        hs = _headroom_summary(port)
+        hs = _headroom_summary(port, _named_folders(data))
         saved = _num(_field(hs, "saved"))
         if saved:
             pct = _num(_field(hs, "pct"))

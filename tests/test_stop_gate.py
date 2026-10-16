@@ -564,7 +564,7 @@ def test_when_it_cannot_tell_where_the_state_directory_is_it_does_nothing(fakes,
     def boom(path):
         raise OSError("cannot resolve")
 
-    monkeypatch.setattr(stop_gate, "_fold", boom)
+    monkeypatch.setattr(paths, "_fold", boom)
     assert stop_gate.handle(payload(repo)) is None and fakes.gate_calls == []
 
 
@@ -592,6 +592,75 @@ def test_a_link_into_the_repository_is_followed(fakes, repo, tmp_path, monkeypat
 def test_the_comparison_ignores_case_on_windows(fakes, repo, monkeypatch):
     monkeypatch.setenv("CLAUDE_HR_HOME", str(repo).upper() + "/.hr")
     assert stop_gate.handle(payload(repo)) is None and fakes.gate_calls == []
+
+
+@pytest.mark.parametrize("relative", [False, True])
+def test_a_broken_config_in_a_state_folder_the_repository_chose_makes_the_hook_write_nothing(
+    fakes, repo, monkeypatch, capsys, relative
+):
+    """The check of the state folder came after config.load(): a config.toml that does not parse, shipped in the folder
+    CLAUDE_HR_HOME (from the repository's own settings) points at, ended in the crash handler, which wrote crash.log there
+    (through a link, if the repository shipped one)."""
+    hr = repo / ".hr"
+    hr.mkdir()
+    (hr / "config.toml").write_text("this is [not toml\n", encoding="utf-8")
+    if relative:
+        monkeypatch.chdir(repo)
+    monkeypatch.setenv("CLAUDE_HR_HOME", ".hr" if relative else str(hr))
+    monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(payload(repo))))
+    assert stop_gate.run() == 0
+    assert capsys.readouterr().out == ""
+    assert [p.name for p in hr.rglob("*")] == ["config.toml"], "nothing was created below it"
+    assert fakes.gate_calls == []
+
+
+@pytest.mark.parametrize("via", ["payload", "process"])
+def test_a_crash_writes_nothing_into_the_folder_claude_works_in(
+    fakes, repo, tmp_path, monkeypatch, capsys, via
+):
+    """Whatever fails before the state folder has been judged: the trace is not left in a folder the repository chose."""
+
+    def boom(cwd, timeout=0):
+        raise RuntimeError("git exploded")
+
+    monkeypatch.setattr(stop_gate, "_git_root", boom)
+    monkeypatch.setenv("CLAUDE_HR_HOME", str(repo / ".hr"))
+    if via == "payload":
+        monkeypatch.chdir(tmp_path)
+        text = json.dumps(payload(repo))
+    else:
+        monkeypatch.chdir(repo)
+        text = "{}"
+    monkeypatch.setattr("sys.stdin", io.StringIO(text))
+    assert stop_gate.run() == 0
+    assert capsys.readouterr().out == ""
+    assert not (repo / ".hr").exists()
+
+
+def test_a_crash_is_still_logged_when_the_state_folder_is_the_users_own(
+    fakes, repo, monkeypatch, capsys
+):
+    fakes.fmt_raises = RuntimeError("formatter exploded")
+    monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(payload(repo))))
+    assert stop_gate.run() == 0
+    log = (paths.logs_dir() / "crash.log").read_text(encoding="utf-8")
+    assert "formatter exploded" in log and "\r" not in log
+
+
+def test_a_crash_log_that_is_a_link_is_not_written_through(
+    fakes, repo, tmp_path, monkeypatch, capsys
+):
+    decoy = tmp_path / "decoy.txt"
+    decoy.write_text("not for the log\n", encoding="utf-8")
+    paths.logs_dir().mkdir(parents=True)
+    try:
+        (paths.logs_dir() / "crash.log").symlink_to(decoy)
+    except (OSError, NotImplementedError):
+        pytest.skip("no symlinks here")
+    fakes.fmt_raises = RuntimeError("formatter exploded")
+    monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(payload(repo))))
+    assert stop_gate.run() == 0
+    assert decoy.read_text(encoding="utf-8") == "not for the log\n"
 
 
 RECIPE = """

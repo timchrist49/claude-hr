@@ -583,3 +583,144 @@ def test_resolve_exe_uses_the_path_of_the_env_it_is_given(tmp_path):
     key = "Path" if os.name == "nt" else "PATH"
     assert procutil.resolve_exe("tool", {key: str(tmp_path)}) == str(tmp_path / exe)
     assert procutil.resolve_exe("tool", {"UNRELATED": "x"}) is None
+
+
+# ---- paths.state_inside / inside_cwd / hook_write: which folders a hook may trust and write to --------------------------
+@pytest.fixture
+def folders(tmp_path):
+    repo = tmp_path / "repo"
+    other = tmp_path / "other"
+    repo.mkdir()
+    other.mkdir()
+    return repo, other
+
+
+def test_state_inside_says_whether_the_state_folder_lies_in_the_repository(folders, monkeypatch):
+    repo, other = folders
+    monkeypatch.chdir(other)
+    for home in (repo, repo / ".hr", repo / "a" / "b" / "hr"):
+        monkeypatch.setenv("CLAUDE_HR_HOME", str(home))
+        assert paths.state_inside(repo) is True, home
+    monkeypatch.setenv("CLAUDE_HR_HOME", str(repo.parent / "third" / ".hr"))
+    assert paths.state_inside(repo) is False
+    # a folder whose name merely starts with the repository's is not inside it
+    monkeypatch.setenv("CLAUDE_HR_HOME", str(repo) + "-home")
+    assert paths.state_inside(repo) is False
+
+
+def test_state_inside_also_looks_at_the_working_folder(folders, monkeypatch):
+    repo, other = folders
+    monkeypatch.setenv("CLAUDE_HR_HOME", str(repo / ".hr"))
+    monkeypatch.chdir(other)
+    assert paths.state_inside(other) is False
+    assert paths.state_inside(other, repo) is True, "the folder named by the caller"
+    assert paths.state_inside(other, str(repo / "sub")) is False
+    monkeypatch.chdir(repo)
+    assert paths.state_inside(other) is True, "no folder named: the one this process runs in"
+
+
+def test_state_inside_resolves_a_relative_home_where_the_process_runs(folders, monkeypatch):
+    repo, other = folders
+    monkeypatch.setenv("CLAUDE_HR_HOME", ".hr")
+    monkeypatch.chdir(repo)
+    assert paths.state_inside(other) is True
+    monkeypatch.setenv("CLAUDE_HR_HOME", "../third/.hr")
+    monkeypatch.chdir(other)
+    assert paths.state_inside(repo) is False
+    assert paths.state_inside(repo / "x" / "..", repo.parent / "third") is True
+
+
+@pytest.mark.skipif(not paths.IS_WINDOWS, reason="Windows paths are not case sensitive")
+def test_state_inside_ignores_case_on_windows(folders, monkeypatch):
+    repo, other = folders
+    monkeypatch.chdir(other)
+    monkeypatch.setenv("CLAUDE_HR_HOME", str(repo).upper() + "/.hr")
+    assert paths.state_inside(repo) is True
+
+
+def test_state_inside_counts_not_being_able_to_tell_as_inside(folders, monkeypatch):
+    repo, other = folders
+    monkeypatch.chdir(other)
+
+    def boom(path):
+        raise OSError("cannot resolve")
+
+    monkeypatch.setattr(paths, "_fold", boom)
+    assert paths.state_inside(repo) is True
+    assert paths.inside_cwd(repo / "x") is True
+
+
+def test_inside_cwd_looks_at_the_process_folder_and_the_ones_named(folders, monkeypatch):
+    repo, other = folders
+    monkeypatch.chdir(repo)
+    assert paths.inside_cwd(repo / ".hr" / "state") is True
+    assert paths.inside_cwd(repo) is True
+    assert paths.inside_cwd(other / "x") is False
+    assert paths.inside_cwd(other / "x", other) is True
+    assert paths.inside_cwd(other / "x", "", None, repo) is False, "an empty name names nothing"
+    monkeypatch.chdir(other)
+    assert paths.inside_cwd(repo / "x") is False
+    assert paths.inside_cwd(repo / "x", repo) is True
+
+
+def test_hook_write_creates_the_home_and_the_folder_and_writes_exact_bytes(tmp_path, monkeypatch):
+    home = tmp_path / "newhome"  # its parent exists, it does not
+    monkeypatch.setenv("CLAUDE_HR_HOME", str(home))
+    target = paths.logs_dir() / "crash.log"
+    assert paths.hook_write(target, "one\ntwo\n") is True
+    assert target.read_bytes() == b"one\ntwo\n", "no CRLF on Windows"
+    assert paths.hook_write(target, "three\n", append=True) is True
+    assert target.read_bytes() == b"one\ntwo\nthree\n"
+    assert paths.hook_write(target, "four\n") is True
+    assert target.read_bytes() == b"four\n", "without append the file is replaced"
+    assert paths.hook_write(target, "caf\u00e9 \udc80\n") is True, (
+        "text that cannot be encoded still goes in"
+    )
+    assert target.read_bytes().startswith("caf\u00e9 ".encode())
+
+
+def test_hook_write_does_not_create_the_parents_above_the_home(tmp_path, monkeypatch):
+    monkeypatch.setenv("CLAUDE_HR_HOME", str(tmp_path / "missing" / "deeper" / "home"))
+    assert paths.hook_write(paths.state_dir() / "cache.json", "{}") is False
+    assert not (tmp_path / "missing").exists()
+
+
+def test_hook_write_writes_nothing_inside_the_working_folder(folders, monkeypatch):
+    repo, other = folders
+    monkeypatch.setenv("CLAUDE_HR_HOME", str(repo / ".hr"))
+    monkeypatch.chdir(repo)
+    assert paths.hook_write(paths.logs_dir() / "crash.log", "x", append=True) is False
+    monkeypatch.chdir(other)
+    assert paths.hook_write(paths.state_dir() / "cache.json", "{}", repo) is False
+    assert list(repo.iterdir()) == [], "not even the folders"
+
+
+def test_hook_write_writes_when_neither_folder_holds_the_file(folders, monkeypatch):
+    repo, other = folders
+    monkeypatch.setenv("CLAUDE_HR_HOME", str(repo / ".hr"))
+    monkeypatch.chdir(other)
+    assert paths.hook_write(paths.state_dir() / "cache.json", "{}", other) is True
+    assert (repo / ".hr" / "state" / "cache.json").read_text(encoding="utf-8") == "{}"
+
+
+def test_hook_write_does_not_follow_a_link_at_the_file(tmp_path, monkeypatch):
+    decoy = tmp_path / "decoy.txt"
+    decoy.write_text("mine\n", encoding="utf-8")
+    target = paths.state_dir() / "cache.json"
+    target.parent.mkdir(parents=True)
+    try:
+        target.symlink_to(decoy)
+    except (OSError, NotImplementedError):
+        # no symlink privilege (Windows): the platform's own answer to "is it a link" is what the code consults
+        monkeypatch.setattr(os.path, "islink", lambda p: str(p).endswith("cache.json"))
+        target.write_text("placeholder", encoding="utf-8")
+    for append in (False, True):
+        assert paths.hook_write(target, "overwritten\n", append=append) is False
+    assert decoy.read_text(encoding="utf-8") == "mine\n"
+
+
+def test_hook_write_is_false_not_an_error_when_the_folder_is_a_file(tmp_path, monkeypatch):
+    monkeypatch.setenv("CLAUDE_HR_HOME", str(tmp_path / "hrhome"))
+    (tmp_path / "hrhome").mkdir()
+    (tmp_path / "hrhome" / "logs").write_text("in the way", encoding="utf-8")
+    assert paths.hook_write(paths.logs_dir() / "crash.log", "x") is False
