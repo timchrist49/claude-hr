@@ -6,8 +6,10 @@ Real temp git repos and tiny fake checks run through sys.executable. Nothing her
 
 import json
 import os
+import signal
 import subprocess
 import sys
+import threading
 import time
 import tomllib
 from pathlib import Path
@@ -184,7 +186,10 @@ def test_discover_node_scripts_and_package_manager(tmp_path):
         ["pnpm", "run", "test"],
     ]
     assert [c.argv for c in r.full] == [c.argv for c in r.fast] + [["pnpm", "run", "build"]]
-    assert [c.timeout_s for c in r.full] == [90, 120, 180, 300]
+    # a fast check is never proposed above the gate's shared budget (it could not be reached there); the build only
+    # runs in the full tier (`verify run --tier full` honours its own limit)
+    assert [c.timeout_s for c in r.full] == [90, 120, 120, 300]
+    assert all(c.timeout_s <= verify.DEFAULT_GATE_TIMEOUT_S for c in r.fast)
     assert all(c.cwd == "." for c in r.full)
     assert r.source == "discovered from package.json"
     assert not any(c.argv[2] == "dev" for c in r.full)
@@ -865,6 +870,49 @@ def test_run_total_budget_skips_and_flags_inconclusive_timeouts(tmp_path):
     assert own.results[0].timed_out and not own.results[0].clamped
 
 
+def test_a_hang_in_a_check_whose_own_limit_is_the_whole_budget_is_a_failure(tmp_path):
+    """The check got a hair less than its limit (the clock had ticked): that is not the budget cutting it short."""
+    for limit in (2, 3):
+        res = verify.run(
+            tmp_path, [pycheck("hang", "import time; time.sleep(60)", limit)], total_timeout_s=limit
+        )
+        r = res.results[0]
+        assert r.timed_out and r.rc == 124 and not r.clamped, limit
+
+
+@pytest.mark.parametrize(
+    "own, limit, cut",
+    [
+        (120, 120, False),
+        (120, 119.999, False),
+        (120, 119.2, False),  # under a second short
+        (120, 118.9, True),  # more than a second short
+        (120, 5, True),
+        (3, 2.9, False),
+        (3, 2.6, True),  # more than a tenth of its own 3 s
+        (1, 0.85, True),
+        (1, 1, False),
+        (60, 60, False),
+    ],
+)
+def test_budget_cut_means_the_budget_shortened_the_check_meaningfully(own, limit, cut):
+    assert verify._budget_cut(own, limit) is cut
+
+
+def test_run_goes_on_past_a_check_that_could_not_be_launched(tmp_path):
+    marker = tmp_path / "later-ran"
+    checks = [
+        Check("missing-tool", ["definitely-not-a-real-tool-xyz"], 10),
+        pycheck("later", f"open({str(marker)!r}, 'w').write('x')"),
+        pycheck("fails", "import sys; sys.exit(3)"),
+        pycheck("never", "pass"),
+    ]
+    res = verify.run(tmp_path, checks, stop_on_fail=True)
+    assert [r.name for r in res.results] == ["missing-tool", "later", "fails"]
+    assert res.results[0].launch_failed and res.results[0].rc == 127
+    assert marker.exists() and res.skipped == ["never"], "a real failure still stops the run"
+
+
 def test_run_exhausted_budget_starts_nothing(tmp_path):
     marker = tmp_path / "marker"
     res = verify.run(tmp_path, [pycheck("a", f"open({str(marker)!r}, 'w')")], total_timeout_s=0)
@@ -1543,7 +1591,52 @@ def test_gate_missing_tool_is_an_error_not_a_block(tmp_path, state):
     repo = gated_repo(tmp_path, state, [Check("lint", ["definitely-not-a-real-tool-xyz"], 10)])
     out = verify.gate(repo, state)
     assert out.action == "error" and "cannot run lint" in out.reason and "not found" in out.reason
+    assert out.note == verify.NOTE_CANNOT_START
     assert not (state / "verify-gate.json").exists(), "a setup problem must not count as a block"
+
+
+def test_gate_a_missing_tool_does_not_hide_the_checks_after_it(tmp_path, state):
+    """A discovered recipe starts with `ruff check .`: without ruff on PATH the tests behind it never ran, silently."""
+    marker = tmp_path / "marker"
+    fast = [Check("lint", ["definitely-not-a-real-tool-xyz"], 10), marker_check(marker, "unit")]
+    repo = gated_repo(tmp_path, state, fast)
+    out = verify.gate(repo, state)
+    assert runs(marker) == 1, "the check behind the missing tool ran"
+    assert out.action == "error" and out.note == verify.NOTE_CANNOT_START
+    assert [r.name for r in out.results] == ["lint", "unit"]
+    put(repo, "code.txt", "broken\n")  # and a failure in it is still the model's to fix
+    blocked = verify.gate(repo, state)
+    assert blocked.action == "block" and blocked.reason.startswith(
+        "claude-hr verify: unit failed (exit 1)"
+    )
+
+
+def test_gate_checks_that_ran_and_passed_before_a_missing_tool_are_not_a_green_run(tmp_path, state):
+    marker = tmp_path / "marker"
+    fast = [marker_check(marker, "unit"), Check("types", ["definitely-not-a-real-tool-xyz"], 10)]
+    repo = gated_repo(tmp_path, state, fast)
+    out = verify.gate(repo, state)
+    assert out.action == "error" and "cannot run types: not found" in out.reason
+    assert out.note == verify.NOTE_CANNOT_START and runs(marker) == 1
+    assert out.fingerprint and [r.ok for r in out.results] == [True, False]
+    assert not (state / "verify-gate.json").exists(), "not every check ran: nothing is recorded"
+
+
+def test_gate_names_every_check_that_could_not_start(tmp_path, state):
+    fast = [Check(f"t{i}", [f"definitely-not-a-real-tool-{i}"], 10) for i in range(3)]
+    repo = gated_repo(tmp_path, state, fast)
+    out = verify.gate(repo, state)
+    assert out.action == "error" and "cannot run t0:" in out.reason and "(and 2 more)" in out.reason
+
+
+def test_gate_a_real_failure_is_reported_even_if_another_check_could_not_start(tmp_path, state):
+    fast = [
+        Check("lint", ["definitely-not-a-real-tool-xyz"], 10),
+        pycheck("unit", "import sys; print('1 failed'); sys.exit(1)"),
+    ]
+    repo = gated_repo(tmp_path, state, fast)
+    out = verify.gate(repo, state)
+    assert out.action == "block" and out.reason.startswith("claude-hr verify: unit failed")
 
 
 def test_gate_a_check_that_times_out_blocks(tmp_path, state):
@@ -1555,10 +1648,20 @@ def test_gate_a_check_that_times_out_blocks(tmp_path, state):
     assert out.results[0].timed_out
 
 
+def test_gate_a_hang_in_a_check_whose_own_limit_equals_the_gate_budget_blocks(tmp_path, state):
+    """The stock defaults: timeout_s 120 and verify.gate_timeout_s 120. On a fine clock the check always got a hair
+    less than 120 s and its hang was reported as 'inconclusive, not blocking'."""
+    repo = gated_repo(tmp_path, state, [pycheck("hang", "import time; time.sleep(60)", timeout=2)])
+    out = verify.gate(repo, state, timeout_s=2)
+    assert out.action == "block" and "hang failed (exit 124, timed out after " in out.reason
+    assert out.results[0].timed_out and not out.results[0].clamped and out.note == ""
+
+
 def test_gate_budget_exhaustion_is_inconclusive_not_a_failure(tmp_path, state):
     repo = gated_repo(tmp_path, state, [pycheck("slow", "import time; time.sleep(60)", timeout=60)])
     out = verify.gate(repo, state, timeout_s=1)
     assert out.action == "skip" and "inconclusive" in out.reason and out.fingerprint
+    assert out.note == verify.NOTE_TIME_BUDGET and out.check == "slow"
     assert not (state / "verify-gate.json").exists()
 
     two = gated_repo(
@@ -1566,6 +1669,7 @@ def test_gate_budget_exhaustion_is_inconclusive_not_a_failure(tmp_path, state):
     )
     out = verify.gate(two, state, timeout_s=0)
     assert out.action == "skip" and "time budget" in out.reason
+    assert out.note == verify.NOTE_TIME_BUDGET and out.check == "quick"
     assert not (state / "verify-gate.json").exists(), (
         "a partial run must never be recorded as green"
     )
@@ -1906,10 +2010,16 @@ def test_git_is_never_taken_from_the_working_directory(tmp_path, monkeypatch):
         "MYSQL_PWD",
         "PGPASSFILE",
         "NPM_CONFIG__AUTH",
-        "NPM_CONFIG_REGISTRY",
+        "npm_config__authToken",
+        "NPM_CONFIG_//registry.npmjs.org/:_authToken",
+        "NPM_CONFIG_PASSWORD",
+        "NPM_TOKEN",
         "AZURE_DEVOPS_EXT_PAT",
         "AWS_ACCESS_KEY_ID",
-        "AWS_REGION",
+        "AWS_SECRET_ACCESS_KEY",
+        "AWS_SESSION_TOKEN",
+        "AWS_PROFILE",
+        "OLDPWD",  # stale shell state; PWD itself is kept and set per check
         "GOOGLE_APPLICATION_CREDENTIALS",
         "GCP_PROJECT",
         "GITHUB_TOKEN",
@@ -1954,10 +2064,108 @@ def test_scrubbed_env_drops_credential_looking_names(name):
         "CLAUDECODE",  # claude-hr-ctl refuses `verify trust` in a shell that has it
         "CLAUDE_HR_HOME",
         "HARMLESS_SETTING",
+        # what an ordinary suite needs although a word of the deny-list is in the name
+        "PWD",  # GNU make's $(PWD), docker compose's ${PWD}
+        "GOPRIVATE",  # go test of a repository with private modules
+        "AWS_REGION",
+        "AWS_DEFAULT_REGION",
+        "NODE_TLS_REJECT_UNAUTHORIZED",
+        "XAUTHORITY",
+        "DOCKER_CERT_PATH",
+        "PIP_CERT",
+        "NIX_SSL_CERT_FILE",
+        # npm settings that are not credentials (the registry URL has none in it here)
+        "NPM_CONFIG_REGISTRY",
+        "npm_config_registry",
+        "npm_config_cache",
+        "npm_config_prefix",
+        "npm_config_loglevel",
+        "GONOSUMDB",
+        "GONOPROXY",
+        "GOFLAGS",
     ],
 )
 def test_scrubbed_env_keeps_what_toolchains_need(name):
     assert verify.scrubbed_env({name: "v"})[name] == "v" and not verify.is_secret_env(name)
+
+
+def test_an_npm_registry_url_that_carries_credentials_is_still_dropped():
+    base = {
+        "npm_config_registry": "https://npm.corp.example/",
+        "NPM_CONFIG_USERCONFIG": "/etc/npmrc",
+        "npm_config_proxy": "http://user:hunter2@proxy.example:3128",
+        "NPM_CONFIG_REGISTRY_BACKUP": "https://__token__:abc123@npm.example/",
+    }
+    assert set(verify.scrubbed_env(base)) == {
+        "npm_config_registry",
+        "NPM_CONFIG_USERCONFIG",
+        "CI",
+        verify.ACTIVE_ENV,
+    }
+
+
+def test_env_allow_keeps_the_names_a_person_listed_and_nothing_else():
+    base = {
+        "DATABASE_URL": "postgres://user:pw@db/x",  # the name AND the value rule would drop it
+        "AWS_PROFILE": "dev",
+        "DJANGO_SECRET_KEY": "k",
+        "ANTHROPIC_API_KEY": "a",
+        "PATH": "/bin",
+    }
+    assert set(verify.scrubbed_env(base)) == {"PATH", "CI", verify.ACTIVE_ENV}
+    env = verify.scrubbed_env(base, allow=["database_url", " AWS_PROFILE "])  # case does not matter
+    assert env["DATABASE_URL"] == "postgres://user:pw@db/x" and env["AWS_PROFILE"] == "dev"
+    assert "DJANGO_SECRET_KEY" not in env and "ANTHROPIC_API_KEY" not in env
+    # an environment-variable override of the key arrives as one string
+    assert "DJANGO_SECRET_KEY" in verify.scrubbed_env(base, allow="AWS_PROFILE, DJANGO_SECRET_KEY")
+    # the markers every check carries cannot be switched off
+    forced = verify.scrubbed_env({"CI": "0"}, allow=["CI", verify.ACTIVE_ENV])
+    assert forced["CI"] == "1" and forced[verify.ACTIVE_ENV] == "1"
+    assert verify.env_allow_names(["a", 3, None, "", " b "]) == {"A", "B"}
+    assert verify.env_allow_names(None) == frozenset() == verify.env_allow_names(42)
+    assert set(verify.scrubbed_env(base, allow=42)) == {"PATH", "CI", verify.ACTIVE_ENV}, (
+        "a setting of the wrong type allows nothing and breaks nothing"
+    )
+
+
+def test_env_allow_reaches_the_checks_of_run_and_of_the_gate(tmp_path, state, monkeypatch):
+    monkeypatch.setenv("DATABASE_URL", "postgres://u:p@db/app")
+    monkeypatch.setenv("DJANGO_SECRET_KEY", "k")
+    code = (
+        "import os, sys; "
+        "sys.exit(0 if os.environ.get('DATABASE_URL') and not os.environ.get('DJANGO_SECRET_KEY') else 1)"
+    )
+    check = pycheck("suite", code)
+    assert verify.run(tmp_path, [check]).results[0].rc == 1
+    assert verify.run(tmp_path, [check], env_allow=["DATABASE_URL"]).results[0].rc == 0
+    repo = gated_repo(tmp_path, state, [check])
+    put(repo, "code.txt", "edited\n")
+    blocked = verify.gate(repo, state)
+    assert blocked.action == "block" and "suite failed (exit 1)" in blocked.reason
+    put(repo, "code.txt", "edited again\n")
+    assert verify.gate(repo, state, env_allow=["DATABASE_URL"]).action == "pass"
+
+
+@pytest.mark.skipif(
+    os.name == "nt", reason="PWD is the shell's variable: Windows shells do not set it"
+)
+def test_a_check_gets_pwd_set_to_its_own_directory(tmp_path, monkeypatch):
+    """The scrub used to drop PWD: GNU make ($(PWD)) and docker compose (${PWD}) read it only from the environment."""
+    (tmp_path / "sub").mkdir()
+    monkeypatch.setenv("PWD", "/somewhere/the/hook/was/started")
+    monkeypatch.setenv("OLDPWD", "/before")
+    code = "import os; print(os.path.realpath(os.environ['PWD'])); print(os.environ.get('OLDPWD'))"
+    root = verify.run(tmp_path, [pycheck("here", code)]).results[0].output.splitlines()
+    sub = verify.run(tmp_path, [pycheck("there", code, cwd="sub")]).results[0].output.splitlines()
+    assert root == [os.path.realpath(tmp_path), "None"]
+    assert sub == [os.path.realpath(tmp_path / "sub"), "None"]
+
+
+def test_mysql_pwd_is_still_a_secret_whatever_happens_to_pwd(tmp_path, monkeypatch):
+    monkeypatch.setenv("MYSQL_PWD", "hunter2")
+    monkeypatch.setenv("OLDPWD", "/before")
+    code = "import os; print(os.environ.get('MYSQL_PWD'), os.environ.get('OLDPWD'))"
+    assert verify.run(tmp_path, [pycheck("env", code)]).results[0].output == "None None"
 
 
 def test_scrubbed_env_drops_values_that_carry_url_credentials():
@@ -1978,7 +2186,7 @@ def test_scrubbed_env_drops_values_that_carry_url_credentials():
 
 
 def test_the_credential_deny_list_is_one_set_of_module_constants():
-    """fmt.py applies the same rules: it must be able to import them from here."""
+    """The deny-list is a set of module constants (fmt.py keeps a list of its own, see the note above them)."""
     for const in ("SECRET_ENV_WORDS", "SECRET_ENV_PREFIXES", "SECRET_ENV_NAMES", "KEEP_ENV"):
         assert getattr(verify, const), const
     assert {"TOKEN", "SECRET", "PASS", "PWD", "KEY", "CRED", "AUTH"} <= set(verify.SECRET_ENV_WORDS)
@@ -2321,3 +2529,341 @@ def test_run_output_loses_c1_controls_too(tmp_path):
     code = "import sys; sys.stdout.buffer.write(b'a\\xc2\\x9b31mb\\xc2\\x85c\\n')"
     out = verify.run(tmp_path, [pycheck("c1", code)]).results[0].output
     assert out == "a31mbc" and not any(0x7F <= ord(c) <= 0x9F for c in out)
+
+
+# =================================================================================================================
+# round two: links, files that are not files, size, one run at a time, a killed hook
+# =================================================================================================================
+def make_file_link(link, target):
+    try:
+        os.symlink(target, link)
+    except (OSError, NotImplementedError):
+        pytest.skip("symlinks are not available here")
+
+
+def new_root(tmp_path, name="repo"):
+    root = tmp_path / name
+    root.mkdir()
+    return root
+
+
+def within(seconds, fn, *args):
+    """Run fn in a daemon thread and fail (instead of hanging the suite) if it blocks."""
+    box = []
+    t = threading.Thread(target=lambda: box.append(fn(*args)), daemon=True)
+    t.start()
+    t.join(seconds)
+    assert box, f"{fn.__name__} blocked for more than {seconds} s"
+    return box[0]
+
+
+def test_write_config_creates_refuses_to_overwrite_and_forces(tmp_path):
+    root = new_root(tmp_path)
+    path = verify.write_config(root, "# one\n")
+    assert path == verify.config_path(root) and path.read_bytes() == b"# one\n"
+    with pytest.raises(verify.ConfigExists):
+        verify.write_config(root, "# two\n")
+    assert path.read_bytes() == b"# one\n"
+    assert verify.write_config(root, "# two\n", force=True) == path
+    assert path.read_bytes() == b"# two\n"
+    assert [p.name for p in path.parent.iterdir()] == [verify.CONFIG_NAME], "no temp file is left"
+
+
+@pytest.mark.parametrize("force", [False, True])
+def test_write_config_never_writes_through_a_symlink_to_a_file(tmp_path, force):
+    """A cloned repository can commit .claude/hr-verify.toml as a link to a file of the user's."""
+    root = new_root(tmp_path)
+    victim = tmp_path / "bashrc"
+    victim.write_text("export PATH=/mine\n", encoding="utf-8")
+    verify.config_path(root).parent.mkdir()
+    make_file_link(verify.config_path(root), victim)
+    with pytest.raises(VerifyConfigError, match="symbolic link"):
+        verify.write_config(root, "# recipe\n", force=force)
+    assert victim.read_text(encoding="utf-8") == "export PATH=/mine\n"
+    assert os.path.islink(verify.config_path(root)), "the link itself is left as it was"
+
+
+@pytest.mark.parametrize("force", [False, True])
+def test_write_config_never_creates_a_file_through_a_dangling_symlink(tmp_path, force):
+    root = new_root(tmp_path)
+    target = tmp_path / "created-by-init.txt"
+    verify.config_path(root).parent.mkdir()
+    make_file_link(verify.config_path(root), target)
+    with pytest.raises(VerifyConfigError, match="symbolic link"):
+        verify.write_config(root, "# recipe\n", force=force)
+    assert not target.exists()
+
+
+def test_write_config_never_writes_into_a_linked_claude_directory(tmp_path):
+    root = new_root(tmp_path)
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    make_dir_link(root / ".claude", elsewhere)  # a symlink, or a junction on Windows
+    for force in (False, True):
+        with pytest.raises(VerifyConfigError, match="symbolic link or junction"):
+            verify.write_config(root, "# recipe\n", force=force)
+    assert list(elsewhere.iterdir()) == []
+
+
+def test_write_config_refuses_a_target_that_is_not_a_regular_file(tmp_path):
+    root = new_root(tmp_path)
+    verify.config_path(root).mkdir(parents=True)  # a directory where the file belongs
+    for force in (False, True):
+        with pytest.raises(VerifyConfigError, match="not a regular file"):
+            verify.write_config(root, "# recipe\n", force=force)
+    other = new_root(tmp_path, "other")
+    (other / ".claude").write_text("a file, not a directory", encoding="utf-8")
+    with pytest.raises(VerifyConfigError, match="not a directory"):
+        verify.write_config(other, "# recipe\n")
+
+
+def test_read_file_is_bounded_and_regular_only(tmp_path, monkeypatch):
+    p = tmp_path / "f"
+    p.write_bytes(b"x" * 10)
+    assert verify._read_file(p, 10) == (b"x" * 10, False)
+    assert verify._read_file(p, 9) == (b"x" * 9, True)
+    assert verify._read_file(p, 100) == (b"x" * 10, False)
+    with pytest.raises(FileNotFoundError):
+        verify._read_file(tmp_path / "missing", 1)
+    with pytest.raises(verify._NotRegular):
+        verify._read_file(tmp_path, 1)  # a directory
+    big = tmp_path / "big"
+    big.write_bytes(b"y" * 1000)
+    asked = []
+    real_read = os.read
+
+    def spy(fd, n):
+        asked.append(n)
+        return real_read(fd, n)
+
+    with monkeypatch.context() as m:
+        m.setattr(os, "read", spy)
+        assert verify._read_file(big, 100) == (b"y" * 100, True)
+    assert sum(asked) <= 101, "never more than limit + 1 bytes are requested"
+
+
+def test_a_recipe_path_that_is_not_a_regular_file_is_refused_and_never_read(tmp_path, state):
+    repo = make_repo(tmp_path)
+    verify.config_path(repo).mkdir(parents=True)  # a directory where the file belongs
+    with pytest.raises(VerifyConfigError, match="not a regular file"):
+        verify.load(repo)
+    assert verify.trust_state(repo, state) == "invalid"
+    out = verify.gate(repo, state)
+    assert out.action == "error" and "not a regular file" in out.reason
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="needs a FIFO")
+def test_a_fifo_in_place_of_the_recipe_does_not_block_the_hook(tmp_path, state):
+    """open() on a FIFO nobody writes to blocks for good: the Stop hook would hang until the host kills it."""
+    repo = make_repo(tmp_path)
+    verify.config_path(repo).parent.mkdir(parents=True)
+    os.mkfifo(verify.config_path(repo))
+    assert within(10, verify.trust_state, repo, state) == "invalid"
+    assert within(10, verify.gate, repo, state).action == "error"
+
+
+@pytest.mark.skipif(not os.path.exists("/dev/null"), reason="needs /dev/null")
+def test_a_symlink_to_a_device_is_not_read_as_the_recipe(tmp_path, state):
+    """/dev/zero and /dev/ptmx are the dangerous ones; /dev/null is the safe stand-in (empty text if not checked)."""
+    repo = make_repo(tmp_path)
+    verify.config_path(repo).parent.mkdir(parents=True)
+    make_file_link(verify.config_path(repo), "/dev/null")
+    assert verify.trust_state(repo, state) == "invalid"
+
+
+def test_discover_reads_a_large_manifest_whole(tmp_path):
+    """verify cut every manifest at 256 KB: the cut-off JSON did not parse and 'nothing recognised' was the answer."""
+    pkg = {
+        "scripts": {"lint": "eslint .", "test": "jest"},
+        "pnpm": {"overrides": {f"pkg-{i}": f"^{i}.0.0" for i in range(20_000)}},
+    }
+    text = json.dumps(pkg)
+    assert 300_000 < len(text) < 900_000
+    put(tmp_path, "package.json", text)
+    r = verify.discover(tmp_path)
+    assert r.source == "discovered from package.json" and r.notes == [
+        "node_modules is absent here: install dependencies before trusting the node checks"
+    ]
+    assert [c.argv for c in r.fast] == [["npm", "run", "lint"], ["npm", "run", "test"]]
+    big_toml = "[tool.ruff]\nline-length = 100\n" + "".join(
+        f"# {'p' * 60} {i}\n" for i in range(6_000)
+    )
+    assert 300_000 < len(big_toml) < 900_000
+    other = tmp_path / "py"
+    put(other, "pyproject.toml", big_toml)
+    assert [c.name for c in verify.discover(other).fast] == ["ruff"]
+
+
+def test_discover_says_so_when_a_manifest_is_too_large_or_not_a_file(tmp_path):
+    put(tmp_path, "package.json", '{"scripts": {"test": "jest"}, "pad": "' + "x" * 1_100_000 + '"}')
+    (tmp_path / "pyproject.toml").mkdir()  # a directory where a manifest belongs
+    r = verify.discover(tmp_path)
+    assert r.fast == [] and r.source == "discovered: nothing recognised"
+    assert any(n.startswith("package.json is too large to inspect") for n in r.notes), r.notes
+    assert any(n.startswith("pyproject.toml is not a regular file") for n in r.notes), r.notes
+    assert "too large to inspect" in verify.render_toml(r), "the proposal says why it is empty"
+    huge = tmp_path / "py"
+    put(huge, "pyproject.toml", "[tool.ruff]\n" + "# pad\n" * 250_000)
+    assert any("pyproject.toml is too large to inspect" in n for n in verify.discover(huge).notes)
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="needs a FIFO")
+def test_discover_does_not_block_on_a_fifo_in_place_of_a_manifest(tmp_path):
+    for name in ("package.json", "pyproject.toml", "setup.cfg", "Makefile", "README.md"):
+        os.mkfifo(tmp_path / name)
+    r = within(10, verify.discover, tmp_path)
+    assert r.fast == [] and any("not a regular file" in n for n in r.notes)
+
+
+# ---- one gate run per repository at a time ------------------------------------------------------------------------
+def test_gate_does_not_run_the_checks_while_another_run_holds_the_repository(
+    tmp_path, state, monkeypatch
+):
+    monkeypatch.setattr(verify, "RUN_LOCK_WAIT_S", 0.3)
+    marker = tmp_path / "marker"
+    repo = gated_repo(tmp_path, state, [marker_check(marker)])
+    with verify._run_lock(state, verify._repo_key(repo), 5.0, 600.0) as held:
+        assert held
+        t0 = time.monotonic()
+        busy = verify.gate(repo, state)
+        assert time.monotonic() - t0 < 20
+    assert busy.action == "skip" and busy.note == verify.NOTE_BUSY and busy.results == []
+    assert runs(marker) == 0 and not (state / "verify-gate.json").exists()
+    assert verify.gate(repo, state).action == "pass" and runs(marker) == 1, "released: it runs"
+    assert not verify._run_lock_path(state, verify._repo_key(repo)).exists(), "and cleans up"
+
+
+def test_a_second_session_waits_for_the_first_and_finds_its_verdict(tmp_path, state, monkeypatch):
+    """Two Stops within one suite run: the suite ran twice at once and the second one got a false failure."""
+    monkeypatch.setattr(verify, "RUN_LOCK_WAIT_S", 60)
+    marker = tmp_path / "marker"
+    slow = pycheck(
+        "slow", f"import time; time.sleep(1.5); open({str(marker)!r}, 'a').write('x')", timeout=60
+    )
+    repo = gated_repo(tmp_path, state, [slow])
+    first: list = []
+    t = threading.Thread(target=lambda: first.append(verify.gate(repo, state)))
+    t.start()
+    time.sleep(0.5)
+    second = verify.gate(repo, state)
+    t.join(60)
+    assert runs(marker) == 1, "the suite ran once"
+    assert sorted([first[0].action, second.action]) == ["pass", "skip"]
+    skipped = first[0] if first[0].action == "skip" else second
+    assert "unchanged since the last passing run" in skipped.reason
+
+
+def test_the_locks_of_different_repositories_do_not_wait_for_each_other(
+    tmp_path, state, monkeypatch
+):
+    monkeypatch.setattr(verify, "RUN_LOCK_WAIT_S", 0.2)
+    marker = tmp_path / "marker"
+    mine = gated_repo(tmp_path, state, [marker_check(marker)], name="mine")
+    other = gated_repo(tmp_path, state, [marker_check(marker)], name="other")
+    with verify._run_lock(state, verify._repo_key(other), 5.0, 600.0):
+        assert verify.gate(mine, state).action == "pass"
+
+
+def test_a_lock_left_by_a_dead_process_is_taken_over_at_once(tmp_path, state, monkeypatch):
+    monkeypatch.setattr(verify, "RUN_LOCK_WAIT_S", 30)
+    marker = tmp_path / "marker"
+    repo = gated_repo(tmp_path, state, [marker_check(marker)])
+    gone = subprocess.run(
+        [PY, "-c", "import os; print(os.getpid())"], capture_output=True, text=True, check=True
+    )
+    lock = verify._run_lock_path(state, verify._repo_key(repo))
+    lock.write_text(gone.stdout.strip() + "\n", encoding="utf-8")
+    t0 = time.monotonic()
+    assert verify.gate(repo, state).action == "pass"
+    assert time.monotonic() - t0 < 20 and runs(marker) == 1 and not lock.exists()
+
+
+def test_a_lock_older_than_any_run_is_taken_over_even_if_its_owner_looks_alive(
+    tmp_path, state, monkeypatch
+):
+    monkeypatch.setattr(verify, "RUN_LOCK_WAIT_S", 0.3)
+    marker = tmp_path / "marker"
+    repo = gated_repo(tmp_path, state, [marker_check(marker)])
+    lock = verify._run_lock_path(state, verify._repo_key(repo))
+    lock.write_text(f"{os.getpid()}\n", encoding="utf-8")  # a live pid (a recycled one, say)
+    fresh = verify.gate(repo, state)
+    assert fresh.note == verify.NOTE_BUSY and runs(marker) == 0
+    old = time.time() - 3600
+    os.utime(lock, (old, old))
+    assert verify.gate(repo, state).action == "pass" and runs(marker) == 1
+
+
+def test_a_gate_run_goes_ahead_when_no_lock_file_can_be_made(tmp_path, state, monkeypatch):
+    marker = tmp_path / "marker"
+    repo = gated_repo(tmp_path, state, [marker_check(marker)])
+    blocker = state / "not-a-directory"
+    blocker.write_text("x", encoding="utf-8")
+    monkeypatch.setattr(verify, "_run_lock_path", lambda state_dir, key: blocker / "run.lock")
+    assert verify.gate(repo, state).action == "pass" and runs(marker) == 1
+
+
+# ---- a killed hook takes its check with it ------------------------------------------------------------------------
+_HOOK_SCRIPT = """\
+import os, sys
+from pathlib import Path
+from claude_hr import verify
+
+pidfile = sys.argv[2]
+code = "import os, time; open(%r, 'w').write(str(os.getpid())); time.sleep(120)" % pidfile
+verify.run(Path(sys.argv[1]), [verify.Check("slow", [sys.executable, "-c", code], 100)])
+"""
+
+
+@pytest.mark.skipif(
+    os.name == "nt", reason="POSIX signals; Windows has the job object (test below)"
+)
+@pytest.mark.parametrize("sig", [signal.SIGTERM, getattr(signal, "SIGHUP", signal.SIGTERM)])
+def test_a_check_dies_with_the_hook_that_was_terminated_or_hung_up(tmp_path, sig):
+    """The check leads its own session, so a signal that ends only the hook used to leave a test runner, a dev server
+    or a database running (holding ports and files) for the next run to collide with."""
+    script = put(tmp_path, "hook.py", _HOOK_SCRIPT)
+    pidfile = tmp_path / "check.pid"
+    env = {**os.environ, "PYTHONPATH": str(Path(__file__).resolve().parents[1] / "src")}
+    hook = subprocess.Popen([PY, str(script), str(tmp_path), str(pidfile)], env=env)
+    check = None
+    try:
+        deadline = time.monotonic() + 60
+        while not (pidfile.exists() and pidfile.read_text().strip()):
+            assert hook.poll() is None and time.monotonic() < deadline, "the check never started"
+            time.sleep(0.1)
+        check = int(pidfile.read_text())
+        hook.send_signal(sig)
+        assert hook.wait(timeout=30) == 128 + sig
+        stop = time.monotonic() + 15
+        while alive(check) and time.monotonic() < stop:
+            time.sleep(0.1)
+        assert not alive(check), "the check outlived the hook that was signalled"
+    finally:
+        if hook.poll() is None:
+            hook.kill()
+        if check is not None:
+            kill_pid(check)
+
+
+@pytest.mark.skipif(
+    threading.current_thread() is not threading.main_thread(), reason="signal handlers: main thread"
+)
+def test_the_termination_handlers_are_put_back_and_never_replace_someone_elses(tmp_path):
+    def mine(signum, frame):
+        return None
+
+    before = signal.getsignal(signal.SIGTERM)
+    try:
+        signal.signal(signal.SIGTERM, signal.SIG_DFL)
+        verify.run(tmp_path, [pycheck("quick", "pass")])
+        assert signal.getsignal(signal.SIGTERM) == signal.SIG_DFL, "restored after the check"
+        signal.signal(signal.SIGTERM, mine)
+        verify.run(tmp_path, [pycheck("quick", "pass")])
+        assert signal.getsignal(signal.SIGTERM) is mine, "a handler that was there stays"
+    finally:
+        signal.signal(signal.SIGTERM, before)
+
+
+def test_the_termination_handlers_fail_open_off_the_main_thread(tmp_path):
+    res = within(60, verify.run, tmp_path, [pycheck("quick", "pass")])
+    assert res.ok

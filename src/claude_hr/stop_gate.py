@@ -71,7 +71,8 @@ def handle(payload: dict) -> dict | None:
     state = _State.load()
     key = _repo_key(root)
     sig_before = _signature(verify, root, deadline)
-    if state.seen(key) == sig_before:
+    # an empty signature is "cannot tell" (git failed, the status listing was cut off, no time): never an idle tree
+    if sig_before and state.seen(key) == sig_before:
         return None  # nothing changed since the last time this gate looked at the tree (and the recipe's trust did not)
     started = time.monotonic()
 
@@ -106,24 +107,32 @@ def handle(payload: dict) -> dict | None:
             tier=str(cfg.get("verify.tier", "fast")),
             test_guard=cfg.flag("verify.test_guard", True),
             deadline=deadline,
+            env_allow=cfg.get("verify.env_allow", []) or [],
         )
 
     action = getattr(outcome, "action", "")
     note = str(getattr(outcome, "note", "") or "")
     blocked = action == "block"
-    # "time budget" with no check run: not even started, so the tree was NOT looked at. Retry next time like an error
-    # (the formatter or git ate the budget this turn); a run that started and was cut short is remembered, or an
-    # over-long suite would be started and cut short again on every Stop.
+    # A note with a skip and no check run ("time budget": not even started; "another gate run in progress"): the tree was
+    # NOT looked at. Retry next time like an error (the formatter or git ate the budget this turn, the other run may
+    # have found something); a run that started and was cut short is remembered, or an over-long suite would be started
+    # and cut short again on every Stop.
     not_looked_at = bool(note) and action == "skip" and not getattr(outcome, "results", None)
-    if not blocked and action != "error" and not not_looked_at:
+    # "cannot start": a check's tool is missing. The checks that could run passed, so the tree is settled: remembering it
+    # keeps an idle Stop from running the first checks again every time (the reason is in the trail). Any other error is
+    # not remembered (a broken state file may be fixed, a bug may not recur).
+    cannot_start = action == "error" and note == "cannot start"
+    if not blocked and (action != "error" or cannot_start) and not not_looked_at:
         # remember the tree as it is NOW (after formatting) so the next idle Stop is a no-op. A blocked tree is NOT
-        # remembered (if Claude stops again without changing anything, the failing checks must be looked at again) and
-        # neither is an error (a missing tool may be installed before the next turn).
+        # remembered (if Claude stops again without changing anything, the failing checks must be looked at again).
         # The state AFTER the checks: they may leave files behind (coverage output, build artifacts that are not
         # gitignored), and the next idle Stop must not mistake that for a change by Claude. (Accepted trade-off: an
         # edit someone else makes during the run is absorbed the same way, and is only checked on the next change.)
-        state.remember(key, _signature(verify, root, deadline))
-        state.save()
+        # An empty signature ("cannot tell") is never remembered: the gate and the formatter run again next time.
+        sig_after = _signature(verify, root, deadline)
+        if sig_after:
+            state.remember(key, sig_after)
+            state.save()
 
     if cfg.flag("gates.trail", True):
         _trail(
@@ -144,7 +153,22 @@ def handle(payload: dict) -> dict | None:
         # the cap ended the blocking: tell the USER (systemMessage is shown to them, it is not a block and adds nothing
         # to the model's context) that the failure is still there, instead of stopping silently with failing tests
         return {"systemMessage": f"claude-hr: {_first_line(outcome.reason, 300)}"}
+    if action == "skip" and note == "time budget" and getattr(outcome, "results", None):
+        # a check was cut short by the time budget (not by its own timeout_s): that is not a failure and never blocks,
+        # but the USER should know the gate did not get to a verdict. Said once: the tree is remembered above, so the
+        # next idle Stop is a no-op, and a changed tree gets a fresh run and a fresh message.
+        check = str(getattr(outcome, "check", "") or "") or str(
+            getattr(outcome.results[-1], "name", "") or "a check"
+        )
+        return {
+            "systemMessage": f"claude-hr: {_plain(check, 60)} did not finish inside the time budget; not blocking"
+        }
     return None
+
+
+def _plain(text: object, limit: int) -> str:
+    """`text` as one short printable line (a check name comes from the repository's recipe)."""
+    return "".join(ch if ch.isprintable() else " " for ch in str(text))[:limit].strip()
 
 
 def _first_line(text: object, limit: int) -> str:
@@ -194,8 +218,12 @@ def repo_tools_allowed(cfg, root: Path) -> bool:
 
 def _signature(verify, root: Path, deadline: float | None = None) -> str:
     """The working tree plus the recipe's trust state: trusting a recipe must re-run the gate even if no file changed.
-    `deadline` (a time.monotonic() value) bounds the git calls of the fingerprint."""
+    `deadline` (a time.monotonic() value) bounds the git calls of the fingerprint. "" when the tree cannot be fingerprinted
+    (git missing or failing, a status listing cut off at git's cap, out of time): "cannot tell", which the caller must
+    never take for "nothing changed" nor remember."""
     fp = verify.fingerprint(root, deadline=deadline)
+    if not fp:
+        return ""
     return f"{fp}|{verify.trust_state(root, paths.state_dir())}"
 
 

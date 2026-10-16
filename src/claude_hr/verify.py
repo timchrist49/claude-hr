@@ -16,9 +16,10 @@ from __future__ import annotations
 import json
 import os
 import re
+import stat
 import time
 from collections import Counter
-from collections.abc import Iterator
+from collections.abc import Callable, Collection, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath, PureWindowsPath
@@ -48,6 +49,15 @@ _ADVISORY_CAP = 5
 # starting with. Below the sum the gate does not start them (skip, note "time budget").
 POST_RUN_RESERVE_S = 10.0
 MIN_RUN_S = 5.0
+# verify.gate_timeout_s in defaults.toml: what ALL the checks of one end-of-turn run may use together. A check's own
+# timeout_s above this can never be reached in the gate (discover proposes fast checks no higher than this)
+DEFAULT_GATE_TIMEOUT_S = 120
+# a second Stop on the same repository waits this long for a gate run that is still going before it skips
+RUN_LOCK_WAIT_S = 5.0
+# audit-trail tags (GateOutcome.note) the end-of-turn hook acts on (stop_gate keeps the same literals)
+NOTE_TIME_BUDGET = "time budget"
+NOTE_BUSY = "another gate run in progress"
+NOTE_CANNOT_START = "cannot start"
 # test-weakening: one diff line is looked at only up to this many characters (a minified bundle or a hostile line
 # must not cost more than a normal one), and the whole scan stops after this many seconds
 _MAX_LINE = 2000
@@ -116,8 +126,12 @@ class GateOutcome:
     results: list[CheckResult] = field(default_factory=list)
     seconds: float = 0.0
     # short machine-readable tag for the audit trail ("time budget": the hook's deadline cut the run short or
-    # left no time to start); empty for every ordinary outcome
+    # left no time to start; "another gate run in progress"; "cannot start": a check could not be launched); empty for
+    # every ordinary outcome
     note: str = ""
+    # the check a "time budget" skip is about (the one that was cut short, or the first that never started), already
+    # cleaned for display
+    check: str = ""
 
 
 # ---------------------------------------------------------------------------------------------------------------
@@ -243,14 +257,53 @@ def _parse(data: bytes, root: Path, source: str) -> Recipe:
     return Recipe(tiers["fast"], tiers["full"], source)
 
 
+class _NotRegular(OSError):
+    """The path exists but is not a regular file: a FIFO, a device, a directory ..."""
+
+
+def _read_file(path: Path | str, limit: int) -> tuple[bytes, bool]:
+    """(data, more): at most `limit` bytes of a REGULAR file, and whether the file holds more than that.
+
+    Raises FileNotFoundError / NotADirectoryError when there is no file, _NotRegular for anything that is not a regular
+    file, OSError for the rest. Every file a repository controls is read through here (the recipe, the manifests that
+    discovery looks at): a committed symlink to a FIFO, /dev/ptmx or a tty would otherwise block the end-of-turn hook
+    until the host kills it, and one to /dev/zero would be read until memory runs out. The kind is checked before the
+    open (stat never blocks), the opened descriptor is checked again (the path may have been swapped in between, and
+    O_NONBLOCK keeps that open from blocking on a FIFO), and the read never takes more than limit + 1 bytes."""
+    st = os.stat(path)
+    if not stat.S_ISREG(st.st_mode):
+        raise _NotRegular(f"{path} is not a regular file")
+    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NONBLOCK", 0)
+    fd = os.open(path, flags)
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise _NotRegular(f"{path} is not a regular file")
+        chunks: list[bytes] = []
+        total = 0
+        while total <= limit:
+            chunk = os.read(fd, min(65536, limit + 1 - total))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            total += len(chunk)
+    finally:
+        os.close(fd)
+    data = b"".join(chunks)
+    return data[:limit], len(data) > limit
+
+
 def _read_config(root: Path) -> bytes | None:
-    """The raw config bytes, None when there is no file. The same bytes feed the hash and the parser (no TOCTOU)."""
+    """The raw config bytes, None when there is no file. The same bytes feed the hash and the parser (no TOCTOU).
+
+    Only a regular file is read (see _read_file); anything else, or a file that cannot be read, is a
+    VerifyConfigError. At most MAX_CONFIG_BYTES + 1 bytes: _parse rejects the file that is longer."""
     path = config_path(root)
     try:
-        with open(path, "rb") as fh:
-            return fh.read(MAX_CONFIG_BYTES + 1)
+        return _read_file(path, MAX_CONFIG_BYTES + 1)[0]
     except (FileNotFoundError, NotADirectoryError):
         return None
+    except _NotRegular as exc:
+        raise VerifyConfigError(f"{path} is not a regular file; it is not read") from exc
     except OSError as exc:
         raise VerifyConfigError(f"cannot read {path}: {exc}") from exc
 
@@ -383,6 +436,85 @@ def command_line(check: Check) -> str:
     return safe_text(shlex.join(check.argv))
 
 
+class ConfigExists(VerifyConfigError):
+    """`.claude/hr-verify.toml` already exists and `force` was not given."""
+
+
+_IO_REPARSE_TAG_MOUNT_POINT = 0xA0000003  # a Windows junction (a symlink is S_ISLNK)
+
+
+def _is_link(path: Path) -> bool:
+    """A symbolic link (dangling or not) or a Windows junction. False when nothing is there."""
+    try:
+        st = os.lstat(path)
+    except OSError:
+        return False
+    return (
+        stat.S_ISLNK(st.st_mode) or getattr(st, "st_reparse_tag", 0) == _IO_REPARSE_TAG_MOUNT_POINT
+    )
+
+
+def write_config(root: Path, text: str, *, force: bool = False) -> Path:
+    """Write `text` as `<root>/.claude/hr-verify.toml` (what `verify init --write` does). Returns the path.
+
+    The repository is not trusted, and neither is anything it commits: `.claude/hr-verify.toml` or `.claude` itself may be
+    a symbolic link to a file or directory elsewhere (a dangling link to a path that does not exist yet as well).
+    Writing through it would overwrite, or create, a file of the user's outside the repository, so a link at either
+    place is refused (also with `force`), and so is a target that is not a regular file. Nothing is ever written
+    through a link: a new file is created with O_EXCL (which does not follow a link), an existing one is replaced
+    atomically by a new file next to it (jsonio.atomic_write_text with follow_symlinks=False).
+
+    Raises ConfigExists when the file exists and `force` is not set, VerifyConfigError for a link or a target of the
+    wrong kind, OSError when the write fails."""
+    cp = config_path(root)
+    parent = cp.parent
+    for link in (parent, cp):
+        if _is_link(link):
+            raise VerifyConfigError(
+                f"{link} is a symbolic link or junction; nothing is written through it "
+                "(remove the link, or write the recipe yourself)"
+            )
+    try:
+        parent_st = os.lstat(parent)
+    except FileNotFoundError:
+        os.makedirs(parent, exist_ok=True)
+    else:
+        if not stat.S_ISDIR(parent_st.st_mode):
+            raise VerifyConfigError(f"{parent} is not a directory")
+    try:
+        old = os.lstat(cp)
+    except FileNotFoundError:
+        old = None
+    if old is not None:
+        if not stat.S_ISREG(old.st_mode):
+            raise VerifyConfigError(f"{cp} is not a regular file; nothing is written over it")
+        if not force:
+            raise ConfigExists(str(cp))
+        atomic_write_text(cp, text, follow_symlinks=False)
+        if os.name != "nt":
+            # the file the replacement came from was created 0600: give back the old permissions
+            try:
+                os.chmod(cp, stat.S_IMODE(old.st_mode))
+            except OSError:
+                pass
+        return cp
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0)
+    try:
+        fd = os.open(cp, flags, 0o666)
+    except FileExistsError as exc:  # made (or linked) by someone else since the look above
+        raise ConfigExists(str(cp)) from exc
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(text.encode("utf-8"))
+    except BaseException:
+        try:
+            os.unlink(cp)
+        except OSError:
+            pass
+        raise
+    return cp
+
+
 # ---------------------------------------------------------------------------------------------------------------
 # trust: the config only runs once the user approved its exact bytes
 # ---------------------------------------------------------------------------------------------------------------
@@ -436,6 +568,8 @@ def trust_state(root: Path, state_dir: Path) -> str:
     """no-config | invalid | untrusted | modified (trusted once, edited since) | trusted. Never raises."""
     try:
         data = _read_config(root)
+    except VerifyConfigError:
+        return "invalid"  # not a regular file, unreadable: nothing in it is ever run
     except (OSError, ValueError):
         return "untrusted"
     return trust_state_of(root, state_dir, data)
@@ -496,12 +630,17 @@ def untrust(root: Path, state_dir: Path) -> bool:
 #     that holds no secret: GIT_AUTHOR_NAME would otherwise match "AUTH", the CA-bundle paths match "CERT").
 # Values are also dropped when they embed credentials in a URL (https://user:pass@host). A deny-list, not an
 # allow-list, so a harmless variable some tool needs keeps working; it is a speed bump for a naive `print(os.environ)`,
-# not a boundary (the check runs as you and can read ~/.aws or its parent's environment). Keep fmt.py in step.
+# not a boundary (the check runs as you and can read ~/.aws or its parent's environment).
+# A person can exempt names with the config key verify.env_allow (scrubbed_env(allow=...)): the escape hatch for the
+# DATABASE_URL / AWS_PROFILE / DJANGO_SECRET_KEY-style variable a repository's own suite reads from the shell.
+# fmt.py (the formatter step) does not import this module and keeps a list of its own, stricter in some places
+# (JWT, WEBHOOK, PAT) and not yet in step with the exemptions below (PWD, GOPRIVATE, AWS_REGION, npm settings) nor
+# aware of verify.env_allow.
 SECRET_ENV_WORDS = (
     "TOKEN",
     "SECRET",
     "PASS",  # PASSWORD, PASSPHRASE, DB_PASS, PGPASSFILE, GIT_ASKPASS, ...
-    "PWD",  # MYSQL_PWD (the shell's own PWD is dropped too: it would name the hook's directory, not the check's)
+    "PWD",  # MYSQL_PWD (and OLDPWD: stale shell state; the shell's own PWD is kept and set per check, see _run_one)
     "KEY",
     "CRED",
     "AUTH",  # also SSH_AUTH_SOCK
@@ -520,8 +659,10 @@ SECRET_ENV_PREFIXES = (
     "GCP_",
     "GITHUB_",
     "GH_",
-    "NPM_",
 )
+# NPM_ is not a prefix of its own: npm_config_registry / _cache / _prefix are settings. The credential-bearing ones
+# (npm_config__auth, npm_config_//host/:_authToken, NPM_TOKEN, ..._password) hold a word above, and a registry URL with
+# credentials in it is caught by the value rule.
 SECRET_ENV_NAMES = frozenset({"DATABASE_URL", "SSH_AUTH_SOCK", "GIT_ASKPASS", "SSH_ASKPASS"})
 KEEP_ENV = frozenset(
     {
@@ -549,6 +690,17 @@ KEEP_ENV = frozenset(
         "SSL_CERT_FILE",
         "SSL_CERT_DIR",
         "NODE_EXTRA_CA_CERTS",
+        "NIX_SSL_CERT_FILE",
+        "PIP_CERT",
+        "DENO_CERT",
+        "DOCKER_CERT_PATH",
+        # names a word above would catch although they hold no secret
+        "PWD",  # the shell's current directory; each check gets its own (see _run_one)
+        "GOPRIVATE",  # module paths that skip the public proxy (go test fails on a private module without it)
+        "NODE_TLS_REJECT_UNAUTHORIZED",  # a switch (contains AUTH)
+        "XAUTHORITY",  # a path
+        "AWS_REGION",  # a region name; the credentials around it stay dropped
+        "AWS_DEFAULT_REGION",
     }
 )
 KEEP_ENV_PREFIXES = ("GIT_AUTHOR_", "GIT_COMMITTER_")
@@ -556,7 +708,7 @@ _URL_CREDENTIALS = re.compile(r"://[^/@\s:]+:[^/@\s]+@")
 
 
 def is_secret_env(name: str, value: str = "") -> bool:
-    """Would the deny-list drop this variable? (see SECRET_ENV_WORDS)"""
+    """Would the deny-list drop this variable? (see SECRET_ENV_WORDS; verify.env_allow is applied by scrubbed_env)"""
     upper = name.upper()
     if upper in KEEP_ENV or upper.startswith(KEEP_ENV_PREFIXES):
         return False
@@ -569,15 +721,33 @@ def is_secret_env(name: str, value: str = "") -> bool:
     return "://" in value and bool(_URL_CREDENTIALS.search(value[:4096]))
 
 
-def scrubbed_env(base: dict[str, str] | None = None) -> dict[str, str]:
+def env_allow_names(raw: object) -> frozenset[str]:
+    """The names in verify.env_allow, upper-cased: a list of strings, or one string with names separated by commas or
+    spaces (what an environment-variable override of the key gives). Anything else is ignored."""
+    if isinstance(raw, str):
+        raw = re.split(r"[,\s]+", raw)
+    if not isinstance(raw, (list, tuple, set, frozenset)):
+        return frozenset()
+    return frozenset(item.strip().upper() for item in raw if isinstance(item, str) and item.strip())
+
+
+def scrubbed_env(
+    base: dict[str, str] | None = None, *, allow: Collection[str] | str = ()
+) -> dict[str, str]:
     """A copy of the environment without the names and values the deny-list above drops, plus CI=1.
 
     A deny-list, not an allow-list: toolchains need many harmless variables (SYSTEMROOT, APPDATA, CARGO_HOME,
     VIRTUAL_ENV, ...) and a check that only works in a hand-picked environment would fail in the gate and pass in
-    the terminal.
+    the terminal. `allow` (the config key verify.env_allow) names variables that are kept although the deny-list
+    would drop them; the person who set it chose them, a repository cannot.
     """
     src = dict(os.environ if base is None else base)
-    env = {name: value for name, value in src.items() if not is_secret_env(name, value)}
+    keep = env_allow_names(allow)
+    env = {
+        name: value
+        for name, value in src.items()
+        if name.upper() in keep or not is_secret_env(name, value)
+    }
     env["CI"] = "1"
     env[ACTIVE_ENV] = "1"
     return env
@@ -822,6 +992,45 @@ def _reap_group(proc, job: _Job | None) -> None:
         pass
 
 
+def _exit_when_terminated() -> Callable[[], None]:
+    """POSIX: while a check runs, SIGTERM and SIGHUP end this process through SystemExit, so the `except BaseException`
+    in _run_one kills the check's whole process group first. Returns the function that puts the old handlers back.
+
+    Without it a hook that the host ends (Esc during the Stop hook, the session closing) dies at once and the check,
+    which leads its own session, keeps running: a test runner, a dev server or a database that holds ports and files
+    and collides with the next run. Windows has the job object (KILL_ON_JOB_CLOSE) instead. What stays uncovered: a
+    SIGKILL of the hook (the host's own timeout is 170 s, the checks are held to HOOK_BUDGET_S = 150 s, so only a
+    manual kill -9 gets there) and the few microseconds between starting the check and installing the handler. There is
+    no reliable stdlib way to ask the kernel to kill a child when its parent dies (prctl PR_SET_PDEATHSIG needs libc
+    from a preexec_fn, which is unsafe next to the reader threads, and does not exist on macOS), so that is not tried.
+    A handler that someone else installed (the host program, nohup's SIGHUP ignore) is left alone. Fails open: off the
+    main thread, where signal.signal raises, nothing is installed."""
+    if _WIN:
+        return lambda: None
+    import signal
+
+    def on_signal(signum, _frame):
+        raise SystemExit(128 + signum)
+
+    previous: dict = {}
+    for name in ("SIGTERM", "SIGHUP"):
+        sig = getattr(signal, name, None)
+        try:
+            if sig is not None and signal.getsignal(sig) == signal.SIG_DFL:
+                previous[sig] = signal.signal(sig, on_signal)
+        except (ValueError, OSError):
+            continue
+
+    def restore() -> None:
+        for sig, old in previous.items():
+            try:
+                signal.signal(sig, old)
+            except (ValueError, OSError):
+                pass
+
+    return restore
+
+
 def _resolve_exe(name: str, cwd: Path, path_env: str) -> str | None:
     """Find the executable like a shell would, but never in the repo unless asked with an explicit path.
 
@@ -901,6 +1110,10 @@ def _run_one(
         if bad is not None:
             return refused(126, f"refused: argument {bad!r} has characters cmd.exe would interpret")
     argv[0] = exe
+    if not _WIN:
+        # what a shell does before it runs a command: the check's directory, not the hook's (GNU make reads $(PWD) and
+        # docker compose ${PWD} only from the environment). Windows shells do not set PWD; whatever is there stays.
+        env = {**env, "PWD": str(cwd)}
     kwargs: dict = (
         {"creationflags": _NO_WINDOW | _NEW_GROUP} if _WIN else {"start_new_session": True}
     )
@@ -921,6 +1134,7 @@ def _run_one(
     job = _Job(proc) if _WIN else None
     tail = _Tail(proc.stdout)
     timed_out = False
+    restore_signals = _exit_when_terminated()
     try:
         try:
             proc.wait(timeout=limit)
@@ -930,9 +1144,11 @@ def _run_one(
         else:
             _reap_group(proc, job)
     except BaseException:
+        # includes the SystemExit of _exit_when_terminated: the check's group dies with the hook
         _kill_tree(proc, job)
         raise
     finally:
+        restore_signals()
         if job is not None:
             job.close()
     # a grandchild that outlives the check may keep the pipe open: do not wait for EOF forever
@@ -949,21 +1165,35 @@ def _run_one(
     )
 
 
+def _budget_cut(own_s: float, limit: float) -> bool:
+    """Did the overall budget shorten a check's own timeout by a meaningful amount?
+
+    Only then is a timeout "inconclusive" (the suite may simply have needed more time). A check whose own timeout_s
+    equals the budget gets a hair less than that (the clock has already ticked), which is not a cut: it ran for as
+    long as it was allowed to and a hang is a failure. A meaningful amount is more than a second or more than a tenth
+    of its own limit, whichever is smaller."""
+    return own_s - limit > min(1.0, 0.1 * own_s)
+
+
 def run(
     root: Path,
     checks: list[Check],
     *,
     total_timeout_s: float = 300,
     stop_on_fail: bool = False,
+    env_allow: Collection[str] | str = (),
 ) -> RunResult:
     """Run checks in order. No shell, scrubbed env, per-check timeout, the process tree dies on timeout, and what a
     check leaves running when it exits on its own (a dev server, a watcher) is ended with it.
 
-    Never raises: a missing tool is a result with rc 127. `total_timeout_s` bounds the whole run (each check gets
-    the smaller of its own limit and what is left). The gate passes stop_on_fail=True, `verify run` wants them all.
+    Never raises: a missing tool is a result with rc 127 (launch_failed). `total_timeout_s` bounds the whole run (each
+    check gets the smaller of its own limit and what is left; see _budget_cut for when a timeout counts as cut short).
+    The gate passes stop_on_fail=True, `verify run` wants them all. stop_on_fail stops at a check that RAN and failed:
+    one that could not be launched (a tool that is not installed) does not hide the checks after it, and the first
+    check's missing tool must not switch the whole gate off. `env_allow` is verify.env_allow (see scrubbed_env).
     """
     root = Path(root)
-    env = scrubbed_env()
+    env = scrubbed_env(allow=env_allow)
     start = time.monotonic()
     results: list[CheckResult] = []
     skipped: list[str] = []
@@ -972,9 +1202,10 @@ def run(
         if remaining <= 0:
             skipped += [c.name for c in checks[i:]]
             break
-        res = _run_one(root, chk, env, min(chk.timeout_s, remaining), remaining < chk.timeout_s)
+        limit = min(chk.timeout_s, remaining)
+        res = _run_one(root, chk, env, limit, _budget_cut(chk.timeout_s, limit))
         results.append(res)
-        if res.rc != 0 and stop_on_fail:
+        if res.rc != 0 and stop_on_fail and not res.launch_failed:
             skipped += [c.name for c in checks[i + 1 :]]
             break
     return RunResult(results, time.monotonic() - start, skipped)
@@ -1571,23 +1802,37 @@ def gate(
     tier: str = "fast",
     test_guard: bool = True,
     deadline: float | None = None,
+    env_allow: Collection[str] | str = (),
 ) -> GateOutcome:
     """Run the trusted recipe's tier for the work tree as it is now. Never raises, never runs untrusted config.
 
     skip  - nothing to do: no/untrusted/empty config, nothing changed since the last green run, or this change
-            already blocked `max_blocks` times (the reason still names the failure), or the run was inconclusive
+            already blocked `max_blocks` times (the reason still names the failure), or the run was inconclusive,
+            or another gate run on this repository is still going (note "another gate run in progress")
     pass  - every check passed; the fingerprint is remembered as green
     block - a check failed; `reason` is what to hand the model (summary line, output tail, test-weakening hints)
-    error - something outside the code under test went wrong (missing tool, broken state file, bug): fail open
+    error - something outside the code under test went wrong (broken state file, bug), or a check could not be
+            launched (a tool that is not installed; note "cannot start": the checks that could run all passed): fail open
 
     `deadline` (a time.monotonic() value) is the caller's overall budget, the end-of-turn hook's, which a killed
     hook would silently turn into a lost block. The checks get min(timeout_s, what is left minus
     POST_RUN_RESERVE_S), every git call is bounded by it, and with less than POST_RUN_RESERVE_S + MIN_RUN_S left
-    nothing is started (skip, note "time budget").
+    nothing is started (skip, note "time budget"). A check that hits ITS OWN timeout_s is a failed check (block); one
+    that was cut short by this overall budget (it could have run for meaningfully longer on its own limit) is
+    inconclusive: skip, note "time budget", `check` names it. `env_allow` is verify.env_allow (see scrubbed_env).
     """
     t0 = time.monotonic()
     try:
-        out = _gate(Path(root), Path(state_dir), max_blocks, timeout_s, tier, test_guard, deadline)
+        out = _gate(
+            Path(root),
+            Path(state_dir),
+            max_blocks,
+            timeout_s,
+            tier,
+            test_guard,
+            deadline,
+            env_allow,
+        )
     except Exception as exc:
         out = GateOutcome("error", f"verify gate failed: {type(exc).__name__}: {exc}")
     out.seconds = time.monotonic() - t0
@@ -1598,6 +1843,38 @@ def _fingerprint_by(root: Path, deadline: float | None) -> str:
     return fingerprint(root) if deadline is None else fingerprint(root, deadline=deadline)
 
 
+def _run_lock_path(state_dir: Path, key: str) -> Path:
+    return Path(state_dir) / f"verify-run-{_sha256(key.encode('utf-8', 'replace'))[:16]}.lock"
+
+
+@contextmanager
+def _run_lock(state_dir: Path, key: str, wait_s: float, stale_s: float) -> Iterator[bool]:
+    """Held across one gate run of one repository, so that two sessions that stop within one suite's run time do not
+    run the suite at once (a port, a sqlite file, a build directory: the second would fail on what the first holds, and
+    its model would be told to fix a failure its code did not cause).
+
+    Yields True with the lock held; False when another run still holds it after `wait_s` (the caller skips); True
+    without a lock when none can be made (a read-only state directory): this never blocks the hook for long and never
+    fails it. A lock whose owner process is gone is taken over at once, and one older than `stale_s` (longer than any
+    run can last, see _gate) whoever owns it."""
+    from .filelock import LockTimeout, locked
+
+    lock = None
+    busy = False
+    try:
+        lock = locked(_run_lock_path(state_dir, key), timeout=max(0.0, wait_s), stale_after=stale_s)
+        lock.__enter__()
+    except LockTimeout:
+        lock, busy = None, True
+    except OSError:
+        lock = None
+    try:
+        yield not busy
+    finally:
+        if lock is not None:
+            lock.__exit__(None, None, None)
+
+
 def _gate(
     root: Path,
     state_dir: Path,
@@ -1606,6 +1883,7 @@ def _gate(
     tier: str,
     test_guard: bool,
     deadline: float | None = None,
+    env_allow: Collection[str] | str = (),
 ) -> GateOutcome:
     def skip(reason: str, fp: str = "") -> GateOutcome:
         return GateOutcome("skip", reason, fp)
@@ -1622,7 +1900,7 @@ def _gate(
             "skip",
             f"time budget: {left:.0f}s of the hook's deadline left, too little to run the checks; not blocking",
             fp,
-            note="time budget",
+            note=NOTE_TIME_BUDGET,
         )
 
     if os.environ.get(ACTIVE_ENV):
@@ -1653,89 +1931,119 @@ def _gate(
         return skip("blocking is disabled (gate_max_blocks < 1)")
     if room() < MIN_RUN_S:
         return out_of_time()
-    fp = _fingerprint_by(root, deadline)
-    if not fp:
-        return skip(
-            "cannot fingerprint the work tree (git missing, not a repository, too many untracked files "
-            "or out of time)"
-        )
-    entry = _gate_entry(state_dir, key)
-    if fp in (entry.get("last_green"), entry.get("last_green_after")):
-        return skip("unchanged since the last passing run", fp)
-    blocks = entry.get("blocks")
-    seen = _count(blocks.get(fp)) if isinstance(blocks, dict) else 0
-    if seen >= max_blocks:
-        last = entry.get("last_block")
-        same = isinstance(last, dict) and fp in (last.get("fp"), last.get("fp_after"))
-        summary = last.get("summary") if same else None
-        tail = f"; last failure: {summary}" if isinstance(summary, str) else ""
-        return skip(f"block cap reached ({seen}/{max_blocks}) for this change{tail}", fp)
-    if room() < MIN_RUN_S:  # the fingerprint and the state lookup may have used what was left
-        return out_of_time(fp)
-    budget = min(timeout_s, room())
 
-    rr = run(root, checks, total_timeout_s=budget, stop_on_fail=True)
-    failed = rr.failed
-    if failed is None and not rr.skipped:
-        # the tree the checks leave behind (coverage files, a test database) is what the next Stop will look at
+    def look_and_run() -> GateOutcome:
+        fp = _fingerprint_by(root, deadline)
+        if not fp:
+            return skip(
+                "cannot fingerprint the work tree (git missing, not a repository, too many untracked files "
+                "or out of time)"
+            )
+        entry = _gate_entry(state_dir, key)
+        if fp in (entry.get("last_green"), entry.get("last_green_after")):
+            return skip("unchanged since the last passing run", fp)
+        blocks = entry.get("blocks")
+        seen = _count(blocks.get(fp)) if isinstance(blocks, dict) else 0
+        if seen >= max_blocks:
+            last = entry.get("last_block")
+            same = isinstance(last, dict) and fp in (last.get("fp"), last.get("fp_after"))
+            summary = last.get("summary") if same else None
+            tail = f"; last failure: {summary}" if isinstance(summary, str) else ""
+            return skip(f"block cap reached ({seen}/{max_blocks}) for this change{tail}", fp)
+        if room() < MIN_RUN_S:  # the fingerprint and the state lookup may have used what was left
+            return out_of_time(fp)
+        budget = min(timeout_s, room())
+
+        rr = run(root, checks, total_timeout_s=budget, stop_on_fail=True, env_allow=env_allow)
+        # a check that could not be launched is a setup problem, not a verdict on the code: it never hides the
+        # checks after it (run() goes on) and it is not the failure the model is told about
+        failed = next((r for r in rr.results if r.rc != 0 and not r.launch_failed), None)
+        unlaunched = [r for r in rr.results if r.launch_failed]
+        if failed is None and not rr.skipped:
+            if unlaunched:
+                first = unlaunched[0]
+                more = f" (and {len(unlaunched) - 1} more)" if len(unlaunched) > 1 else ""
+                # nothing is recorded as green (not every check ran). The checks that could run passed: the hook
+                # remembers this tree (note "cannot start") so an idle Stop does not run them again, and the reason
+                # is in the audit trail.
+                return GateOutcome(
+                    "error",
+                    f"claude-hr verify: cannot run {_clean(first.name)}: {_comment(first.output, 300)}{more}",
+                    fp,
+                    rr.results,
+                    rr.seconds,
+                    note=NOTE_CANNOT_START,
+                )
+            # the tree the checks leave behind (coverage files, a test database) is what the next Stop will look at
+            after = _fingerprint_by(root, deadline)
+            try:
+                _record(state_dir, key, _mark_green(fp, after))
+            except OSError:
+                pass  # not remembering a green run only costs one re-run
+            return GateOutcome(
+                "pass",
+                f"{len(rr.results)} check(s) passed in {rr.seconds:.1f}s",
+                fp,
+                rr.results,
+                rr.seconds,
+            )
+        if failed is None:
+            done = f"{len(rr.results)} of {len(checks)}"
+            return GateOutcome(
+                "skip",
+                f"time budget ({budget:g}s) used up after {done} checks; not blocking",
+                fp,
+                rr.results,
+                note=NOTE_TIME_BUDGET,
+                check=_clean(rr.skipped[0]),
+            )
+        if failed.clamped:
+            return GateOutcome(
+                "skip",
+                f"time budget ({budget:g}s) ran out inside {_clean(failed.name)}; inconclusive, not blocking",
+                fp,
+                rr.results,
+                note=NOTE_TIME_BUDGET,
+                check=_clean(failed.name),
+            )
+        summary = _failure_summary(failed)
+        lines = [summary]
+        if failed.output:
+            lines.append(failed.output)
+        # the failing check may have written files; the next Stop fingerprints that tree and must find the count there
         after = _fingerprint_by(root, deadline)
+        if test_guard:
+            advice = (
+                test_weakening(root)
+                if deadline is None
+                else test_weakening(root, deadline=deadline)
+            )
+            lines += [f"Possible test weakening: {adv}" for adv in advice]
         try:
-            _record(state_dir, key, _mark_green(fp, after))
-        except OSError:
-            pass  # not remembering a green run only costs one re-run
-        return GateOutcome(
-            "pass",
-            f"{len(rr.results)} check(s) passed in {rr.seconds:.1f}s",
-            fp,
-            rr.results,
-            rr.seconds,
-        )
-    if failed is None:
-        done = f"{len(rr.results)} of {len(checks)}"
-        return GateOutcome(
-            "skip",
-            f"time budget ({budget:g}s) used up after {done} checks; not blocking",
-            fp,
-            rr.results,
-            note="time budget",
-        )
-    if failed.launch_failed:
-        return GateOutcome(
-            "error",
-            f"claude-hr verify: cannot run {_clean(failed.name)}: {failed.output}",
-            fp,
-            rr.results,
-        )
-    if failed.clamped:
-        return GateOutcome(
-            "skip",
-            f"time budget ({budget:g}s) ran out inside {_clean(failed.name)}; inconclusive, not blocking",
-            fp,
-            rr.results,
-            note="time budget",
-        )
-    summary = _failure_summary(failed)
-    lines = [summary]
-    if failed.output:
-        lines.append(failed.output)
-    # the failing check may have written files; the next Stop fingerprints that tree and must find the count there
-    after = _fingerprint_by(root, deadline)
-    if test_guard:
-        advice = (
-            test_weakening(root) if deadline is None else test_weakening(root, deadline=deadline)
-        )
-        lines += [f"Possible test weakening: {adv}" for adv in advice]
-    try:
-        _record(state_dir, key, _mark_block(fp, summary, after))
-    except OSError as exc:
-        # without a block counter the cap cannot work: fail open instead of nagging forever
-        return GateOutcome(
-            "error",
-            f"claude-hr verify: cannot record gate state ({exc}); {summary}",
-            fp,
-            rr.results,
-        )
-    return GateOutcome("block", "\n".join(lines), fp, rr.results)
+            _record(state_dir, key, _mark_block(fp, summary, after))
+        except OSError as exc:
+            # without a block counter the cap cannot work: fail open instead of nagging forever
+            return GateOutcome(
+                "error",
+                f"claude-hr verify: cannot record gate state ({exc}); {summary}",
+                fp,
+                rr.results,
+            )
+        return GateOutcome("block", "\n".join(lines), fp, rr.results)
+
+    # One run per repository at a time, from the fingerprint to the state write: a second session that Stops while the
+    # first still runs the suite waits a moment (and then finds the first one's verdict), or skips and is retried on its
+    # next Stop. The lock outlives any run: the checks get at most `timeout_s`, the hook at most its deadline.
+    stale_s = max(180.0, float(timeout_s) + 60.0)
+    wait_s = max(0.0, min(RUN_LOCK_WAIT_S, room() - MIN_RUN_S))
+    with _run_lock(state_dir, key, wait_s, stale_s) as held:
+        if not held:
+            return GateOutcome(
+                "skip",
+                "another gate run is in progress for this repository; not running the checks twice at once",
+                note=NOTE_BUSY,
+            )
+        return look_and_run()
 
 
 # ---------------------------------------------------------------------------------------------------------------
@@ -1762,7 +2070,12 @@ class _Builder:
         tier: str = "fast",
         timeout: int | None = None,
     ) -> None:
-        chk = Check(name, list(argv), timeout or _TIMEOUTS[category])
+        limit = timeout or _TIMEOUTS[category]
+        if tier == "fast":
+            # the end-of-turn gate gives ALL the checks together verify.gate_timeout_s: a longer own limit could never
+            # be reached there (the run is cut short and reported as inconclusive), so it is not proposed
+            limit = min(limit, DEFAULT_GATE_TIMEOUT_S)
+        chk = Check(name, list(argv), limit)
         if tier == "fast":
             self.fast.append((_RANK[category], chk))
             self.categories.add(category)
@@ -1787,25 +2100,52 @@ class _Builder:
 
 
 def _read_text(path: Path, limit: int = 256_000) -> str | None:
+    """The first `limit` bytes of a regular file as text (docs, CI files and Makefiles are only searched, a prefix is
+    enough). None when there is no such file, it is not a regular file, or it cannot be read."""
     try:
-        with open(path, "rb") as fh:
-            return fh.read(limit).decode("utf-8", errors="replace")
+        return _read_file(path, limit)[0].decode("utf-8", errors="replace")
     except OSError:
         return None
 
 
-def _load_json(path: Path) -> object:
-    text = _read_text(path)
+# no real package.json / pyproject.toml / setup.cfg is anywhere near this (fmt.py and initrepo.py use the same bound)
+_MAX_MANIFEST_BYTES = 1_000_000
+
+
+def _read_manifest(path: Path, notes: list[str]) -> str | None:
+    """A manifest read WHOLE: a cut-off package.json or pyproject.toml would not parse and discovery would then report
+    "nothing recognised" about a repository it simply did not read. None (with a note saying why) for a file over
+    _MAX_MANIFEST_BYTES or one that is not a regular file; None without a note when there is no file."""
+    try:
+        data, more = _read_file(path, _MAX_MANIFEST_BYTES)
+    except (FileNotFoundError, NotADirectoryError):
+        return None
+    except _NotRegular:
+        notes.append(f"{path.name} is not a regular file: not inspected")
+        return None
+    except OSError:
+        return None
+    if more:
+        notes.append(
+            f"{path.name} is too large to inspect (over {_MAX_MANIFEST_BYTES // 1000} KB): "
+            "nothing was proposed from it"
+        )
+        return None
+    return data.decode("utf-8", errors="replace")
+
+
+def _load_json(path: Path, notes: list[str]) -> object:
+    text = _read_manifest(path, notes)
     try:
         return json.loads(text) if text is not None else None
-    except ValueError:
+    except (ValueError, RecursionError):
         return None
 
 
-def _load_toml(path: Path) -> dict:
+def _load_toml(path: Path, notes: list[str]) -> dict:
     import tomllib
 
-    text = _read_text(path)
+    text = _read_manifest(path, notes)
     try:
         doc = tomllib.loads(text) if text is not None else {}
     except (ValueError, RecursionError):
@@ -1833,7 +2173,7 @@ _WATCH_RE = re.compile(r"--watch(?:All)?\b(?!\s*=\s*false)")
 
 
 def _discover_node(root: Path, b: _Builder) -> None:
-    pkg = _load_json(root / "package.json")
+    pkg = _load_json(root / "package.json", b.notes)
     if not isinstance(pkg, dict):
         return
     b.sources.append("package.json")
@@ -1934,10 +2274,10 @@ def _discover_python(root: Path, b: _Builder) -> None:
     present = [m for m in markers if (root / m).exists()]
     if not present:
         return
-    pyproject = _load_toml(root / "pyproject.toml")
+    pyproject = _load_toml(root / "pyproject.toml", b.notes)
     tool = pyproject.get("tool")
     tool = tool if isinstance(tool, dict) else {}
-    setup_cfg = _read_text(root / "setup.cfg") or ""
+    setup_cfg = _read_manifest(root / "setup.cfg", b.notes) or ""
 
     runner: list[str] = []
     for lock, argv in (
