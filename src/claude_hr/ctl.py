@@ -1002,8 +1002,15 @@ def cmd_verify(a, cfg) -> int:
             if hint:
                 out(hint)
             return 0
+        when_trusted = "TRUSTED: the end-of-turn gate runs these checks"
+        if state == "trusted" and doctor.state_inside_repo(Path.cwd()):
+            # the hook refuses a state folder inside the repository: the record is valid and the gate still does not run
+            when_trusted = (
+                "NOT RUNNING: the state folder is inside this repository, so the end-of-turn hook ignores its trust "
+                f"record (set CLAUDE_HR_HOME outside the repository; the state folder is {paths.state_dir()})"
+            )
         meaning = {
-            "trusted": "TRUSTED: the end-of-turn gate runs these checks",
+            "trusted": when_trusted,
             "untrusted": "NOT trusted: the gate does nothing until a person approves it (`claude-hr-ctl verify enable`)",
             "modified": "CHANGED since it was trusted: the gate does nothing until it is reviewed and trusted again (`claude-hr-ctl verify enable`)",
         }.get(state, state)
@@ -1036,6 +1043,8 @@ def cmd_verify(a, cfg) -> int:
         except Exception:  # noqa: BLE001 - the preflight is advice; it must not block the decision
             pass
         out(f"\nfile sha256: {loaded.sha256}")
+        if doctor.state_inside_repo(Path.cwd()):
+            out(f"\nwarning: {doctor.state_inside_warning()}")
         if not _confirm("\nTrust exactly this file?"):
             out("not trusted")
             return 1
