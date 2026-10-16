@@ -11,9 +11,11 @@ imported inside the functions that need them.
 
 from __future__ import annotations
 
+import errno
 import fnmatch
 import os
 import re
+import stat
 import time
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
@@ -73,11 +75,39 @@ _GENERATED = re.compile(
 _RUSTFMT_BANNER = re.compile(r"\Astdin:\r?\n(?:\r?\n)?")
 # cmd.exe metacharacters (BatBadBut): never pass them to a .cmd/.bat shim
 _CMD_UNSAFE = re.compile(r'[%^&|<>!"\r\n]')
-_SECRET_ENV = re.compile(r"token|secret|passw|credential|api[_-]?key|private[_-]?key|auth", re.I)
+# A formatter may execute repo-controlled configuration (a trusted repo, or format.repo_tools = always), so it gets
+# the verify runner's treatment, widened: a deny-list (toolchains need too many harmless variables for an allow-list).
+_SECRET_ENV = re.compile(
+    r"TOKEN|SECRET|PASS|PWD|KEY|CRED|AUTH|COOKIE|DSN|CONNECTION|PRIVATE|CERT|JWT|WEBHOOK|(?:^|_)PAT(?:_|$)",
+    re.I,
+)
+_SECRET_ENV_PREFIXES = (
+    "ANTHROPIC_", "CLAUDE_CODE_", "AWS_", "AZURE_", "GOOGLE_", "GCP_", "GITHUB_", "GH_", "NPM_",
+)  # fmt: skip
+_SECRET_ENV_NAMES = frozenset({"DATABASE_URL", "SSH_AUTH_SOCK", "GIT_ASKPASS", "SSH_ASKPASS"})
+# `scheme://user:password@host`: DATABASE_URL, REDIS_URL, HTTPS_PROXY, a registry URL ... whatever the variable is called
+_URL_CREDENTIALS = re.compile(r"://[^/\s@:]*:[^/\s@]+@")
+# never dropped, even if a name above would match: git needs the identity variables, toolchains need their homes
+_KEEP_ENV = frozenset(
+    {
+        "PATH", "PATHEXT", "HOME", "USERPROFILE", "SYSTEMROOT", "SYSTEMDRIVE", "WINDIR", "COMSPEC",
+        "TEMP", "TMP", "TMPDIR", "APPDATA", "LOCALAPPDATA", "PROGRAMDATA", "LANG", "LANGUAGE",
+        "CARGO_HOME", "RUSTUP_HOME", "GOPATH", "GOROOT", "GOCACHE", "GOMODCACHE", "VIRTUAL_ENV",
+        "NODE_PATH", "PYTHONPATH", "PYTHONHOME",
+    }
+)  # fmt: skip
+_KEEP_ENV_PREFIXES = ("GIT_AUTHOR_", "GIT_COMMITTER_")
 _GIT_REDIRECT_ENV = (
     "GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_PREFIX", "GIT_COMMON_DIR",
-    "GIT_OBJECT_DIRECTORY", "GIT_NAMESPACE",
+    "GIT_OBJECT_DIRECTORY", "GIT_NAMESPACE", "GIT_CONFIG_COUNT", "GIT_CONFIG_PARAMETERS",
 )  # fmt: skip
+# injected git configuration travels as a family: GIT_CONFIG_COUNT without its KEY_n makes git die, so all go together
+_GIT_REDIRECT_PREFIXES = ("GIT_CONFIG_KEY_", "GIT_CONFIG_VALUE_")
+# no real pyproject.toml / package.json / Cargo.toml is anywhere near this
+_MAX_CONFIG_BYTES = 1_000_000
+_REPLACE_TRIES = (
+    4  # os.replace attempts on Windows (50, 100, 200 ms apart) before a locked file is reported
+)
 
 DRIFT_REASON = "pre-existing formatting drift"
 BUDGET_REASON = "time budget"
@@ -151,16 +181,31 @@ class _Proc:
     timed_out: bool = False
 
 
+def _env_is_dropped(name: str, value: str) -> bool:
+    """True for a variable that looks like a credential, or that would redirect git to another repository / inject
+    git configuration when we are called from inside a git hook. See _SECRET_ENV and _KEEP_ENV."""
+    up = name.upper()
+    if up in _GIT_REDIRECT_ENV or up.startswith(_GIT_REDIRECT_PREFIXES):
+        return True
+    if up in _KEEP_ENV or up.startswith(_KEEP_ENV_PREFIXES):
+        return False
+    return bool(
+        up in _SECRET_ENV_NAMES
+        or up.startswith(_SECRET_ENV_PREFIXES)
+        or _SECRET_ENV.search(up)
+        or ("@" in value and _URL_CREDENTIALS.search(value))
+    )
+
+
 def _clean_env() -> dict[str, str]:
-    """Environment for git and formatters: no credentials (a formatter may execute repo-controlled config), and
-    nothing that would redirect git to another repository when we are called from inside a git hook."""
-    env = {
-        k: v
-        for k, v in os.environ.items()
-        if not _SECRET_ENV.search(k)
-        and not k.startswith("ANTHROPIC_")
-        and k not in _GIT_REDIRECT_ENV
-    }
+    """Environment for git and formatters: no credentials (a formatter may execute repo-controlled config; the
+    deny-list is the verify runner's, widened), and nothing that would redirect git to another repository or inject
+    git configuration when we are called from inside a git hook."""
+    env = {k: v for k, v in os.environ.items() if not _env_is_dropped(k, v)}
+    if paths.IS_WINDOWS:
+        # cmd.exe (which runs an npm .cmd shim) and CreateProcess look in the current directory, here the untrusted
+        # repository, before PATH: a planted node.exe there would run instead of the real one
+        env["NoDefaultCurrentDirectoryInExePath"] = "1"
     env.update(
         GIT_OPTIONAL_LOCKS="0",  # `git status` must not take the index lock away from the user's own git commands
         GIT_TERMINAL_PROMPT="0",
@@ -172,11 +217,22 @@ def _clean_env() -> dict[str, str]:
     return env
 
 
+def _taskkill_exe() -> str:
+    """taskkill.exe by absolute path under %SystemRoot%\\System32. The bare name would be searched in the current
+    directory first (an untrusted repository) when NoDefaultCurrentDirectoryInExePath is not set; if System32 has
+    none, the bare name still goes through procutil.run, which searches absolute PATH entries only."""
+    root = os.environ.get("SystemRoot") or os.environ.get("windir") or ""
+    if not os.path.isabs(root):
+        root = r"C:\Windows"
+    exe = os.path.join(root, "System32", "taskkill.exe")
+    return exe if os.path.isfile(exe) else "taskkill"
+
+
 def _kill_tree(proc) -> None:
     """Kill the formatter and its children (a Windows .cmd shim leaves node running after its cmd.exe dies)."""
     try:
         if paths.IS_WINDOWS:
-            procutil.run(["taskkill", "/PID", str(proc.pid), "/T", "/F"], timeout=10)
+            procutil.run([_taskkill_exe(), "/PID", str(proc.pid), "/T", "/F"], timeout=10)
         else:
             os.killpg(proc.pid, 9)
     except (OSError, ValueError):
@@ -229,10 +285,10 @@ _GIT_EXE: dict[str, str | None] = {}
 
 
 def _git_exe() -> str | None:
-    """Absolute path of git, found on absolute PATH entries only (never the repo's own directory)."""
+    """Absolute path of git (procutil.resolve_exe: absolute PATH entries only, never the repo's own directory)."""
     key = os.environ.get("PATH", "")
     if key not in _GIT_EXE:
-        _GIT_EXE[key] = _which("git")
+        _GIT_EXE[key] = procutil.resolve_exe("git")
     return _GIT_EXE[key]
 
 
@@ -311,11 +367,44 @@ def _rel(p: Path, root: Path) -> str:
         return str(p)
 
 
-def _read_text(p: Path) -> str | None:
+def _read_regular(p: Path | str, limit: int) -> bytes | None:
+    """The bytes of a regular file of at most `limit` bytes, else None. Never raises.
+
+    For files the repository controls (pyproject.toml, package.json, Cargo.toml ...): a symlink to /dev/zero would be
+    read until memory runs out, and one to a FIFO or /dev/ptmx would block the hook for good. So the kind is checked
+    before opening (stat never blocks), the opened descriptor is checked again (the file may have been swapped), the
+    size is capped, and the read itself never takes more than limit + 1 bytes."""
     try:
-        return p.read_text(encoding="utf-8-sig", errors="replace")
-    except OSError:
+        st = os.stat(p)
+        if not stat.S_ISREG(st.st_mode) or st.st_size > limit:
+            return None
+        flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NONBLOCK", 0)
+        fd = os.open(p, flags)
+        try:
+            if not stat.S_ISREG(os.fstat(fd).st_mode):
+                return None
+            chunks: list[bytes] = []
+            total = 0
+            while total <= limit:
+                chunk = os.read(fd, min(65536, limit + 1 - total))
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                total += len(chunk)
+        finally:
+            os.close(fd)
+    except (OSError, ValueError):
         return None
+    return None if total > limit else b"".join(chunks)
+
+
+def _read_text(p: Path) -> str | None:
+    """Text of a repo-controlled configuration file (see _read_regular); None when unreadable, not a regular file, or
+    bigger than _MAX_CONFIG_BYTES, which the callers treat as "not configured"."""
+    data = _read_regular(p, _MAX_CONFIG_BYTES)
+    if data is None:
+        return None
+    return data.decode("utf-8-sig", "replace").replace("\r\n", "\n").replace("\r", "\n")
 
 
 def _toml_has_table(text: str, *names: str) -> bool:
@@ -375,7 +464,7 @@ def _prettier_config(dirs: list[Path], root: Path) -> str | None:
 
             try:
                 data = json.loads(text)
-            except ValueError:
+            except (ValueError, RecursionError):  # deeply nested JSON must not abort detection
                 continue
             if isinstance(data, dict) and "prettier" in data:
                 return _rel(d / "package.json", root)
@@ -442,9 +531,13 @@ def _rust_edition(path: Path) -> str:
     import tomllib
 
     def load(manifest: Path) -> dict:
+        # bounded, regular files only: never a device or an endless file
+        text = _read_text(manifest)
+        if text is None:
+            return {}
         try:
-            data = tomllib.loads(manifest.read_text(encoding="utf-8-sig"))
-        except (OSError, ValueError):
+            data = tomllib.loads(text)
+        except Exception:  # noqa: BLE001 - TOMLDecodeError, but also RecursionError on hostile nesting
             return {}
         return data if isinstance(data, dict) else {}
 
@@ -533,12 +626,14 @@ class _Cand:
     rel: str  # posix, relative to root
     top_rel: str  # posix, relative to the git top level ("" when unknown)
     tracked: bool  # False = untracked (never has a HEAD version)
+    orig_top_rel: str = ""  # rename/copy only: the path at HEAD (top-level relative)
 
 
-def _parse_status(raw: bytes) -> list[tuple[str, str]]:
-    """(XY, path) for each entry of `git status --porcelain=v1 -z` (paths are relative to the repo top level)."""
+def _parse_status_entries(raw: bytes) -> list[tuple[str, str, str]]:
+    """(XY, path, original path) for each entry of `git status --porcelain=v1 -z`; paths are relative to the repo top
+    level, and the original path is "" unless the entry is a rename or copy (git prints it after the new path)."""
     fields = raw.split(b"\0")
-    out: list[tuple[str, str]] = []
+    out: list[tuple[str, str, str]] = []
     i = 0
     while i < len(fields):
         item = fields[i]
@@ -546,10 +641,18 @@ def _parse_status(raw: bytes) -> list[tuple[str, str]]:
         if len(item) < 4 or item[2:3] != b" ":
             continue
         xy = item[:2].decode("ascii", "replace")
-        out.append((xy, os.fsdecode(item[3:])))
+        orig = ""
         if "R" in xy or "C" in xy:
+            if i < len(fields):
+                orig = os.fsdecode(fields[i])
             i += 1  # a rename/copy entry is followed by the original path
+        out.append((xy, os.fsdecode(item[3:]), orig))
     return out
+
+
+def _parse_status(raw: bytes) -> list[tuple[str, str]]:
+    """(XY, path) for each entry of `git status --porcelain=v1 -z` (paths are relative to the repo top level)."""
+    return [(xy, path) for xy, path, _orig in _parse_status_entries(raw)]
 
 
 def _glob_match(rel: str, globs: Iterable[str]) -> bool:
@@ -615,6 +718,9 @@ def _status_candidates(
         return []
     r = _git(
         root,
+        # rename detection on whatever the user's diff.renames says: a moved file is judged against its old path
+        "-c",
+        "status.renames=true",
         "status",
         "--porcelain=v1",
         "-z",
@@ -630,7 +736,8 @@ def _status_candidates(
     top_res, root_res = top.resolve(), root.resolve()
     out: list[_Cand] = []
     seen: set[str] = set()
-    for xy, top_rel in _parse_status(r.out):  # git always prints "/" separators, even on Windows
+    # git always prints "/" separators, even on Windows
+    for xy, top_rel, orig in _parse_status_entries(r.out):
         if xy == "!!" or Path(top_rel).suffix.lower() not in _ALL_EXTS or top_rel in seen:
             continue
         try:
@@ -648,7 +755,7 @@ def _status_candidates(
         path = root / rel
         if not path.is_file() and not path.is_symlink():
             continue  # deleted, or a submodule/directory entry
-        out.append(_Cand(path, rel, top_rel, tracked=xy != "??"))
+        out.append(_Cand(path, rel, top_rel, tracked=xy != "??", orig_top_rel=orig))
     return sorted(out, key=lambda c: c.rel)
 
 
@@ -794,9 +901,20 @@ def _per_file_timeout(deadline: float) -> float:
 
 
 def _head_text(root: Path, c: _Cand, deadline: float) -> tuple[str | None, str | None]:
-    """(text of HEAD's version, None) | (None, None) when HEAD has no such file | (None, reason) when unknowable."""
-    r = _git(root, "cat-file", "blob", f"HEAD:{c.top_rel}", timeout=_git_timeout(deadline))
+    """(text of HEAD's version, None) | (None, None) when HEAD has no such file | (None, reason) when unknowable.
+
+    A renamed or copied file is looked up under its ORIGINAL path: that is the version its drift is measured against."""
+    r = _git(
+        root,
+        "cat-file",
+        "blob",
+        f"HEAD:{c.orig_top_rel or c.top_rel}",
+        timeout=_git_timeout(deadline),
+    )
     if r.rc == 128:
+        if c.orig_top_rel:
+            # git says this was renamed from a file that HEAD does not have: nothing to compare with, so do not guess
+            return None, "cannot read the HEAD version of the file it was renamed from"
         return None, None  # no HEAD yet, or the file is new in this change
     if r.rc != 0:
         return None, "cannot read the HEAD version"
@@ -823,13 +941,81 @@ def _gate(f: Formatter, root: Path, c: _Cand, deadline: float) -> str | None:
     out, err = _format(f, c.path, head, cwd=_cwd_for(f, c.path, root), timeout=timeout)
     if out is None:
         return f"cannot verify HEAD formatting: {err}"
-    return None if out == head else DRIFT_REASON
+    # like with like: _format_one judges the working file after _match_eol, so judge HEAD the same way (a CRLF blob
+    # that is clean apart from the formatter's LF output is clean, not drifted)
+    return None if _match_eol(head, out) == head else DRIFT_REASON
 
 
 def _cwd_for(f: Formatter, path: Path, root: Path) -> Path:
     # rustfmt reads stdin but looks for rustfmt.toml from its working directory; the file's own directory finds
     # a nested crate's config and still reaches the root's
     return path.parent if f.name == "rustfmt" else root
+
+
+def _keeps_owner(tmp: str, before: os.stat_result) -> bool:
+    """Give the replacement file the original's owner and group where we can (only root can change owner). False when
+    the file would end up owned by somebody else than before, which a rewrite must not do silently."""
+    if not hasattr(os, "geteuid"):
+        # Windows: ownership comes from the directory's ACL, as for any file written there
+        return True
+    if (before.st_uid, before.st_gid) == (os.geteuid(), os.getegid()):
+        return True
+    try:
+        os.chown(tmp, before.st_uid, before.st_gid)
+        return True
+    except OSError:
+        return before.st_uid == os.geteuid()  # the group is best effort, the owner is not
+
+
+def _replace_atomically(path: Path, data: bytes, before: os.stat_result) -> str | None:
+    """Replace `path` with `data` without ever truncating it: write a temporary file in the same directory, copy the
+    permission bits, then os.replace it over the original. The original is intact until that last step, so a full
+    disk, a quota, a network share, a crash or a kill leaves either the old file or the new one, never half of one.
+
+    Returns None on success, or the skip reason when the file changed since `before` (re-checked just before the
+    replace). Raises OSError, with the original untouched and the temporary file removed, when anything fails."""
+    if not os.access(path, os.W_OK):
+        # os.replace would happily overwrite a read-only file the user protected (the directory decides, not the file)
+        raise PermissionError(errno.EACCES, "file is read-only")
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    directory = os.path.dirname(os.path.abspath(path))
+    candidate = os.path.join(directory, f".claude-hr-fmt-{os.urandom(6).hex()}.tmp")
+    tmp: str | None = None
+    try:
+        # O_EXCL on a 48-bit random name: it never clobbers anything, and never follows a planted symlink
+        fd = os.open(candidate, flags, 0o600)
+        tmp = candidate
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(data)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.chmod(tmp, stat.S_IMODE(before.st_mode))
+        if not _keeps_owner(tmp, before):
+            raise PermissionError(errno.EPERM, "cannot keep the file's owner")
+        for attempt in range(_REPLACE_TRIES):
+            now = os.lstat(path)
+            if not stat.S_ISREG(now.st_mode) or (now.st_size, now.st_mtime_ns) != (
+                before.st_size,
+                before.st_mtime_ns,
+            ):
+                return "changed while formatting"
+            try:
+                os.replace(tmp, path)
+                break
+            except PermissionError:
+                # Windows: an antivirus scan or an indexer can hold the file for a moment; anything else fails at once
+                if not paths.IS_WINDOWS or attempt == _REPLACE_TRIES - 1:
+                    raise
+                time.sleep(0.05 * 2**attempt)
+        tmp = None
+        return None
+    finally:
+        if tmp is not None:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
 
 
 def _format_one(
@@ -844,7 +1030,15 @@ def _format_one(
 ) -> None:
     path = c.path
     try:
-        before = path.stat()
+        # lstat: a symlink swapped in after the candidate scan must not be written through
+        before = os.lstat(path)
+        if not stat.S_ISREG(before.st_mode):
+            report.skipped.append((c.rel, "not a regular file"))
+            return
+        if before.st_nlink > 1:
+            # an atomic rewrite replaces the file's directory entry, which would silently unlink it from its twin(s)
+            report.skipped.append((c.rel, "hard-linked file"))
+            return
         data = path.read_bytes()
     except OSError as exc:
         report.errors.append((c.rel, f"cannot read: {exc.strerror or exc}"))
@@ -875,14 +1069,15 @@ def _format_one(
         report.formatted.append(c.rel)
         return
     try:
-        after = path.stat()
-        if (after.st_size, after.st_mtime_ns) != (before.st_size, before.st_mtime_ns):
-            report.skipped.append((c.rel, "changed while formatting"))
-            return
-        with open(path, "wb") as fh:  # bytes, so the newline convention is never rewritten
-            fh.write((_BOM if bom else b"") + new_text.encode("utf-8"))
+        # bytes, so the newline convention is never rewritten
+        changed = _replace_atomically(
+            path, (_BOM if bom else b"") + new_text.encode("utf-8"), before
+        )
     except OSError as exc:
         report.errors.append((c.rel, f"cannot write: {exc.strerror or exc}"))
+        return
+    if changed:
+        report.skipped.append((c.rel, changed))
         return
     report.formatted.append(c.rel)
 
@@ -951,8 +1146,12 @@ def format_changed(
 ) -> FormatReport:
     """Format the files git reports as changed, with the formatter each repo configures. Never raises.
 
-    clean_gate: a tracked file is rewritten only if HEAD's version is already clean under the formatter, so the
-    change never turns into a whole-file drift diff; untracked/new files are always formatted.
+    The scope is the working tree's uncommitted files, as `git status` reports them: not only the files an agent
+    edited (nothing here knows who changed a file), which is what a pre-commit formatter hook would also do.
+
+    clean_gate: a tracked file is rewritten only if HEAD's version is already clean under the formatter (a renamed
+    file is judged against the version at its old path), so the change never turns into a whole-file drift diff;
+    untracked/new files are always formatted. A write replaces the file atomically; if it fails the original stays.
     allow: formatter names to use; empty/None = any detected one. timeout_s bounds the whole call.
     check=True writes nothing and lists in `formatted` the files that would change.
     trusted: the repository is trusted (the user approved its verify recipe, or chose format.repo_tools = always): only then
