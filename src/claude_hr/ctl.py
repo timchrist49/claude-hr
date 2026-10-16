@@ -1094,19 +1094,39 @@ def cmd_init_repo(a, cfg) -> int:
     except ValueError as exc:  # an unknown group name; the message lists the valid ones
         out(str(exc))
         return 2
-    skipped = [g for g in groups if g in initrepo.ROOT_ONLY_GROUPS]
-    top = initrepo.git_top_level(root) if skipped else None
-    if top is not None:
-        # GitHub only reads .github/ from the top level of the repository: a copy under a subdirectory would be inert
-        groups = [g for g in groups if g not in skipped]
-        out(
-            f"warning: {root} is a subdirectory of the git repository at {top}. GitHub reads .github/ (issue forms, "
-            f"PR template, CODEOWNERS, Dependabot, workflows) only from the top level, so "
-            f"{', '.join(skipped)} are not scaffolded here. Run `claude-hr-ctl init-repo {top}` for them."
+    if not root.is_dir():
+        out(f"{root} is not a directory")
+        return 2
+    where, top = initrepo.locate(root)
+    if where in {"none", "gitdir"}:
+        # .github/, .editorconfig and .gitattributes written here would belong to no repository (or, in a bare
+        # repository's git directory, sit next to HEAD and objects/): operate on the top level of a work tree only
+        what = (
+            "a git directory (a bare repository, or .git itself), not a work tree"
+            if where == "gitdir"
+            else "not inside a git work tree"
         )
-        if not groups:
-            out("nothing left to scaffold in this directory.")
-            return 2
+        out(
+            f"warning: {root} is {what}, so nothing was scaffolded. init-repo writes the top-level files of a git "
+            "repository (.github/, .editorconfig, .gitattributes, docs/): run `git init` first, or pass the top-level "
+            "directory of the repository."
+        )
+        return 2
+    if where == "subdir":
+        skipped = [g for g in groups if g in initrepo.ROOT_ONLY_GROUPS]
+        if skipped:
+            # these belong to the top level: GitHub reads .github/ and reviewers read REVIEW.md only there, and a nested
+            # .editorconfig / .gitattributes would silently override the repository's own for this whole subtree
+            groups = [g for g in groups if g not in skipped]
+            out(
+                f"warning: {root} is a subdirectory of the git repository at {top}. {', '.join(skipped)} are not "
+                f"scaffolded here: they belong to the top level (GitHub reads .github/ only there, and a nested "
+                f".editorconfig or .gitattributes would override the repository's own for this subtree). "
+                f"Run `claude-hr-ctl init-repo {top}` for them."
+            )
+            if not groups:
+                out("nothing left to scaffold in this directory.")
+                return 2
     commands = None
     try:  # the CI skeleton runs the same checks the end-of-turn gate would
         from . import verify
@@ -1114,7 +1134,7 @@ def cmd_init_repo(a, cfg) -> int:
         commands = [c.argv for c in verify.discover(root).fast] or None
     except Exception:  # noqa: BLE001
         pass
-    actions, notes = initrepo.plan_with_notes(root, only=groups, commands=commands)
+    actions, notes = initrepo.plan_with_notes(root, only=groups, commands=commands, discovered=True)
     out(initrepo.format_plan(actions, notes))
     if not a.apply:
         out(

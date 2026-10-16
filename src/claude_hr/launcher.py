@@ -415,7 +415,7 @@ def main(argv: list[str] | None = None) -> int:
             )
             return 126
         os.environ["CLAUDE_HR_NEST"] = str(nest + 1)
-        real = procutil.find_claude()
+        real = _absolute(procutil.find_claude())
         if real is None:
             _say("Claude Code was not found.")
             return 127
@@ -426,7 +426,7 @@ def main(argv: list[str] | None = None) -> int:
         os.execv(str(real), [str(real), *args])
 
     verbose = bool(opts.get("verbose")) or os.environ.get("CLAUDE_HR_VERBOSE") == "1"
-    real = procutil.find_claude(_configured_binary())
+    real = _absolute(procutil.find_claude(_configured_binary()))
     if real is None:
         _say(
             "Claude Code was not found. Install it (https://claude.ai/install.sh) or run `claude-hr-ctl setup`."
@@ -466,7 +466,7 @@ def main(argv: list[str] | None = None) -> int:
         _say(f"ignoring unreadable config: {exc}")
         cfg = config_mod.load(with_user=False)
     configured = str(cfg.get("claude.binary", "") or "")
-    claude = procutil.find_claude(configured) if configured else real
+    claude = (_absolute(procutil.find_claude(configured)) if configured else None) or real
 
     default_flags = (
         [str(x) for x in (cfg.get("claude.default_flags", []) or [])]
@@ -475,9 +475,12 @@ def main(argv: list[str] | None = None) -> int:
     )
     cmd = [str(claude), *default_flags, *args]
     op_file = str(cfg.get("credentials.op_env_file", "") or "")
-    if op_file and kind != "passthrough" and procutil.cmd_exists("op"):
+    # resolve_exe (absolute PATH entries only), never shutil.which / a bare "op": on Windows both look in the current
+    # directory first, and the current directory of a launch is often a freshly cloned, untrusted repository.
+    op_exe = procutil.resolve_exe("op") if op_file and kind != "passthrough" else None
+    if op_exe:
         # --no-masking: masking would pipe the child's stdout and break the interactive TUI
-        cmd = ["op", "run", "--no-masking", "--env-file", op_file, "--", *cmd]
+        cmd = [op_exe, "run", "--no-masking", "--env-file", op_file, "--", *cmd]
     env = dict(os.environ)
     env["CLAUDE_HR_SESSION"] = "1"
     env["CLAUDE_HR_NEST"] = "0"
@@ -611,20 +614,57 @@ def main(argv: list[str] | None = None) -> int:
         full = cmd
         if track and not opts.get("no-limits"):
             full = _best_effort(resources.wrap_command_posix, cfg, cmd) or cmd
+        launch = _resolved_command(full, env)
+        if launch is None and full != cmd:
+            launch = _resolved_command(
+                cmd, env
+            )  # the limiter (systemd-run, nice) vanished: run unlimited, not never
+        if launch is None:
+            _say(f"could not start Claude Code: {cmd[0]} was not found on PATH")
+            return 126
         try:
-            os.execvpe(full[0], full, env)
+            os.execve(launch[0], launch, env)
         except OSError as exc:
             _say(f"could not start Claude Code: {exc}")
             return 126
     # Windows has no exec(): keep a thin parent that owns the Job Object.
+    launch = _resolved_command(cmd, env)
+    if launch is None:
+        _say(f"could not start Claude Code: {cmd[0]} was not found on PATH")
+        return 126
     child_pids: list[int] = []
     try:
         return _run_windows(
-            cfg, cmd, env, cwd, kind, routed_url, track and not opts.get("no-limits"), child_pids
+            cfg, launch, env, cwd, kind, routed_url, track and not opts.get("no-limits"), child_pids
         )
     finally:
         for pid in child_pids:
             _best_effort(resources.unregister_session, pid)
+
+
+def _absolute(binary: Path | None) -> Path | None:
+    """A located Claude Code binary, safe to start. A bare name (find_claude returns one when `claude.binary` or
+    CLAUDE_HR_CLAUDE_BIN names a file in the current directory, and pathlib drops a leading `./`) is looked up through
+    absolute PATH entries only - never in the current directory, which may be an untrusted repository - and not
+    accepted when that finds a claude-hr shim of this very launcher. None means "not found"."""
+    if binary is None:
+        return None
+    exe = procutil.resolve_exe(str(binary))
+    if exe is None or (exe != str(binary) and procutil._is_shim(Path(exe))):
+        return None
+    return Path(exe)
+
+
+def _resolved_command(cmd: list[str], env: dict[str, str] | None = None) -> list[str] | None:
+    """`cmd` with its program resolved to an absolute path, or None when a bare program name is not on PATH.
+
+    Every program the launcher starts (claude, `op`, the limiter prefix, `headroom wrap`) goes through here at the
+    point of the spawn. A bare name is resolved through absolute PATH entries only (procutil.resolve_exe): Windows
+    CreateProcess searches the current directory first - a freshly cloned repository that commits `op.exe` would run
+    it before Claude starts - and an empty PATH entry means the current directory to execvp on POSIX.
+    """
+    exe = procutil.resolve_exe(str(cmd[0]), env)
+    return None if exe is None else [exe, *cmd[1:]]
 
 
 def _run_windows(cfg, cmd, env, cwd, kind, routed_url, limits: bool, pids: list[int]) -> int:
@@ -632,7 +672,11 @@ def _run_windows(cfg, cmd, env, cwd, kind, routed_url, limits: bool, pids: list[
 
     from . import resources
 
-    proc = subprocess.Popen(cmd, env=env)
+    try:
+        proc = subprocess.Popen(cmd, env=env)
+    except OSError as exc:  # same message and code as the POSIX exec failure above
+        _say(f"could not start Claude Code: {exc}")
+        return 126
     pids.append(proc.pid)
     if kind in {"session", "headless", "agents", "daemon"}:
         _best_effort(resources.register_session, proc.pid, cwd, kind)

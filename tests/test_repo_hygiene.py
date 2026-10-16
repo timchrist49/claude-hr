@@ -4,6 +4,8 @@ import json
 import re
 from pathlib import Path
 
+import pytest
+
 ROOT = Path(__file__).resolve().parents[1]
 SKIP = {".git", "__pycache__", ".venv", ".pytest_cache", ".ruff_cache", "dist", "build"}
 
@@ -124,23 +126,68 @@ READ_ONLY_CTL_VERBS = {
     "plugins list",
     "claudemd lint",
     "skills",
-    "footprint",
-    "trail",
     "audit",
     "verify status",
     "verify run",
     "fmt --check",
 }
+# Verbs that are read-only only WITHOUT their flags: `Bash(claude-hr-ctl trail *)` would also pre-approve `trail --prune`
+# (deletes audit files) and `footprint --probe` (runs a real `claude -p` and spends tokens). A trailing ` *` cannot exclude
+# a flag, so these may be pre-approved only as the exact, argument-free command `Bash(claude-hr-ctl trail)`.
+READ_ONLY_CTL_BARE = {"trail", "footprint"}
 READ_ONLY_GH = {"gh issue view", "gh issue list", "gh pr view", "gh pr diff", "gh pr checks"}
 
 
+def _unquote(item: str) -> str:
+    item = item.strip()
+    if len(item) >= 2 and item[0] == item[-1] and item[0] in "\"'":
+        return item[1:-1].strip()
+    return item
+
+
+def allowed_tools_value(front: str) -> str | None:
+    """A skill's `allowed-tools` as one space-joined string, whichever YAML form it is written in: an inline value, a flow
+    list `[a, b]`, a block list (`- a` lines, indented or not) or a block scalar (`>` / `|`). None when the key is absent.
+    The check below used to read only the text after `allowed-tools:` on the same line, so the block-list form
+    (`allowed-tools:` then `  - Bash(claude-hr-ctl *)`) looked empty and passed."""
+    lines = front.splitlines()
+    for at, line in enumerate(lines):
+        m = re.match(r"allowed-tools:[ \t]*(.*?)[ \t]*$", line)
+        if not m:
+            continue
+        value, items = m.group(1), []
+        if value.startswith("["):  # flow list: split on the commas outside (...)
+            depth, buf = 0, ""
+            for ch in value.strip("[] \t"):
+                depth += (ch == "(") - (ch == ")")
+                if ch == "," and depth == 0:
+                    items.append(buf)
+                    buf = ""
+                else:
+                    buf += ch
+            items.append(buf)
+        elif value and not re.fullmatch(r"[>|][+-]?", value):
+            items.append(value)
+        for nxt in lines[at + 1 :]:
+            if nxt.strip() and not re.match(r"[ \t]|-([ \t]|$)", nxt):
+                break  # the next key
+            text = nxt.strip()
+            if not text or text.startswith("#"):
+                continue
+            items.append(text[1:] if text.startswith("-") else text)
+        return " ".join(x for x in (_unquote(i) for i in items) if x)
+    return None
+
+
 def allowed_tools_problems(value: str) -> list[str]:
-    """Why a skill's `allowed-tools` line is broader than a fixed read-only command prefix (empty = fine)."""
+    """Why a skill's `allowed-tools` is broader than a fixed read-only command prefix (empty = fine)."""
     problems = []
     leftover = re.sub(r"Bash\([^)]*\)", "", value).strip()
     if leftover:
         problems.append(f"not a Bash(<prefix> *) entry: {leftover!r}")
     for entry in re.findall(r"Bash\(([^)]*)\)", value):
+        if entry in {f"claude-hr-ctl {verb}" for verb in READ_ONLY_CTL_BARE}:
+            continue  # exactly the argument-free command: no flag can be added to it
         if not entry.endswith(" *") or re.search(r"[*?;&|<>`$()]", entry[:-2]):
             problems.append(f"Bash({entry}) is not a plain `<command prefix> *` pattern")
             continue
@@ -170,6 +217,15 @@ def test_allowed_tools_check_rejects_broad_grants():
         "Bash(gh pr create *)",
         "Bash(gh api *)",
         "Bash(gh *)",
+        # read-only only without their flags (`trail --prune` deletes files, `footprint --probe` spends tokens)
+        "Bash(claude-hr-ctl trail *)",
+        "Bash(claude-hr-ctl footprint *)",
+        "Bash(claude-hr-ctl trail --prune *)",
+        "Bash(claude-hr-ctl trail --tail 5 *)",
+        "Bash(claude-hr-ctl trail --prune)",
+        "Bash(claude-hr-ctl cleanup *)",
+        "Bash(claude-hr-ctl usage --snapshot *)",
+        "Bash(claude-hr-ctl status)",
     ):
         assert allowed_tools_problems(bad), bad
     for good in (
@@ -177,8 +233,69 @@ def test_allowed_tools_check_rejects_broad_grants():
         "Bash(claude-hr-ctl status *) Bash(claude-hr-ctl doctor *)",
         "Bash(claude-hr-ctl fmt --check *)",
         "Bash(gh issue view *) Bash(gh pr checks *)",
+        "Bash(claude-hr-ctl plugins audit *) Bash(claude-hr-ctl usage *)",
+        "Bash(claude-hr-ctl trail) Bash(claude-hr-ctl footprint)",  # exactly the argument-free form
     ):
         assert not allowed_tools_problems(good), good
+
+
+FRONT = "name: x\ndescription: d\n"
+
+
+@pytest.mark.parametrize(
+    "block, expected",
+    [
+        ("", None),
+        ("allowed-tools:\n", ""),
+        (
+            "allowed-tools: Bash(claude-hr-ctl status *) Bash(claude-hr-ctl doctor *)\n",
+            "Bash(claude-hr-ctl status *) Bash(claude-hr-ctl doctor *)",
+        ),
+        (
+            "allowed-tools: [Bash(claude-hr-ctl status *), 'Bash(claude-hr-ctl doctor *)']\n",
+            "Bash(claude-hr-ctl status *) Bash(claude-hr-ctl doctor *)",
+        ),
+        (
+            'allowed-tools:\n  - Bash(claude-hr-ctl status *)\n  - "Bash(claude-hr-ctl doctor *)"\n',
+            "Bash(claude-hr-ctl status *) Bash(claude-hr-ctl doctor *)",
+        ),
+        (
+            "allowed-tools:\n- Bash(claude-hr-ctl status *)\n- Write\n",
+            "Bash(claude-hr-ctl status *) Write",
+        ),
+        (
+            "allowed-tools:\n  # a comment\n  - Bash(claude-hr-ctl status *)\n\n  - Edit\n",
+            "Bash(claude-hr-ctl status *) Edit",
+        ),
+        (
+            "allowed-tools: >\n  Bash(claude-hr-ctl status *)\n  Bash(claude-hr-ctl doctor *)\n",
+            "Bash(claude-hr-ctl status *) Bash(claude-hr-ctl doctor *)",
+        ),
+        (
+            "allowed-tools:\n  - Bash(claude-hr-ctl status *)\ndisable-model-invocation: true\n",
+            "Bash(claude-hr-ctl status *)",
+        ),
+    ],
+)
+def test_allowed_tools_value_reads_every_yaml_form(block, expected):
+    assert allowed_tools_value(FRONT + block) == expected
+
+
+@pytest.mark.parametrize(
+    "block",
+    [
+        "allowed-tools:\n  - Bash(claude-hr-ctl *)\n  - Bash(*)\n  - Write\n",
+        "allowed-tools:\n- Bash(claude-hr-ctl update *)\n- Bash(claude-hr-ctl setup *)\n",
+        "allowed-tools: [Bash(claude-hr-ctl *)]\n",
+        "allowed-tools: ['Bash(claude-hr-ctl *)', Write]\n",
+        "allowed-tools: >\n  Bash(claude-hr-ctl *)\n",
+        "allowed-tools:\n  - Bash(claude-hr-ctl trail *)\n",
+        "allowed-tools: Bash(claude-hr-ctl *)\n",
+    ],
+)
+def test_a_broad_grant_is_caught_in_every_yaml_form(block):
+    """The block-list form used to read as an empty value and pass."""
+    assert allowed_tools_problems(allowed_tools_value(FRONT + block)), block
 
 
 def test_every_skills_allowed_tools_is_an_explicit_read_only_list():
@@ -186,21 +303,18 @@ def test_every_skills_allowed_tools_is_an_explicit_read_only_list():
     `config set`, `update` or `setup` without a prompt."""
     seen = 0
     for md in (ROOT / "plugins").rglob("SKILL.md"):
-        m = re.search(r"(?m)^allowed-tools:[ ]*(.*)$", skill_frontmatter(md))
-        if not m:
+        value = allowed_tools_value(skill_frontmatter(md))
+        if value is None:
             continue
         seen += 1
-        assert not allowed_tools_problems(m.group(1)), (
-            md.parent.name,
-            allowed_tools_problems(m.group(1)),
-        )
+        assert value, f"{md.parent.name}: an allowed-tools key with no entries"
+        assert not allowed_tools_problems(value), (md.parent.name, allowed_tools_problems(value))
     assert seen >= 4, "the skills that pre-approve commands were not found"
 
 
 def test_hr_status_pre_approves_exactly_status_and_doctor():
     fm = skill_frontmatter(ROOT / "plugins" / "hr-core" / "skills" / "hr-status" / "SKILL.md")
-    tools = re.search(r"(?m)^allowed-tools:[ ]*(.*)$", fm).group(1)
-    assert tools == "Bash(claude-hr-ctl status *) Bash(claude-hr-ctl doctor *)"
+    assert allowed_tools_value(fm) == "Bash(claude-hr-ctl status *) Bash(claude-hr-ctl doctor *)"
 
 
 def test_manual_only_skills_do_not_tell_the_model_to_start_each_other():
