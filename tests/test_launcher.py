@@ -415,6 +415,7 @@ class _OfferWorld:
 def offer_world(tmp_path, monkeypatch):
     """A real git repository as the current directory, a person at a terminal (scripted), a fake claude whose start is
     only recorded, and a discovery that proposes two real checks (`python -c pass`)."""
+    import json
     import os
     import subprocess
     import sys
@@ -431,6 +432,13 @@ def offer_world(tmp_path, monkeypatch):
         pytest.skip("git is needed for a real repository")
     (repo / "pyproject.toml").write_text("[project]\nname='x'\nversion='0'\n", encoding="utf-8")
     monkeypatch.chdir(repo)
+    # the folder is one the person has already told Claude Code to trust (the offer waits for that)
+    from claude_hr import paths as _paths
+
+    _paths.claude_global_json().write_text(
+        json.dumps({"projects": {str(repo).replace("\\", "/"): {"hasTrustDialogAccepted": True}}}),
+        encoding="utf-8",
+    )
     for var in ("CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT", "CLAUDE_HR_GATES"):
         monkeypatch.delenv(var, raising=False)
     monkeypatch.setenv("CLAUDE_HR_HEADROOM__ENABLED", "false")

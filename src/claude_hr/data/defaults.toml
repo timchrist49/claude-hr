@@ -39,7 +39,7 @@ port = 8787
 host = "127.0.0.1"
 savings_profile = "coding"   # coding (cache-safe, never lossy-compresses file reads) | balanced | general | agent-90
 proxy_mode = "cache"         # cache = preserve the provider prompt-cache prefix (independent tests: token mode busts the cache)
-memory = true                # cross-session memory, one DB per project under ~/.claude-hr/headroom
+memory = false               # off: in proxy_mode "cache" Headroom's memory injects 5 tools (~2.5k tokens on EVERY request) and runs a lookup whose result is discarded; nothing was ever saved (measured). true = cross-session memory, one DB per project under ~/.claude-hr/headroom
 learn = false                # live traffic learning (implies memory). Off: use the scheduled batch `learn` report
 code_graph = true            # only effective in mode = "wrap" (it watches the launch directory)
 code_memory = "serena"       # "serena" | "none"
@@ -48,7 +48,7 @@ serena_version = ""          # pin e.g. "2.0.0" to stop `uvx` pulling new releas
 mcp = true                   # register headroom_compress / headroom_retrieve / headroom_stats
 tool_search = "true"         # ENABLE_TOOL_SEARCH behind the proxy; without it every MCP tool schema is loaded eagerly
 one_m_context = false        # force the [1m] model selector (account must be eligible)
-output_shaper = true         # trim model OUTPUT tokens (verbosity steering + effort routing)
+output_shaper = false        # true: Headroom appends a short "be brief, do not restate code" instruction to every request's system prompt (verbosity only: in 0.41.0 it never changes model, effort or thinking). Off: the benefit was never measured on real traffic and quality comes first
 output_holdout = 0.0         # 0.1 keeps a 10% unshaped control group so savings are *measured*, not estimated
 telemetry = false            # Headroom's anonymous beacon off
 update_check = false         # claude-hr's staged updater replaces Headroom's own daily check

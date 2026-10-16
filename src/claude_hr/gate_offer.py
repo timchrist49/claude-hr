@@ -317,6 +317,48 @@ def _quick_verdict(root: Path) -> str:
     return "look"
 
 
+_MAX_GLOBAL_JSON_BYTES = (
+    32 * 1024 * 1024
+)  # ~/.claude.json is a few hundred KB; nothing legitimate is near this
+
+
+def _folder_key(p: str | Path) -> str:
+    """How Claude Code keys a folder in ~/.claude.json: forward slashes, no trailing slash (case-folded on Windows)."""
+    s = str(p).replace("\\", "/").rstrip("/")
+    return s.casefold() if os.name == "nt" else s
+
+
+def claude_trusts(root: Path, cwd: str | Path) -> bool:
+    """Has the person already answered Claude Code's own "do you trust this folder?" question with yes, for the folder they
+    launched in or for the repository's top level? Claude Code records that as projects[<folder>].hasTrustDialogAccepted in its
+    global state file (paths.claude_global_json: ~/.claude.json, or inside CLAUDE_CONFIG_DIR).
+
+    Only a regular file up to a sane size is read, once, and only on the rare path where a question would otherwise be
+    asked; anything unexpected (no file, bad JSON, another layout in a future Claude Code) answers False, which means
+    "do not ask now" - never "ask anyway"."""
+    try:
+        import json
+
+        path = paths.claude_global_json()
+        st = os.stat(path)
+        if not stat.S_ISREG(st.st_mode) or st.st_size > _MAX_GLOBAL_JSON_BYTES:
+            return False
+        with open(path, "rb") as fh:
+            data = json.loads(fh.read())
+        projects = data.get("projects") if isinstance(data, dict) else None
+        if not isinstance(projects, dict):
+            return False
+        wanted = {_folder_key(x) for x in (cwd, os.path.realpath(cwd), root)}
+        return any(
+            isinstance(value, dict)
+            and value.get("hasTrustDialogAccepted") is True
+            and _folder_key(key) in wanted
+            for key, value in projects.items()
+        )
+    except Exception:  # noqa: BLE001 - cannot tell: do not ask
+        return False
+
+
 # ---------------------------------------------------------------------------------------------------------------
 # the launcher entry
 # ---------------------------------------------------------------------------------------------------------------
@@ -342,6 +384,11 @@ def _maybe_offer(args, cfg) -> None:
     if root is None:
         return
     if _quick_verdict(root) == "quiet":
+        return
+    if not claude_trusts(root, os.getcwd()):
+        # Claude Code has not been told to trust this folder yet (it asks on the first launch). A freshly cloned repository
+        # must not be offered "run its checks after every turn" before its owner has vouched for it even once: the offer
+        # comes on a later launch, after that answer. `claude-hr-ctl verify enable` works at any time.
         return
     offer_now(root, cfg, stderr_say, explicit=False)
 

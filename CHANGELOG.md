@@ -18,6 +18,20 @@ is unchanged: the checks still run only after a person approved the exact file, 
 - **Cost:** about 3 ms on an interactive start in a folder that is already decided, and nothing on any other launch (`-p`, agents,
   subcommands, dry runs do not even import the module). The launcher stays fail-open: any error in the offer starts Claude.
 - The manual way (`verify init --write`, `verify trust`) still works and is documented as such.
+- **The offer waits for Claude Code's own trust.** It is made only in a folder Claude Code itself has already been told to trust
+  (`hasTrustDialogAccepted` in its state file), so a freshly cloned repository is offered nothing on the first launch; a person who
+  just pressed Enter can no longer run an untrusted clone's commands. `verify enable` works anywhere.
+- **Two Headroom defaults changed, from measurements on a real install (2026-10-17):**
+  - `headroom.memory` is now off. In `proxy_mode = "cache"` it injected 5 tools (about 2,460 tokens) into every request and ran a
+    lookup (0.3-1.8 s) whose result was thrown away; no memory had ever been saved and no benefit is measured. Claude Code's own
+    CLAUDE.md and MEMORY.md do the job. Set `headroom.memory = true` to bring it back.
+  - `headroom.output_shaper` is now off. In Headroom 0.41.0 it only appends a short "be brief, do not restate code" instruction to
+    the system prompt (it never changed model, effort or thinking; the README had said it steers effort, which was wrong), and its
+    benefit was never measured on real traffic. Set `headroom.output_shaper = true` to bring it back. Run `claude-hr-ctl headroom
+    restart` once for either change to reach the shared proxy.
+  Together with disabling unused plugins this took a fresh session on one machine from 43,791 to 30,588 input tokens (-30%).
+- Tests no longer depend on the machine: the sandbox points git's global ignore (`XDG_CONFIG_HOME`) at a temporary folder, and the
+  CLAUDE.md test counts only files inside its own folder.
 
 ## 0.2.0 (2026-10-16)
 A verified development loop with no always-on token cost, for sessions run at Ultracode effort on `opusplan` (claude-hr still sets

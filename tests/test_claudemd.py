@@ -65,7 +65,10 @@ def test_path_scoped_rules_do_not_count_as_always_loaded(sandbox, tmp_path):
     rep = lint(tmp_path)
     src = next(s for s in rep.sources if s.path.name == "py.md")
     assert src.conditional
-    assert rep.always_loaded_lines < 5
+    # only what lives in this test's own folder: pytest's tmp_path is under the real home directory, and Claude Code
+    # also reads CLAUDE.md files of parent folders, so the machine's own ~/.claude/CLAUDE.md is (correctly) in the report
+    mine = [s for s in rep.sources if tmp_path in s.path.parents and not s.conditional]
+    assert sum(s.lines for s in mine) < 5
 
 
 def test_local_file_must_be_gitignored(sandbox, tmp_path):

@@ -507,7 +507,7 @@ def main(argv: list[str] | None = None) -> int:
             "claude",
             "--port",
             str(hr.port),
-            *(["--memory"] if cfg.get("headroom.memory", True) else []),
+            *(["--memory"] if cfg.get("headroom.memory", False) else []),
             *(["--code-graph"] if cfg.get("headroom.code_graph", True) else []),
             "--",
             *args,

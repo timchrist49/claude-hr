@@ -8,7 +8,10 @@ def hr(monkeypatch=None, **env):
     return Headroom(config.load())
 
 
-def test_proxy_args_are_safe_for_parallel_agents(sandbox):
+def test_proxy_args_are_safe_for_parallel_agents(sandbox, monkeypatch):
+    monkeypatch.setenv(
+        "CLAUDE_HR_HEADROOM__MEMORY", "true"
+    )  # the memory path is only built when it is switched on
     args = hr().proxy_args()
     assert args[:1] == ["proxy"]
     assert "--no-rate-limit" in args  # the default 60 req/min limiter throttles parallel sessions
@@ -19,6 +22,11 @@ def test_proxy_args_are_safe_for_parallel_agents(sandbox):
     assert str(Path(args[args.index("--memory-db-path") + 1])).startswith(
         str(sandbox)
     )  # never cwd-relative
+
+
+def test_memory_is_off_by_default_because_in_cache_mode_it_is_pure_overhead(sandbox):
+    args = hr().proxy_args()
+    assert "--memory" not in args and "--memory-db-path" not in args
 
 
 def test_lite_footprint_drops_ml_features(sandbox, monkeypatch):
@@ -50,8 +58,15 @@ def test_server_env_is_private_by_default(sandbox):
     assert env["DO_NOT_TRACK"] == "1"
     assert env["HEADROOM_UPDATE_CHECK"] == "off"
     assert env["HEADROOM_SAVINGS_PROFILE"] == "coding"
-    assert env["HEADROOM_OUTPUT_SHAPER"] == "1"
+    assert (
+        "HEADROOM_OUTPUT_SHAPER" not in env
+    )  # off by default: it edits every request's system prompt
     assert "HEADROOM_WRAP_OWNED" not in env  # a wrap-owned proxy would self-terminate
+
+
+def test_output_shaper_can_be_switched_on(sandbox, monkeypatch):
+    monkeypatch.setenv("CLAUDE_HR_HEADROOM__OUTPUT_SHAPER", "true")
+    assert hr().server_env({"PATH": "x"})["HEADROOM_OUTPUT_SHAPER"] == "1"
 
 
 def test_client_env_keeps_tool_search_and_labels_project(sandbox, tmp_path, monkeypatch):

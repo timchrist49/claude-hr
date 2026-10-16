@@ -31,6 +31,17 @@ def _git(repo, *args):
 pytestmark = pytest.mark.skipif(shutil.which("git") is None, reason="git is needed for a real repo")
 
 
+def claude_trusts(folder, trusted=True):
+    """Claude Code's own record that its "do you trust this folder?" question was answered (the sandboxed global state
+    file, keyed the way Claude Code keys it: forward slashes)."""
+    path = paths.claude_global_json()
+    data = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+    data.setdefault("projects", {})[str(folder).replace("\\", "/")] = {
+        "hasTrustDialogAccepted": trusted
+    }
+    path.write_text(json.dumps(data), encoding="utf-8")
+
+
 @pytest.fixture
 def repo(tmp_path, monkeypatch):
     r = tmp_path / "work" / "proj"
@@ -38,6 +49,9 @@ def repo(tmp_path, monkeypatch):
     _git(r, "init", "-q")
     (r / "pyproject.toml").write_text("[project]\nname='x'\nversion='0'\n", encoding="utf-8")
     monkeypatch.chdir(r)
+    claude_trusts(
+        r
+    )  # the realistic case: a folder the person has already told Claude Code to trust
     monkeypatch.delenv("CLAUDE_HR_GATES", raising=False)
     monkeypatch.delenv("CLAUDECODE", raising=False)
     monkeypatch.delenv("CLAUDE_CODE_ENTRYPOINT", raising=False)
@@ -725,6 +739,7 @@ def test_a_linked_worktree_still_gets_the_recipe_but_no_exclude_line(
     _git(repo, "worktree", "add", "-q", str(linked))
     (linked / "pyproject.toml").write_text("[project]\nname='x'\n", encoding="utf-8")
     monkeypatch.chdir(linked)
+    claude_trusts(linked)
     keys.type("y")
     run_offer(cfg)
     assert trust_state(linked) == "trusted"
@@ -1304,3 +1319,125 @@ def test_output_survives_a_console_that_cannot_encode(monkeypatch):
     monkeypatch.setattr(sys, "stderr", stream)
     gate_offer.stderr_say("café ✓")
     assert "caf" in stream.text
+
+
+# ---- the offer waits until Claude Code itself trusts the folder -------------------------------------------------------
+def test_a_folder_claude_code_was_not_told_to_trust_is_offered_nothing(
+    repo, person, keys, offered, cfg
+):
+    """A freshly cloned repository: the owner has not vouched for it even once, so no 'run its checks every turn' question."""
+    claude_trusts(repo, trusted=False)
+    run_offer(cfg)  # `keys` fails on any question
+    assert trust_state(repo) == "no-config" and offer_record(repo) is None
+    assert not (repo / ".claude").exists()
+
+
+def test_no_claude_state_file_means_no_offer(repo, person, keys, offered, cfg):
+    paths.claude_global_json().unlink()
+    run_offer(cfg)
+    assert trust_state(repo) == "no-config" and offer_record(repo) is None
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        "",
+        "not json",
+        "[]",
+        "null",
+        '{"projects": []}',
+        '{"projects": "x"}',
+        '{"projects": {"x": 1}}',
+        '{"projects": {"x": {"hasTrustDialogAccepted": "true"}}}',
+        '{"projects": {"x": {"hasTrustDialogAccepted": 1}}}',
+    ],
+)
+def test_an_unreadable_or_unexpected_claude_state_means_no_offer(
+    repo, person, keys, offered, cfg, content
+):
+    paths.claude_global_json().write_text(content, encoding="utf-8")
+    run_offer(cfg)
+    assert trust_state(repo) == "no-config" and offer_record(repo) is None
+
+
+def test_the_launch_folder_or_the_repository_top_level_counts_a_parent_does_not(
+    repo, person, keys, offered, cfg, monkeypatch
+):
+    sub = repo / "pkg"
+    sub.mkdir()
+    monkeypatch.chdir(sub)
+    claude_trusts(repo, trusted=False)
+    claude_trusts(repo.parent)  # a trusted PARENT of the repository vouches for nothing
+    run_offer(cfg)
+    assert offer_record(repo) is None and trust_state(repo) == "no-config"
+    claude_trusts(repo)  # the top level is trusted: launching from a subfolder of it is fine
+    keys.type("")
+    run_offer(cfg)
+    assert trust_state(repo) == "trusted"
+
+
+def test_trust_recorded_for_the_launch_folder_itself_counts(
+    repo, person, keys, offered, cfg, monkeypatch
+):
+    sub = repo / "pkg"
+    sub.mkdir()
+    monkeypatch.chdir(sub)
+    claude_trusts(repo, trusted=False)
+    claude_trusts(sub)
+    keys.type("")
+    run_offer(cfg)
+    assert trust_state(repo) == "trusted"
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows paths are case-insensitive")
+def test_claude_state_keys_match_without_regard_to_case_or_slashes_on_windows(
+    repo, person, keys, offered, cfg
+):
+    paths.claude_global_json().write_text(
+        json.dumps(
+            {"projects": {str(repo).upper().replace("\\", "/"): {"hasTrustDialogAccepted": True}}}
+        ),
+        encoding="utf-8",
+    )
+    keys.type("")
+    run_offer(cfg)
+    assert trust_state(repo) == "trusted"
+
+
+def test_a_huge_claude_state_file_is_not_read(repo, person, keys, offered, cfg, monkeypatch):
+    monkeypatch.setattr(gate_offer, "_MAX_GLOBAL_JSON_BYTES", 10)
+    run_offer(cfg)
+    assert offer_record(repo) is None and trust_state(repo) == "no-config"
+
+
+def test_a_claude_state_path_that_is_not_a_regular_file_is_not_read(
+    repo, person, keys, offered, cfg
+):
+    target = paths.claude_global_json()
+    target.unlink()
+    target.mkdir()  # a directory where the file should be
+    run_offer(cfg)
+    assert offer_record(repo) is None and trust_state(repo) == "no-config"
+
+
+def test_a_modified_recipe_in_an_untrusted_folder_is_not_shown_either(
+    repo, person, keys, cfg, monkeypatch
+):
+    """The existing-recipe screen (a clone that ships its own list) obeys the same rule: nothing before the owner vouched."""
+    verify.write_config(
+        repo, '[[fast]]\nname = "x"\nargv = ["' + PY.replace("\\", "/") + '", "-c", "pass"]\n'
+    )
+    claude_trusts(repo, trusted=False)
+    run_offer(cfg)  # `keys` fails on any question
+    assert trust_state(repo) == "untrusted" and offer_record(repo) is None
+
+
+def test_the_explicit_command_does_not_wait_for_claude_codes_trust(
+    repo, person, keys, offered, cfg
+):
+    """`claude-hr-ctl verify enable` is the person asking: it works in any folder, whatever Claude Code remembers."""
+    claude_trusts(repo, trusted=False)
+    keys.type("")
+    said: list[str] = []
+    assert gate_offer.offer_now(repo, cfg, said.append, explicit=True) == "enabled"
+    assert trust_state(repo) == "trusted"

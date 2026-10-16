@@ -189,7 +189,7 @@ class Headroom:
         args = ["proxy", "--host", self.host, "--port", str(self.port), "--workers", "1"]
         args += ["--mode", str(h.get("proxy_mode", "cache")), "--no-rate-limit"]
         footprint_lite = self.effective_extras() == "proxy,code,mcp"
-        if bool(h.get("memory", True)) and not footprint_lite:
+        if bool(h.get("memory", False)) and not footprint_lite:
             args += [
                 "--memory",
                 "--memory-db-path",
@@ -216,7 +216,7 @@ class Headroom:
         env["HEADROOM_SAVINGS_PROFILE"] = str(h.get("savings_profile", "coding"))
         env["HEADROOM_WORKSPACE_DIR"] = str(paths.hr_home() / "headroom")
         env.setdefault("HEADROOM_AGENT_TYPE", "claude")
-        if bool(h.get("output_shaper", True)):
+        if bool(h.get("output_shaper", False)):
             env["HEADROOM_OUTPUT_SHAPER"] = "1"
         holdout = float(h.get("output_holdout", 0) or 0)
         if holdout > 0:

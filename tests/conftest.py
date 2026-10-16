@@ -19,6 +19,10 @@ def sandbox(tmp_path, monkeypatch):
     monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "localappdata"))
     monkeypatch.setenv("APPDATA", str(tmp_path / "appdata"))
     monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
+    # git reads its global ignore list from $XDG_CONFIG_HOME/git/ignore (else ~/.config/git/ignore), and Claude Code writes
+    # `**/.claude/settings.local.json` there the first time a local plugin setting is saved: tests that ask git whether a
+    # file is ignored must not depend on the machine they run on
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg-config"))
     monkeypatch.setenv("HF_HOME", str(tmp_path / "hf"))
     for k in list(os.environ):
         if k.startswith("CLAUDE_HR_") and k not in {"CLAUDE_HR_USER_HOME", "CLAUDE_HR_HOME"}:
