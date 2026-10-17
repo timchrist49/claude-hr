@@ -83,7 +83,7 @@ def audit_plugins(
     from . import usage as usage_mod
 
     counts = usage_mod.collect_tool_use(usage_days)
-    measured = bool(counts) or any((paths.claude_home() / "projects").glob("*/*.jsonl"))
+    measured = bool(counts) or usage_mod.has_transcripts()
     setup = ClaudeSetup(cfg, None, claude)  # type: ignore[arg-type]
     with (paths.package_data_dir() / "plugins.toml").open("rb") as fh:
         plan = tomllib.load(fh)
@@ -120,6 +120,7 @@ def audit_plugins(
             row.uses = count_uses(row, counts)
             if (
                 row.uses == 0
+                and not getattr(counts, "partial", False)  # a scan cut short cannot say "unused"
                 and row.enabled
                 and row.always_on_tokens >= 100
                 and not row.id.startswith("hr-core@")

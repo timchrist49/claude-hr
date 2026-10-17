@@ -288,10 +288,11 @@ def cmd_status(a, cfg) -> int:
     out(
         f"  Sessions   : {snap['sessions']} running / limit {snap['session_limit']}   RAM free {snap['ram_free_gb']} of {snap['ram_total_gb']} GB   disk free {snap['disk_free_gb']} GB"
     )
-    led = usage.collect(1)
+    led = usage.collect(1, max_seconds=15)  # `status` stays quick: a slow disk gives a lower bound
     t = led.total
     out(
         f"  Last 24h   : {t.messages} model calls, {usage._n(t.output)} output tokens, cache hit {t.cache_hit * 100:.0f}%"
+        + (" (partial: the scan was cut short)" if led.partial else "")
     )
     rep = claudemd.lint(Path.cwd(), cfg)
     out(
@@ -533,9 +534,13 @@ def cmd_claudemd(a, cfg) -> int:
 
 def cmd_usage(a, cfg) -> int:
     if a.tools:
-        out(usage.format_tool_use(usage.collect_tool_use(a.days), a.days))
+        out(
+            usage.format_tool_use(
+                usage.collect_tool_use(a.days, subagents=not a.no_subagents), a.days
+            )
+        )
         return 0
-    led = usage.collect(a.days)
+    led = usage.collect(a.days, subagents=not a.no_subagents)
     if a.snapshot:
         d = paths.state_dir() / "usage"
         d.mkdir(parents=True, exist_ok=True)
@@ -1328,6 +1333,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--tools",
         action="store_true",
         help="which skills / subagents / MCP servers were actually used",
+    )
+    s.add_argument(
+        "--no-subagents",
+        action="store_true",
+        help="count the main sessions only (the numbers before subagent and workflow transcripts were read)",
     )
     s.set_defaults(fn=cmd_usage)
 
