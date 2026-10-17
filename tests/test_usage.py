@@ -266,7 +266,9 @@ def test_the_cost_estimate_uses_api_list_prices():
         "cache_creation_input_tokens": 1_000_000,
         "cache_read_input_tokens": 1_000_000,
     }
-    assert usage.estimate_cost("claude-sonnet-5-5", u) == pytest.approx(2.0 + 10.0 + 2.5 + 0.2)
+    # Sonnet 5.5 cache hits are 0.05x the input price ($0.10), Opus 5.5 too ($0.20); Sonnet 5 is 0.1x ($0.20)
+    assert usage.estimate_cost("claude-sonnet-5-5", u) == pytest.approx(2.0 + 10.0 + 2.5 + 0.1)
+    assert usage.estimate_cost("claude-sonnet-5", u) == pytest.approx(2.0 + 10.0 + 2.5 + 0.2)
     assert usage.estimate_cost("claude-opus-5-5", u) == pytest.approx(4.0 + 20.0 + 5.0 + 0.2)
     assert usage.estimate_cost("claude-haiku-5-5", u) == pytest.approx(0.1 + 0.5 + 0.125 + 0.01)
     one_hour = {
@@ -791,3 +793,59 @@ def test_a_folder_that_cannot_be_listed_is_counted(projects, monkeypatch):
     assert problems == [str(sub)]
     assert sorted(t.path.name for t in got) == ["agent-c1.jsonl", "s1.jsonl"]
     assert led.unreadable == 1
+
+
+# ---- list prices: Sonnet 5.5 cache hits and fast mode ----------------------------------------------------------------
+ONE_MILLION_EACH = {
+    "input_tokens": 1_000_000,
+    "output_tokens": 1_000_000,
+    "cache_creation_input_tokens": 1_000_000,
+    "cache_read_input_tokens": 1_000_000,
+}
+
+
+def test_sonnet_5_5_cache_hits_cost_five_percent_of_the_input_price():
+    # list prices (platform.claude.com/docs/en/about-claude/pricing, 2026-10-18): $2 in, $10 out, $2.50 write, $0.10 hit
+    assert usage.estimate_cost("claude-sonnet-5-5", ONE_MILLION_EACH) == pytest.approx(
+        2.0 + 10.0 + 2.5 + 0.10
+    )
+    assert usage.estimate_cost("claude-sonnet-5", ONE_MILLION_EACH) == pytest.approx(
+        2.0 + 10.0 + 2.5 + 0.20
+    )  # Sonnet 5 stays at 0.1x
+
+
+def test_fast_mode_doubles_every_price_class_on_the_models_that_have_it():
+    base = usage.estimate_cost("claude-opus-5-5", ONE_MILLION_EACH)
+    assert base == pytest.approx(4.0 + 20.0 + 5.0 + 0.20)
+    assert usage.estimate_cost(
+        "claude-opus-5-5", {**ONE_MILLION_EACH, "speed": "fast"}
+    ) == pytest.approx(2 * base)  # $8 / $40
+    assert usage.estimate_cost(
+        "claude-opus-5-5", {**ONE_MILLION_EACH, "speed": "standard"}
+    ) == pytest.approx(base)
+    assert usage.estimate_cost(
+        "claude-opus-5", {**ONE_MILLION_EACH, "speed": "fast"}
+    ) == pytest.approx(2 * (5.0 + 25.0 + 6.25 + 0.50))
+    assert usage.estimate_cost(
+        "claude-opus-4-8", {**ONE_MILLION_EACH, "speed": "fast"}
+    ) == pytest.approx(2 * (5.0 + 25.0 + 6.25 + 0.50))
+    # a model without fast mode is not charged for it, whatever the record says
+    assert usage.estimate_cost(
+        "claude-sonnet-5-5", {**ONE_MILLION_EACH, "speed": "fast"}
+    ) == pytest.approx(2.0 + 10.0 + 2.5 + 0.10)
+    assert usage.estimate_cost(
+        "claude-opus-4-7", {**ONE_MILLION_EACH, "speed": "fast"}
+    ) == pytest.approx(5.0 + 25.0 + 6.25 + 0.50)
+
+
+def test_the_one_hour_cache_write_doubles_with_fast_mode_too():
+    one_hour = {
+        "cache_creation_input_tokens": 1_000_000,
+        "cache_creation": {"ephemeral_1h_input_tokens": 1_000_000},
+    }
+    assert usage.estimate_cost("claude-opus-5-5", one_hour) == pytest.approx(
+        8.0
+    )  # 2 x the $4 input price
+    assert usage.estimate_cost("claude-opus-5-5", {**one_hour, "speed": "fast"}) == pytest.approx(
+        16.0
+    )

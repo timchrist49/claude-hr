@@ -159,19 +159,24 @@ def has_transcripts(root: Path | None = None) -> bool:
 # ---------------------------------------------------------------------------------------------
 # USD per million tokens: (input, output, cache write for the 5-minute TTL, cache read). List prices of the Anthropic
 # API (as of 2026-10), to ESTIMATE what the same traffic would cost there: a subscription is not billed per token.
-# One flat price per model family: tiered (long-context), fast-mode and batch prices are not modelled, and the report
-# says so. The first row whose marker is in the model id wins; a model with no row is left out of every cost, counted,
-# and shown as n/a.
+# One flat price per model family: tiered (long-context) and batch prices are not modelled, and the report says so.
+# Fast mode is: a message whose usage block says speed "fast" on a model that has it costs twice the price in every
+# class (Opus 5.5 $8/$40 against $4/$20; the caching multipliers stack on the fast price). Cache hits cost 0.05x the
+# input price on Opus 5.5 and Sonnet 5.5, 0.1x on the others. The first row whose marker is in the model id wins; a
+# model with no row is left out of every cost, counted, and shown as n/a.
 _PRICES: tuple[tuple[tuple[str, ...], tuple[float, float, float, float]], ...] = (
     (("fable-5-1", "mythos-5-1"), (10.0, 50.0, 12.5, 0.25)),
     (("fable-5", "mythos-5"), (10.0, 50.0, 12.5, 1.0)),
     (("opus-5-5",), (4.0, 20.0, 5.0, 0.20)),
     (("opus-5", "opus-4-8", "opus-4-7", "opus-4-6"), (5.0, 25.0, 6.25, 0.50)),
+    (("sonnet-5-5",), (2.0, 10.0, 2.5, 0.10)),
     (("sonnet-5",), (2.0, 10.0, 2.5, 0.20)),
     (("sonnet-4-6",), (3.0, 15.0, 3.75, 0.30)),
     (("haiku-5",), (0.10, 0.50, 0.125, 0.01)),
     (("haiku-4-5",), (1.0, 5.0, 1.25, 0.10)),
 )
+# the models that have fast mode ("opus-5" also matches Opus 5.5)
+_FAST_MODE = ("opus-5", "opus-4-8")
 
 
 def _int(v: object) -> int:
@@ -190,13 +195,16 @@ def estimate_cost(model: str, u: dict) -> float | None:
     write = _int(u.get("cache_creation_input_tokens"))
     cc = u.get("cache_creation")
     hour = min(write, _int(cc.get("ephemeral_1h_input_tokens"))) if isinstance(cc, dict) else 0
-    return (
+    cost = (
         _int(u.get("input_tokens")) * p_in
         + _int(u.get("output_tokens")) * p_out
         + (write - hour) * p_write
         + hour * p_in * 2  # a 1-hour cache write costs twice the input price
         + _int(u.get("cache_read_input_tokens")) * p_read
     ) / 1_000_000
+    if u.get("speed") == "fast" and any(m in model for m in _FAST_MODE):
+        cost *= 2  # fast mode: every price class doubles
+    return cost
 
 
 @dataclass
@@ -468,7 +476,8 @@ def format_ledger(led: Ledger, by: str = "day", top: int = 12) -> str:
     )
     out.append(
         "est.cost = an estimate of what these tokens would cost at the Anthropic API list prices, not a bill: "
-        "tiered, long-context, fast-mode and batch pricing is ignored, and a subscription plan is not billed per token."
+        "fast mode is counted (2x on Opus); tiered, long-context and batch pricing is ignored, and a subscription plan is not "
+        "billed per token (extra usage once a window is full is: see `claude-hr-ctl status`)."
     )
     if led.unpriced:
         out.append(
