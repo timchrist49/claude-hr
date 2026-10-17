@@ -12,6 +12,14 @@
   with the flags claude-hr uses and looks at the desktop session's windows; `CLAUDE_HR_TEST_WINDOW_CONTROL=1` adds the control
   that the old flags do open one), and `tests/windows/proxy_window_probe.py`, which starts the real proxy through
   `Headroom.start()` and reports any new console window.
+- **The self-update helper and the monitor's alert command no longer open a window either.** The helper's one-shot scheduled
+  task ran `powershell.exe` directly; Task Scheduler gives it no console, so Windows Terminal opened a window that stayed
+  (minimised) for the whole reinstall, and closing it killed the reinstall. The task now runs it through `conhost.exe
+  --headless` (checked once that this Windows supports it, else as before). `monitor.alert_command` is started with
+  `CREATE_NO_WINDOW` and no stdin (the monitor job runs under `pythonw.exe`).
+- **Fixed: `pytest tests` failed on Linux and macOS with a collection error.** 0.2.1 added a Windows-only script
+  (`tests/windows/console_offer_test.py`) whose name pytest collects and which uses `ctypes.WinDLL` at import time. It is
+  now `tests/windows/offer_console_check.py`, and `tests/conftest.py` keeps pytest out of `tests/windows/*.py` altogether.
 - If you are on 0.2.1 and see the window: update (`claude-hr-ctl update`, or `install.ps1` again) and, once no Claude session is
   running, `claude-hr-ctl headroom restart`.
 

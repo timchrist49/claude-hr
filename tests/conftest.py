@@ -6,6 +6,10 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
+# tests/windows/*.py are scripts for a Windows machine (ctypes.WinDLL at import time), run by hand or by verify-windows.ps1:
+# pytest must never import them, whatever they are called
+collect_ignore_glob = ["windows/*.py"]
+
 
 @pytest.fixture(scope="session")
 def _empty_gitconfig(tmp_path_factory):
