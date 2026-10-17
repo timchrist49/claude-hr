@@ -610,6 +610,11 @@ def cmd_creds(a, cfg) -> int:
         checks = creds.run_checks(cfg)
         for c in checks:
             out(c.line(_color()))
+        listing = creds.format_findings(creds.scan_config_secrets())
+        if listing:
+            out("")
+            for line in listing:
+                out(line)
         return 1 if any(c.status == FAIL for c in checks) else 0
     hits, scanned = creds.scan_transcripts(a.days)
     out(f"scanned {scanned} transcript file(s) from the last {a.days} day(s)")
