@@ -477,12 +477,15 @@ def _headroom_summary(port: int, named: tuple[str, ...] = ()) -> dict | None:
         return None
     life = (body.get("persistent_savings") or {}).get("lifetime") or {}
     disp = body.get("display_session") or {}
+    sub = (body.get("subscription_window") or {}).get("latest") or {}
     out = {
         "saved": (body.get("savings") or {}).get("total_tokens") or life.get("tokens_saved") or 0,
         "pct": disp.get("savings_percent"),
-        "five_hour": (
-            ((body.get("subscription_window") or {}).get("latest") or {}).get("five_hour") or {}
-        ).get("utilization_pct"),
+        "five_hour": (sub.get("five_hour") or {}).get("utilization_pct"),
+        "seven_day": _field(sub, "seven_day", "utilization_pct"),
+        "extra_used": _field(sub, "extra_usage", "used_credits_usd")
+        if _field(sub, "extra_usage", "is_enabled") is True
+        else None,
     }
     if usable:
         paths.hook_write(cache, json.dumps(out), *named)
@@ -543,6 +546,14 @@ def _statusline_parts(data, parts: list[str]) -> None:
         five_hour = _num(_field(hs, "five_hour"))
         if five_hour is not None:
             parts.append(f"5h {five_hour:.0f}%")
+        seven_day = _num(_field(hs, "seven_day"))
+        # the window only when it matters, so that the status line stays short
+        if seven_day is not None and seven_day >= 80:
+            parts.append(f"7d {seven_day:.0f}%")
+        extra_used = _num(_field(hs, "extra_used"))
+        # a full window means extra usage is being spent, at API prices
+        if extra_used and seven_day is not None and seven_day >= 100:
+            parts.append(f"extra ${extra_used:,.0f}")
 
 
 def statusline() -> int:

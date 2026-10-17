@@ -23,6 +23,7 @@ from . import (
     maintenance,
     monitor,
     paths,
+    planmeter,
     plugins_audit,
     procutil,
     schedule,
@@ -288,6 +289,13 @@ def cmd_status(a, cfg) -> int:
                 out(
                     f"  Plan usage : 5h window {sw['five_hour'].get('utilization_pct')}%  |  7d window {(sw.get('seven_day') or {}).get('utilization_pct')}%"
                 )
+    # extra usage is cash: show it, and say so when the window is full
+    meter = planmeter.read_local()
+    if meter and planmeter.extra_text(meter):
+        out(f"  Extra usage: {planmeter.extra_text(meter)} this month")
+    flag = planmeter.warning(meter) if meter else None
+    if flag and flag[0] == "warn":
+        out(f"  WARNING    : {flag[1]}")
     out(
         f"  Sessions   : {snap['sessions']} running / limit {snap['session_limit']}   RAM free {snap['ram_free_gb']} of {snap['ram_total_gb']} GB   disk free {snap['disk_free_gb']} GB"
     )
