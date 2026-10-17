@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.2.3
+- **Fixed: false "Headroom proxy down" alarms.** A proxy nobody has asked for a while answers its first request slowly (0.4-0.8 s
+  measured on Windows, the first `/health` after 15 idle minutes), while the quick probe gives up after 0.6 s; the next request
+  takes a millisecond. The monitor job (every 15 minutes) therefore raised "Headroom proxy down" and "proxy restart requested" at
+  most of its ticks for a proxy that was running fine, `doctor` and `status` could print "not serving" right after a quiet spell,
+  and the launcher printed "waiting for the Headroom proxy (up to 90s ...)" for a healthy one. New `Headroom.health_patient()`:
+  when something is listening but the quick probe got no answer, it asks once more with a longer timeout (nothing listening is
+  still "down" at once). Used by the monitor (check and restart decision), `doctor`, `status`, `headroom status`, the updater's
+  "was it running" check and, with a short 1.5 s patience, the launcher.
+
 ## 0.2.2
 - **Fixed: an empty terminal window titled with the path of `headroom.exe` kept popping up on Windows, and closing it killed the
   Headroom proxy.** Every proxy start (the launcher's cold start, and the monitor job restarting a dead proxy) was made with

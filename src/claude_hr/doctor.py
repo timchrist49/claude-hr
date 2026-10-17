@@ -430,7 +430,7 @@ def run(cfg: Config, cwd: Path, deep: bool = False) -> list[Check]:
             )
         else:
             ver = hr.version() or "?"
-            h = hr.health()
+            h = hr.health_patient()
             out.append(Check("headroom", OK, f"{ver} at {b}"))
             if h.ok:
                 snap_rss = max([sysinfo.process_rss_mb(p) for p in hr._listener_pids()] or [0])

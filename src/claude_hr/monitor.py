@@ -38,7 +38,7 @@ def snapshot(cfg: Config) -> dict:
     hr = Headroom(cfg)
     total, avail = sysinfo.memory_gb()
     # "enabled" for alerting purposes means: configured AND installed (a missing install is a doctor finding, not an outage)
-    health = hr.health() if cfg.flag("headroom.enabled", True) and hr.binary() else None
+    health = hr.health_patient() if cfg.flag("headroom.enabled", True) and hr.binary() else None
     proxy_rss = 0.0
     st = read_json(paths.state_dir() / "headroom-proxy.json", {}) or {}
     for pid in {int(st.get("pid") or 0)} | hr._listener_pids():
@@ -112,7 +112,7 @@ def heal(cfg: Config, snap: dict) -> str:
     if hr.binary() is None:
         return "headroom not installed"
     # a wedged proxy of ours may still hold the port; stop() only ever signals Headroom processes
-    if procutil.port_listening(hr.host, hr.port) and not hr.health().ok:
+    if procutil.port_listening(hr.host, hr.port) and not hr.health_patient().ok:
         hr.stop()
         conflict = getattr(hr, "last_conflict", None)
         if conflict and procutil.port_listening(hr.host, hr.port):

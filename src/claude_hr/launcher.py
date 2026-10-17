@@ -543,7 +543,9 @@ def main(argv: list[str] | None = None) -> int:
             )
             want_route = False
         else:
-            health = hr.health()
+            # a short extra wait for a proxy that is listening but slow to answer its first request after idling: without it
+            # every launch after a quiet spell printed "waiting for the Headroom proxy (up to 90s ...)" for a proxy that was fine
+            health = hr.health_patient(patience_s=1.5)
             if not health.ok and not opts.get("dry-run"):
                 if wait > 0:
                     _say(

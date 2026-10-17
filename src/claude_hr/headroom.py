@@ -193,6 +193,20 @@ class Headroom:
         ok = body.get("status") == "healthy" and bool(body.get("ready"))
         return Health(ok, str(body.get("status")), str(body.get("version", "")))
 
+    def health_patient(self, patience_s: float = 4.0) -> Health:
+        """health() for callers that can afford to wait a little before saying "down".
+
+        A proxy nobody has asked for a while has its memory trimmed by the OS, so its first answer can take 0.4-0.8 s, past the
+        0.6 s of health(); the next one takes a millisecond (measured on Windows: every monitor tick after 15 idle minutes
+        failed the quick probe and raised a false "Headroom proxy down"). When something is listening but the quick probe got no
+        usable answer, ask once more with `patience_s`. Nothing listening (refused) is down at once."""
+        h = self.health()
+        if h.ok or patience_s <= 0.6:
+            return h
+        if procutil.port_listening(self.host, self.port):
+            return self.health(timeout=patience_s)
+        return h
+
     def proxy_args(self) -> list[str]:
         h = self.h
         args = ["proxy", "--host", self.host, "--port", str(self.port), "--workers", "1"]

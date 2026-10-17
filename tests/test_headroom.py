@@ -313,3 +313,74 @@ def test_restart_still_restarts_when_the_session_registry_cannot_be_read(
     monkeypatch.setattr(resources, "live_sessions", boom)
     assert ctl.main(["headroom", "restart"]) == 0
     assert "warning" not in capsys.readouterr().out and restart == ["stop", "ensure"]
+
+
+# ---- a proxy that is slow to answer its first request after idling is not "down" --------------------------------------
+class _Probe:
+    """Stands in for procutil.http_json / port_listening: answers from a script and remembers the timeouts it was given."""
+
+    def __init__(self, answers, listening=True):
+        self.answers = list(answers)
+        self.listening = listening
+        self.timeouts = []
+
+    def http_json(self, url, timeout=0.6, loopback=True):
+        self.timeouts.append(timeout)
+        return self.answers.pop(0)
+
+    def port_listening(self, host, port, timeout=0.25):
+        return self.listening
+
+
+GOOD = (200, {"status": "healthy", "ready": True, "version": "0.41.0"})
+NOTHING = (0, None)
+
+
+def _patient(monkeypatch, probe, **kw):
+    monkeypatch.setattr(headroom.procutil, "http_json", probe.http_json)
+    monkeypatch.setattr(headroom.procutil, "port_listening", probe.port_listening)
+    return hr().health_patient(**kw)
+
+
+def test_a_slow_first_answer_after_idling_is_not_down(sandbox, monkeypatch):
+    """Measured: the first request after 15 idle minutes took 0.4-0.8 s, the monitor's probe gave up at 0.6 s and raised a false
+    'Headroom proxy down' at most ticks; the next request answers in a millisecond."""
+    probe = _Probe([NOTHING, GOOD])
+    h = _patient(monkeypatch, probe)
+    assert h.ok and h.version == "0.41.0"
+    assert probe.timeouts == [0.6, 4.0], "the quick probe, then one patient one"
+
+
+def test_a_proxy_that_answers_at_once_is_asked_once(sandbox, monkeypatch):
+    probe = _Probe([GOOD])
+    assert _patient(monkeypatch, probe).ok and probe.timeouts == [0.6]
+
+
+def test_nothing_listening_is_down_at_once_without_waiting(sandbox, monkeypatch):
+    probe = _Probe([NOTHING], listening=False)
+    h = _patient(monkeypatch, probe)
+    assert not h.ok and h.status == "down" and probe.timeouts == [0.6]
+
+
+def test_a_listener_that_never_answers_is_down_after_the_patient_try(sandbox, monkeypatch):
+    probe = _Probe([NOTHING, NOTHING])
+    h = _patient(monkeypatch, probe)
+    assert not h.ok and h.status == "down" and probe.timeouts == [0.6, 4.0]
+
+
+def test_no_patience_means_the_quick_probe_only(sandbox, monkeypatch):
+    probe = _Probe([NOTHING])
+    assert not _patient(monkeypatch, probe, patience_s=0).ok and probe.timeouts == [0.6]
+
+
+def test_the_monitor_does_not_raise_a_false_down_for_a_slow_first_answer(sandbox, monkeypatch):
+    from claude_hr import monitor
+
+    probe = _Probe([NOTHING, GOOD])
+    monkeypatch.setattr(headroom.procutil, "http_json", probe.http_json)
+    monkeypatch.setattr(headroom.procutil, "port_listening", probe.port_listening)
+    monkeypatch.setattr(Headroom, "binary", lambda self: Path("/fake/headroom"))
+    monkeypatch.setattr(Headroom, "_listener_pids", lambda self: set())
+    snap = monitor.snapshot(config.load())
+    assert snap["proxy"]["ok"] is True
+    assert not [a for a in monitor.evaluate(config.load(), snap) if a.key == "proxy"]

@@ -267,7 +267,7 @@ def cmd_doctor(a, cfg) -> int:
 def cmd_status(a, cfg) -> int:
     hr = Headroom(cfg)
     snap = monitor.snapshot(cfg)
-    h = hr.health()
+    h = hr.health_patient()
     out(f"claude-hr {__version__}")
     out(
         f"  Headroom   : {'healthy' if h.ok else h.status} {('v' + h.version) if h.version else ''} @ {hr.url}  (mode={cfg.get('headroom.mode')}, profile={cfg.get('headroom.savings_profile')})"
@@ -403,7 +403,7 @@ def _running_sessions() -> int:
 def cmd_headroom(a, cfg) -> int:
     hr = Headroom(cfg)
     if a.action == "status":
-        h = hr.health()
+        h = hr.health_patient()
         out(
             f"{'healthy' if h.ok else h.status} {h.version} {hr.url}  binary={hr.binary()}  installed={hr.version()}"
         )

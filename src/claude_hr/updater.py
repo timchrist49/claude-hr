@@ -391,7 +391,7 @@ class Updater:
         if busy:
             res.action, res.detail = "deferred", busy
             return res
-        was_running = self.hr.health().ok
+        was_running = self.hr.health_patient().ok
         self.hr.stop()
         # a new release may need a newer model revision: allow the network for this one start
         online_h = {**self.hr.h, "offline_models": False}
