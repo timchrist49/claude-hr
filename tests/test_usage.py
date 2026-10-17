@@ -465,3 +465,329 @@ def test_plugins_audit_does_not_call_a_plugin_unused_from_a_cut_short_scan(
     rows = {r.id: r for r in plugins_audit.audit_plugins(config.load(), Path("claude"))}
     assert rows["idle@market"].uses == 0
     assert not any("not used" in n for n in rows["idle@market"].notes)
+
+
+# ---- est.cost: n/a for a model without a price, and what the number is -------------------------------------------
+
+
+def test_a_model_without_a_price_shows_n_a_never_a_zero_dollar_cost(projects):
+    write(
+        projects / "p" / "s.jsonl",
+        [
+            msg("m1", "r1", output_tokens=1_000_000),
+            msg("m2", "r2", model="mystery-1", output_tokens=1_000_000),
+        ],
+    )
+    led = usage.collect(7)
+    text = usage.format_ledger(led, "model")
+    rows = {ln.split()[0]: ln for ln in text.splitlines() if ln.split()[:1]}
+    assert rows["mystery-1"].rstrip().endswith("n/a") and "$0.00" not in rows["mystery-1"]
+    assert rows["claude-sonnet-5-5"].rstrip().endswith("$10.00")
+    assert rows["TOTAL"].rstrip().endswith("$10.00*")  # the star: some of it has no price
+    day_row = next(ln for ln in usage.format_ledger(led, "day").splitlines() if ln[:2] == "20")
+    assert day_row.rstrip().endswith("$10.00*")
+    assert "n/a = no price known for the model; * = the figure leaves out 1 message(s)" in text
+    assert "(mystery-1)" in text
+
+
+def test_a_ledger_with_nothing_priced_says_n_a_in_the_total(projects):
+    write(projects / "p" / "s.jsonl", [msg("m1", "r1", model="mystery-1", output_tokens=5)])
+    text = usage.format_ledger(usage.collect(7))
+    lines = text.splitlines()
+    total = next(ln for ln in lines if ln.startswith("TOTAL"))
+    day_row = next(ln for ln in lines if ln[:2] == "20")
+    main_row = next(ln for ln in lines if ln.startswith("main sessions"))
+    assert all(row.rstrip().endswith("n/a") for row in (total, day_row, main_row))
+
+
+def test_the_cost_footnote_says_it_is_an_estimate_and_what_it_ignores(projects):
+    write(projects / "p" / "s.jsonl", [msg("m1", "r1", output_tokens=5)])
+    text = usage.format_ledger(usage.collect(7))
+    foot = " ".join(ln for ln in text.splitlines() if ln.startswith("est.cost"))
+    assert "not a bill" in foot and "API list prices" in foot
+    for word in ("tiered", "long-context", "batch"):
+        assert word in foot
+    assert "a subscription plan is not billed per token" in foot
+
+
+# ---- the daily snapshot ------------------------------------------------------------------------------------------
+
+SINCE = datetime(
+    2026, 10, 9, 10, 0, tzinfo=UTC
+).timestamp()  # a scan of 8 days, made on 2026-10-17 at 10:00 UTC
+UNTIL = datetime(2026, 10, 17, 10, 0, tzinfo=UTC).timestamp()
+WINDOW_DAYS = [f"2026-10-{d:02d}" for d in range(9, 18)]
+WHOLE_DAYS = WINDOW_DAYS[
+    1:-1
+]  # the first day began before the scan did, the last one is still running
+
+
+def ledger(days=WINDOW_DAYS, subagents=True, partial=False, messages=3) -> usage.Ledger:
+    led = usage.Ledger(8, since=SINCE, until=UNTIL, subagents=subagents, partial=partial)
+    for d in days:
+        for _ in range(messages):
+            led.by_day[d].add({"input_tokens": 5, "output_tokens": 10}, 0.0)
+    return led
+
+
+def stored(res: usage.SnapshotResult) -> dict:
+    return json.loads(res.file.read_text(encoding="utf-8"))
+
+
+def test_the_snapshot_stores_only_whole_days_each_with_its_scope(tmp_path):
+    res = usage.write_snapshot(ledger(), tmp_path)
+    got = stored(res)
+    assert (
+        sorted(got) == WHOLE_DAYS
+    )  # seven days, not the first (partly in the window) or the last (running)
+    assert all(v["scope"] == "main+subagents" and v["messages"] == 3 for v in got.values())
+    assert got["2026-10-10"] == {
+        "input": 15,
+        "output": 30,
+        "cache_write": 0,
+        "cache_read": 0,
+        "messages": 3,
+        "scope": "main+subagents",
+    }
+    assert res.not_whole == ["2026-10-09", "2026-10-17"] and not res.skipped
+
+
+def test_a_partial_scan_never_overwrites_a_stored_day(tmp_path):
+    first = usage.write_snapshot(ledger(), tmp_path)
+    before = first.file.read_text(encoding="utf-8")
+    cut = ledger(messages=1, partial=True)
+    res = usage.write_snapshot(cut, tmp_path)
+    assert res.skipped and "cut short" in res.skipped and not res.written
+    assert first.file.read_text(encoding="utf-8") == before
+    fresh = usage.write_snapshot(ledger(partial=True), tmp_path / "other")
+    assert fresh.skipped and not (tmp_path / "other").exists()  # not even the folder
+
+
+def test_a_day_stored_without_a_scope_is_main_only_and_is_kept_as_it_is(tmp_path):
+    old = {"input": 1, "output": 2, "cache_write": 0, "cache_read": 0, "messages": 9}
+    assert usage.snapshot_scope(old) == "main"
+    assert usage.snapshot_scope({**old, "scope": "main+subagents"}) == "main+subagents"
+    assert usage.snapshot_scope("garbage") == "main"
+    month = f"{time.strftime('%Y-%m')}.json"
+    (tmp_path / month).write_text(
+        json.dumps(
+            {
+                "2026-10-10": old,  # from before the field existed
+                "2026-10-11": {
+                    **old,
+                    "messages": 100,
+                    "scope": "main+subagents",
+                },  # more than this scan sees
+                "2026-10-12": {**old, "messages": 1, "scope": "main+subagents"},  # less
+            }
+        ),
+        encoding="utf-8",
+    )
+    res = usage.write_snapshot(ledger(), tmp_path)
+    got = stored(res)
+    assert got["2026-10-10"] == old  # untouched: no scope added, no number replaced
+    assert (
+        got["2026-10-11"]["messages"] == 100
+    )  # the larger figure stays: Claude Code prunes transcripts
+    assert (
+        got["2026-10-12"]["messages"] == 3
+    )  # replaced by a figure of the same scope that is not smaller
+    assert res.kept_other_scope == ["2026-10-10"] and res.kept_larger == ["2026-10-11"]
+    assert "2026-10-12" in res.written and len(res.written) == 5
+    lines = "\n".join(res.lines())
+    assert "kept as stored (counted with another scope): 2026-10-10" in lines
+
+
+def test_a_main_only_snapshot_does_not_overwrite_days_counted_with_subagents(tmp_path):
+    usage.write_snapshot(ledger(), tmp_path)
+    res = usage.write_snapshot(ledger(subagents=False, messages=1), tmp_path)
+    assert res.scope == "main" and not res.written
+    assert res.kept_other_scope == WHOLE_DAYS
+    assert all(v["scope"] == "main+subagents" for v in stored(res).values())
+    fresh = usage.write_snapshot(ledger(subagents=False), tmp_path / "main-only")
+    assert all(v["scope"] == "main" for v in stored(fresh).values())
+
+
+def test_an_unparsable_snapshot_file_is_left_alone(tmp_path):
+    f = tmp_path / f"{time.strftime('%Y-%m')}.json"
+    f.write_text('{"2026-10-10": {', encoding="utf-8")
+    res = usage.write_snapshot(ledger(), tmp_path)
+    assert res.skipped and "not valid JSON" in res.skipped and not res.written
+    assert f.read_text(encoding="utf-8") == '{"2026-10-10": {'
+
+
+def test_usage_snapshot_command_reports_what_it_stored_and_what_it_did_not(projects, capsys):
+    fleet(projects)  # one message each, all of today: a day that is still running is not stored
+    assert ctl._run(["usage", "--snapshot", "--days", "7"]) == 0
+    text = capsys.readouterr().out
+    assert "snapshot unchanged:" in text and "scope main+subagents" in text
+    assert "not stored (the scan saw only part of the day)" in text
+    assert ctl._run(["usage", "--snapshot", "--days", "7", "--no-subagents"]) == 0
+    assert "scope main)" in capsys.readouterr().out
+
+
+def test_the_maintain_job_stores_the_seven_whole_days_before_today(projects, monkeypatch):
+    """It runs weekly: the old 3-day window stored 3 days in 7, and its first and last day were partial."""
+    now = datetime.now(UTC)
+    for k in range(1, 11):  # one message at noon UTC of each of the last 10 days
+        noon = (now - timedelta(days=k)).replace(hour=12, minute=0, second=0, microsecond=0)
+        write(
+            projects / "p" / f"s{k}.jsonl",
+            [msg(f"m{k}", f"r{k}", when=noon.strftime("%Y-%m-%dT%H:%M:%S.000Z"), output_tokens=k)],
+        )
+    monkeypatch.setattr(ctl.maintenance, "plan", lambda cfg: None)
+    monkeypatch.setattr(ctl.maintenance, "apply", lambda p: (0, 0.0))
+    monkeypatch.setattr(ctl.Headroom, "binary", lambda self: None)  # no real `headroom learn`
+    assert ctl._run(["job", "maintain"]) == 0
+    f = paths.state_dir() / "usage" / f"{time.strftime('%Y-%m')}.json"
+    got = json.loads(f.read_text(encoding="utf-8"))
+    expected = {(now - timedelta(days=k)).strftime("%Y-%m-%d") for k in range(1, 8)}
+    assert set(got) == expected
+    assert all(v["scope"] == "main+subagents" for v in got.values())
+    log = (paths.logs_dir() / "job-maintain.log").read_text(encoding="utf-8")
+    assert "usage snapshot: 7 day(s) stored" in log
+
+
+def test_the_maintain_job_does_not_store_from_a_cut_short_scan(projects, monkeypatch):
+    write(projects / "p" / "s.jsonl", [msg("m1", "r1", output_tokens=1)])
+    real = usage.collect
+    monkeypatch.setattr(usage, "collect", lambda days: real(days, max_seconds=-1))
+    monkeypatch.setattr(ctl.maintenance, "plan", lambda cfg: None)
+    monkeypatch.setattr(ctl.maintenance, "apply", lambda p: (0, 0.0))
+    monkeypatch.setattr(ctl.Headroom, "binary", lambda self: None)
+    assert ctl._run(["job", "maintain"]) == 0
+    assert not (paths.state_dir() / "usage").exists()
+    log = (paths.logs_dir() / "job-maintain.log").read_text(encoding="utf-8")
+    assert "usage snapshot not written: the scan was cut short" in log
+
+
+# ---- plugins audit: a partial result says so, and how the window is measured -------------------------------------
+
+
+def test_plugins_audit_says_how_the_window_is_measured(projects, fake_plugins):
+    tool_fleet(projects)
+    rows = plugins_audit.audit_plugins(config.load(), Path("claude"))
+    text = plugins_audit.format_plugins(rows)
+    assert not rows.partial and rows.measured
+    assert "modified in the last 30 days" in text
+    assert "by file modification time, not by when each call was made" in text
+    assert "PARTIAL" not in text and ">=" not in text
+
+
+def test_plugins_audit_marks_a_partial_scan_as_partial(projects, fake_plugins, monkeypatch):
+    tool_fleet(projects)
+    counts = usage.ToolCounts(int)
+    counts["skill:alpha:brainstorming"] = 2
+    counts.partial = True
+    monkeypatch.setattr(usage, "collect_tool_use", lambda days: counts)
+    rows = plugins_audit.audit_plugins(config.load(), Path("claude"))
+    text = plugins_audit.format_plugins(rows)
+    assert rows.partial
+    assert "PARTIAL: the transcript scan stopped early; the uses column is a lower bound" in text
+    alpha = next(ln for ln in text.splitlines() if ln.startswith("alpha@market"))
+    assert alpha.rstrip().endswith(">=2")  # a lower bound is written as one
+    assert not any("not used" in n for r in rows for n in r.notes)
+
+
+def test_plugins_audit_does_not_call_a_plugin_unused_when_transcripts_were_unreadable(
+    projects, fake_plugins, monkeypatch
+):
+    tool_fleet(projects)
+    counts = usage.ToolCounts(int)
+    counts["skill:alpha:brainstorming"] = 2
+    counts.unreadable = 3
+    monkeypatch.setattr(usage, "collect_tool_use", lambda days: counts)
+    rows = plugins_audit.audit_plugins(config.load(), Path("claude"))
+    text = plugins_audit.format_plugins(rows)
+    assert rows.unreadable == 3
+    assert "3 transcript file(s) could not be read" in text
+    assert not any("not used" in n for r in rows for n in r.notes)
+
+
+# ---- Windows: deep transcript paths, and files that cannot be read are counted -----------------------------------
+
+DEEP = (
+    "C:\\Users\\tim\\.claude\\projects\\"
+    + "p" * 190
+    + "\\s\\subagents\\workflows\\wf_1\\agent-1.jsonl"
+)
+
+
+def test_long_paths_get_the_extended_length_form_on_windows_only():
+    short = "C:\\Users\\tim\\.claude\\projects\\p\\s.jsonl"
+    assert usage.long_path(short, windows=True) == short
+    assert len(DEEP) > 259
+    assert usage.long_path(DEEP, windows=True) == "\\\\?\\" + DEEP
+    assert usage.long_path(DEEP.replace("\\", "/"), windows=True) == "\\\\?\\" + DEEP  # no '/' left
+    unc = "\\\\server\\share\\" + "d\\" * 130 + "agent.jsonl"
+    assert (
+        usage.long_path(unc, windows=True)
+        == "\\\\?\\UNC\\server\\share\\" + unc[len("\\\\server\\share\\") :]
+    )
+    assert usage.long_path("\\\\?\\" + DEEP, windows=True) == "\\\\?\\" + DEEP  # not twice
+    assert usage.long_path(DEEP, windows=False) == DEEP
+    assert usage.plain_path("\\\\?\\" + DEEP) == DEEP
+    assert usage.plain_path("\\\\?\\UNC\\server\\share\\x") == "\\\\server\\share\\x"
+    assert usage.plain_path(short) == short
+
+
+def test_transcripts_are_listed_and_opened_through_long_path(projects, monkeypatch):
+    fleet(projects)
+    seen: list[str] = []
+    real = usage.long_path
+    monkeypatch.setattr(
+        usage, "long_path", lambda p, windows=None: seen.append(str(p)) or real(p, windows)
+    )
+    usage.collect(7)
+    usage.collect_tool_use(7)
+    names = {Path(p).name for p in seen}
+    assert {"s1.jsonl", "agent-a1.jsonl", "agent-b1.jsonl", "agent-c1.jsonl"} <= names  # opened
+    assert str(projects / "proj-a" / "s1" / "subagents") in seen  # listed
+
+
+def test_a_transcript_that_cannot_be_read_is_counted_and_said(projects, monkeypatch):
+    fleet(projects)
+    real_open = builtins.open
+
+    def deny(file, *args, **kwargs):
+        if str(file).endswith("agent-a1.jsonl"):
+            raise PermissionError(13, "denied")
+        return real_open(file, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "open", deny)
+    led = usage.collect(7)
+    counts = usage.collect_tool_use(7)
+    monkeypatch.setattr(builtins, "open", real_open)
+    assert led.unreadable == 1
+    assert (led.files, led.files_main, led.files_sub) == (
+        3,
+        1,
+        2,
+    )  # the file that was read, not the one listed
+    assert led.total.messages == 3
+    assert (
+        "1 transcript file(s) could not be read; the figures leave them out."
+        in usage.format_ledger(led)
+    )
+    assert counts.unreadable == 1
+    assert "1 transcript file(s) could not be read" in usage.format_tool_use(counts, 30)
+
+
+def test_a_folder_that_cannot_be_listed_is_counted(projects, monkeypatch):
+    fleet(projects)
+    sub = projects / "proj-a" / "s1" / "subagents"
+    real_scandir = os.scandir
+
+    def scandir(path="."):
+        if str(path) == str(sub):
+            raise PermissionError(13, "denied")
+        return real_scandir(path)
+
+    with monkeypatch.context() as m:
+        m.setattr(os, "scandir", scandir)
+        problems: list[str] = []
+        got = usage.list_transcripts(projects, 0.0, problems=problems)
+        led = usage.collect(7)
+    assert problems == [str(sub)]
+    assert sorted(t.path.name for t in got) == ["agent-c1.jsonl", "s1.jsonl"]
+    assert led.unreadable == 1

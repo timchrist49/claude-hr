@@ -548,21 +548,10 @@ def cmd_usage(a, cfg) -> int:
         return 0
     led = usage.collect(a.days, subagents=not a.no_subagents)
     if a.snapshot:
-        d = paths.state_dir() / "usage"
-        d.mkdir(parents=True, exist_ok=True)
-        f = d / f"{time.strftime('%Y-%m')}.json"
-        cur = read_json(f, {}) or {}
-        for day, b in led.by_day.items():
-            cur[day] = {
-                "input": b.input,
-                "output": b.output,
-                "cache_write": b.cache_write,
-                "cache_read": b.cache_read,
-                "messages": b.messages,
-            }
-        write_json(f, cur)
-        out(f"snapshot written: {f}")
-        return 0
+        res = usage.write_snapshot(led)
+        for line in res.lines():
+            out(line)
+        return 1 if res.skipped else 0
     out(usage.format_ledger(led, a.by))
     return 0
 
@@ -703,27 +692,32 @@ def cmd_cleanup(a, cfg) -> int:
 
 def cmd_creds(a, cfg) -> int:
     if a.action == "doctor":
-        checks = creds.run_checks(cfg)
+        scan = creds.scan_config()  # once: the checks and the listing below must agree
+        checks = creds.run_checks(cfg, scan)
         for c in checks:
             out(c.line(_color()))
-        listing = creds.format_findings(creds.scan_config_secrets())
+        listing = creds.format_findings(scan.findings, scan.capped)
         if listing:
             out("")
             for line in listing:
                 out(line)
         return 1 if any(c.status == FAIL for c in checks) else 0
-    hits, scanned = creds.scan_transcripts(a.days)
-    out(f"scanned {scanned} transcript file(s) from the last {a.days} day(s)")
-    for f, kind, n in hits[:40]:
+    res = creds.scan_transcripts(a.days)
+    for line in res.coverage_lines():
+        out(line)
+    for f, kind, n in res.hits[:40]:
         out(f"  {n:4d} x {kind:<26} {f}")
-    if hits:
+    if res.hits:
         out(
             "\nSecrets in transcripts are plaintext on disk. Rotate each affected credential, then delete the file "
             "(or `claude purge`). Values are never printed here."
         )
     else:
-        out("no token-shaped secrets found")
-    return 1 if hits else 0
+        out(
+            "no token-shaped secrets found"
+            + ("" if res.complete else " in the part that was scanned")
+        )
+    return 1 if res.hits else 0
 
 
 def cmd_shim(a, cfg) -> int:
@@ -870,20 +864,14 @@ def cmd_job(a, cfg) -> int:
             except Exception:  # noqa: BLE001 - housekeeping must not fail the job
                 pass
             if cfg.flag("maintenance.usage_snapshot", True):
-                led = usage.collect(3)
-                d = paths.state_dir() / "usage"
-                d.mkdir(parents=True, exist_ok=True)
-                f = d / f"{time.strftime('%Y-%m')}.json"
-                cur = read_json(f, {}) or {}
-                for day, b in led.by_day.items():
-                    cur[day] = {
-                        "input": b.input,
-                        "output": b.output,
-                        "cache_write": b.cache_write,
-                        "cache_read": b.cache_read,
-                        "messages": b.messages,
-                    }
-                write_json(f, cur)
+                # 8 days back: the job runs weekly, and the first and the last day of a window are only partly in it, so
+                # the seven whole days before today are what gets stored
+                snap = usage.write_snapshot(usage.collect(8))
+                msg += (
+                    f"; usage snapshot: {len(snap.written)} day(s) stored"
+                    if not snap.skipped
+                    else f"; usage snapshot not written: {snap.skipped}"
+                )
             hr_learn = Headroom(cfg)
             if (
                 cfg.flag("headroom.enabled", True)
@@ -902,14 +890,20 @@ def cmd_job(a, cfg) -> int:
                     follow_symlinks=False,
                 )
                 msg += " | learn report written"
-            hits, scanned = creds.scan_transcripts(7)
-            if hits:
+            scan = creds.scan_transcripts(7)
+            if not scan.complete:  # a scan that did not cover the week says so in the job log
+                msg += " | transcript scan: " + "; ".join(
+                    ln.strip() for ln in scan.coverage_lines()
+                )
+            if scan.hits:
                 monitor.deliver(
                     cfg,
                     monitor.Alert(
                         "transcript-secrets",
                         "Secrets found in Claude transcripts",
-                        f"{len(hits)} finding(s) in {scanned} files; run `claude-hr-ctl creds scan`",
+                        f"{len(scan.hits)} finding(s) in {scan.scanned} of {scan.total} files"
+                        + ("" if scan.complete else " (the scan did not cover everything)")
+                        + "; run `claude-hr-ctl creds scan`",
                     ),
                 )
         else:
