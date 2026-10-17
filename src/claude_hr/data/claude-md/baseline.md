@@ -15,3 +15,4 @@
 
 ## Context
 - Read large files and logs with offsets or searches instead of whole. Do not spawn subagents for work that takes a few tool calls.
+- Before a workflow or a fan-out of more than ~10 agents, check the plan meter (`claude-hr-ctl status`). When the 7-day window is above 90% or extra usage is being spent, every token is cash: use fewer agents, Sonnet for mechanical stages, or defer it.
