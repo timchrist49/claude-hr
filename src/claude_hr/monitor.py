@@ -23,15 +23,20 @@ class Alert:
     body: str
 
 
-def _claude_dir_gb(max_age_s: float = 6 * 3600) -> float:
-    """~/.claude size, recomputed at most every 6h and never walked for more than 20s."""
+def _claude_dir_info(max_age_s: float = 6 * 3600) -> tuple[float, bool]:
+    """(GB, complete) of ~/.claude, recomputed at most every 6h and never walked for more than 20s. Incomplete means the walk
+    ran out of time (a folder with hundreds of thousands of files): the size is then a lower bound."""
     cache = paths.state_dir() / "claude-dir-size.json"
     c = read_json(cache, {}) or {}
     if time.time() - float(c.get("ts", 0)) < max_age_s and "gb" in c:
-        return float(c["gb"])
+        return float(c["gb"]), bool(c.get("complete", True))
     gb, complete = sysinfo.dir_size_info(paths.claude_home(), budget_s=20.0)
     write_json(cache, {"ts": time.time(), "gb": round(gb, 2), "complete": complete})
-    return round(gb, 2)
+    return round(gb, 2), bool(complete)
+
+
+def _claude_dir_gb(max_age_s: float = 6 * 3600) -> float:
+    return _claude_dir_info(max_age_s)[0]
 
 
 def snapshot(cfg: Config) -> dict:
@@ -40,6 +45,7 @@ def snapshot(cfg: Config) -> dict:
     # "enabled" for alerting purposes means: configured AND installed (a missing install is a doctor finding, not an outage)
     health = hr.health_patient() if cfg.flag("headroom.enabled", True) and hr.binary() else None
     proxy_rss = 0.0
+    claude_dir_gb, claude_dir_complete = _claude_dir_info()
     st = read_json(paths.state_dir() / "headroom-proxy.json", {}) or {}
     for pid in {int(st.get("pid") or 0)} | hr._listener_pids():
         if pid:
@@ -49,7 +55,8 @@ def snapshot(cfg: Config) -> dict:
         "ram_total_gb": round(total, 1),
         "ram_free_gb": round(avail, 1),
         "disk_free_gb": round(sysinfo.disk_free_gb(paths.home()), 1),
-        "claude_dir_gb": _claude_dir_gb(),
+        "claude_dir_gb": claude_dir_gb,
+        "claude_dir_complete": claude_dir_complete,
         "sessions": len(resources.live_sessions()),
         "session_limit": resources.session_limit(cfg),
         "proxy": {
@@ -81,11 +88,18 @@ def evaluate(cfg: Config, snap: dict) -> list[Alert]:
                 )
             )
     if snap["claude_dir_gb"] > float(m.get("claude_dir_warn_gb", 10)):
+        days = float(cfg.section("maintenance").get("jobs_retention_days", 14))
+        size = (
+            f"{snap['claude_dir_gb']} GB"
+            if snap.get("claude_dir_complete", True)
+            else f"at least {snap['claude_dir_gb']} GB (the size scan ran out of time, usually on ~/.claude/jobs)"
+        )
         alerts.append(
             Alert(
                 "claude-dir",
                 "~/.claude is large",
-                f"{snap['claude_dir_gb']} GB; run `claude-hr-ctl cleanup`",
+                f"{size}. `claude-hr-ctl cleanup` lists what can go; finished workflow scratch under ~/.claude/jobs is "
+                f"only removed after {days:.0f} days (maintenance.jobs_retention_days), so it may free little today",
             )
         )
     if snap["proxy"]["enabled"] and not snap["proxy"]["ok"]:
