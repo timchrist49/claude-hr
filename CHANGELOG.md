@@ -1,5 +1,50 @@
 # Changelog
 
+## 0.3.0
+`claude-hr update` now updates everything, and the token ledger sees the subagent work that is most of the volume.
+- **`claude-hr update` (and `claude-hr-ctl update`, and the daily job) updates the whole setup:** claude-hr itself, Claude Code,
+  Headroom, user-scope plugins and their marketplaces, then re-applies the settings baseline and CLAUDE.md block, restarts the
+  Headroom proxy only when no session runs and it was started with older settings, and prints one report (component, before ->
+  after, result; `Everything is up to date.` or what is pending/failed and why) with a health verdict. Until 0.2.3 `claude-hr update`
+  only ran Claude Code's own `claude update`; that is now `claude-hr update --claude-only`. Flags: `--check` (a preview of current ->
+  target per component, still runs `git fetch`; plugins cannot be previewed), `--only` (now also `baseline`, `proxy`; always the
+  fixed order), `--no-restart`, `--force`, `--allow-downgrade`. Exit codes: 0 ok, 1 a component failed or could not be checked,
+  2 usage error, 75 deferred because sessions run or another update is running (the scheduled job counts 75 as success). A
+  cross-process lock (`state/update.lock`) keeps two updates from running at once.
+- **The part that needs the new code runs after claude-hr itself was reinstalled:** the detached helper (Windows scheduled task
+  through `conhost --headless`, systemd unit, detached spawn) chains `python -I -m claude_hr.ctl update --post` in the state folder
+  after a reinstall that exited 0; the result is in `state/update-last.json` and `claude-hr-ctl status`. The session guard is asked
+  again right before the reinstall. Under systemd a stale proxy is stopped and the monitor job or the next launch starts it (a proxy
+  started inside the transient unit would die with it).
+- **Claude Code was frozen on this kind of machine:** `claude.channel` defaulted to `stable` while the user's own
+  `autoUpdatesChannel` said `latest`, and the built-in auto-updater is off, so nothing ever moved. `claude.channel` is now `auto`
+  (the user's `autoUpdatesChannel` when it is stable/latest, else stable); the report shows the channel in force and what it offers
+  instead of a bare "not downgrading"; `doctor` shows it and warns when an explicit setting disagrees.
+- **`doctor`/`update` say it when Claude Code runs outside claude-hr:** plain `claude` sessions are not routed through Headroom and
+  not counted by the session guard (an INFO line says how many, and whether they use the proxy through `ANTHROPIC_BASE_URL`, in
+  which case they also block a proxy restart or a Headroom upgrade).
+- **With the `claude` shim,** `claude update` typed in a terminal means update-everything; scripts, IDEs and CI still get Claude's own
+  updater. The POSIX shim script now passes `--hr-shim`: run `claude-hr-ctl shim install` again to refresh an old shim.
+- **`usage` counts subagent and workflow transcripts.** The ledger, `usage --tools`, `plugins audit` and `status` read only
+  `projects/*/*.jsonl` before; on the author's machine subagents are about 67% of the prompt volume and 78% of the output, and the
+  numbers were understated about three times. The report adds an estimated API list-price cost (`est.cost`, `n/a` for an unpriced model;
+  tiered/long-context/batch pricing ignored; an estimate, not a bill), a main-vs-subagent split and a note when subagents are more
+  than half. `--no-subagents` gives the old numbers. Messages are de-duplicated by (message id, request id) across files; scans are
+  capped (120 s, `status` 15 s) and say so when cut short; unreadable files are counted; on Windows long transcript paths are opened in
+  the extended-length form. The weekly snapshot stores seven whole days from complete scans only, labelled `main+subagents`.
+- **The credentials scan finds what it missed:** `doctor` said "MCP literal secrets: none" while `~/.claude.json` held plain-text
+  (temporary) AWS credentials in a project-scoped MCP server. It now scans project-scoped servers, settings files and project
+  `.mcp.json` files (regular files only, bounded, per-file error isolation), recognises passwords in connection strings and opaque
+  Authorization headers, ignores references and file paths, sanitises every printed name, and says what a cap left unscanned.
+  `creds scan` reads main sessions before subagent transcripts so the 400 MB budget covers the sessions that matter.
+- **Review:** an adversarial review (5 reviewers, a reproducer and a refuter per finding) confirmed 49 issues; all that mattered are
+  fixed, among them `--no-restart` being ignored by the Headroom upgrade, a stale proxy record that could make the updater stop a
+  proxy it did not start, an exception during the Headroom upgrade leaving the proxy down, `python -m claude_hr.ctl` importing from the
+  user's current folder, untrusted project files read without limits, and report text that said "up to date" next to a failure.
+- **Not done, on purpose:** Ponytail and Chisle stay off (Ponytail is vendored and opt-in; Chisle is not in the project: its terse,
+  "lazy first" rules conflict with ultracode and its output trimming can drop errors); the Serena pin changes only with a claude-hr
+  release; uv, git and Python are not updated by anything.
+
 ## 0.2.3
 - **Fixed: false "Headroom proxy down" alarms.** A proxy nobody has asked for a while answers its first request slowly (0.4-0.8 s
   measured on Windows, the first `/health` after 15 idle minutes), while the quick probe gives up after 0.6 s; the next request

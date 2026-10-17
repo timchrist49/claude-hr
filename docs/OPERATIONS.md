@@ -83,16 +83,33 @@ Desktop, `security-guidance` reviews that were skipped for lack of API credentia
 
 ## Updates
 ```
-claude-hr-ctl update --check                 # what is available, changes nothing
-claude-hr-ctl update                         # apply now (defers while sessions run; --force to override)
-claude-hr-ctl update --only headroom         # one component
+claude-hr update                             # update EVERYTHING now (same as claude-hr-ctl update; the daily job runs it too)
+claude-hr update --check                     # preview: current -> target per component, changes nothing (still runs git fetch)
+claude-hr update --only headroom plugins     # just these (self, claude, headroom, plugins, baseline, proxy; always in that order)
+claude-hr update --no-restart                # never restart the Headroom proxy (a Headroom upgrade is then deferred)
+claude-hr update --force                     # update even while claude-hr sessions run
+claude-hr update --claude-only [args]        # Claude Code's own `claude update`, untouched by claude-hr
 ```
+A full run does, in order: claude-hr itself (a newer release tag: checked out now, reinstalled in the background), Claude Code
+(staged, smoke-tested, rolled back on failure), Headroom (5-day cooldown, smoke test, rollback), user-scope plugins and their
+marketplaces (never `-y`, never `marketplace add`, never an install outside the profile), then the post steps: re-apply the settings
+baseline and CLAUDE.md block, restart the proxy only when no session runs and it was started with older settings, and a doctor
+verdict. When claude-hr itself updates, the post steps run in the background helper right after its reinstall (`update --post`,
+internal) and the result lands in `state/update-last.json` and `claude-hr-ctl status`; the helper's log is `logs/self-update.log`.
+The report ends with `Everything is up to date.` or the list of what is pending/failed and why. **Exit codes:** 0 ok or current,
+1 a component failed (also a failed check), 2 usage error, 75 deferred because claude-hr sessions or Claude background sessions
+run, or another update is running (nothing is broken: close them, or `--force`). The scheduled job counts 75 as success.
+With the `claude` shim installed (`claude-hr-ctl shim install`; run it again after upgrading to 0.3.0), `claude update` typed in a
+terminal means the same as `claude-hr update`; scripts, IDEs and CI that call `claude update` still get Claude Code's own updater.
+`update --check` cannot preview plugin updates (the update asks Claude Code for each plugin): it lists the installed versions.
+**Not updated by any command:** uv, git, Python, the Hugging Face model cache, other uv tools, the Serena pin (changes with a
+claude-hr release) and project-scope plugins.
 Daily job: 03:17 local (`updates.at`). Log: `~/.claude-hr/logs/update.jsonl`. Pin instead of tracking:
 `claude-hr-ctl config set claude.pin 2.1.292` / `headroom.version 0.40.0`. Release channel for Claude: `claude.channel`
-(`stable` ≈ a week behind `latest`; the updater never downgrades you off a newer build unless `--allow-downgrade`).
+(`auto` by default = your own `autoUpdatesChannel` from `~/.claude/settings.json`, else `stable`; `stable` ≈ a week behind `latest`; the updater never downgrades you off a newer build unless `--allow-downgrade`).
 claude-hr itself updates to the newest `vX.Y.Z` tag (`self.update_ref`); cut a release with `git tag vX.Y.Z && git push --tags`.
 
-**After a self-update:** the daily `update` job (and a full `claude-hr-ctl update`, not `--check` or `--only`) re-applies the managed settings baseline and the CLAUDE.md block once per release, and nothing else: it never installs plugins, never adds marketplaces and never passes `-y` (a plugin a release adds, such as `hr-gates` after an upgrade from 0.1.x, is reported by `claude-hr-ctl doctor` with the fix `claude-hr-ctl plugins sync`). It re-applies only a step that `setup` recorded in `state/applied-version.json` (`{settings, claude-md, plugins, config_dir, ts}`: a step you skipped with `--skip` or `--only` stays skipped), and only when the job resolves the same Claude config directory that setup applied it to, because a scheduled job does not inherit the `CLAUDE_CONFIG_DIR` of your shell; otherwise it logs one `deferred` `baseline` row a day in `logs/update.jsonl` / `job-update.log`, and `doctor` says to run `claude-hr-ctl setup`. A machine set up before 0.2.0 has no per-step record yet, so run `claude-hr-ctl setup` once. `uninstall` removes `state/install.json` and the applied-version record.
+**After a self-update:** the post steps (see above; the daily `update` job and a full `claude-hr update`, not `--check` or `--only`) re-apply the managed settings baseline and the CLAUDE.md block once per release, and nothing else: it never installs plugins, never adds marketplaces and never passes `-y` (a plugin a release adds, such as `hr-gates` after an upgrade from 0.1.x, is reported by `claude-hr-ctl doctor` with the fix `claude-hr-ctl plugins sync`). It re-applies only a step that `setup` recorded in `state/applied-version.json` (`{settings, claude-md, plugins, config_dir, ts}`: a step you skipped with `--skip` or `--only` stays skipped), and only when the job resolves the same Claude config directory that setup applied it to, because a scheduled job does not inherit the `CLAUDE_CONFIG_DIR` of your shell; otherwise it logs one `deferred` `baseline` row a day in `logs/update.jsonl` / `job-update.log`, and `doctor` says to run `claude-hr-ctl setup`. A machine set up before 0.2.0 has no per-step record yet, so run `claude-hr-ctl setup` once. `uninstall` removes `state/install.json` and the applied-version record.
 
 **Rollback by hand:** `claude install <version> --force`; `uv tool install --python 3.13 "headroom-ai[all]==<ver>"`;
 `git -C ~/.claude-hr/repo checkout <tag> && uv tool install --force --reinstall ~/.claude-hr/repo`.
