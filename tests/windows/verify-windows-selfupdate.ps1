@@ -120,7 +120,14 @@ $u2 = Run "claude-hr-ctl update --only self plugins"
 $u2.TrimEnd()
 Check "update reported self updated again" ($u2 -match 'self\s+updated') $u2
 Verify-Update 'round 2' '9.0.3'
-Check "the one-shot helper task removed itself and its script" ((-not (Get-ScheduledTask -TaskPath '\claude-hr\' -TaskName 'selfupdate' -ErrorAction SilentlyContinue)) -and (-not (Test-Path "$sb\h\.claude-hr\state\self-update.ps1")))
+# the helper's last two lines (delete its script, unregister its task) run just after the reinstall that Verify-Update waited for
+$cleaned = $false
+foreach ($i in 1..15) {
+  $cleaned = (-not (Get-ScheduledTask -TaskPath '\claude-hr\' -TaskName 'selfupdate' -ErrorAction SilentlyContinue)) -and (-not (Test-Path "$sb\h\.claude-hr\state\self-update.ps1"))
+  if ($cleaned) { break }
+  Start-Sleep -Seconds 2
+}
+Check "the one-shot helper task removed itself and its script" $cleaned ((Get-Content "$sb\h\.claude-hr\logs\self-update.log" -Tail 6 -ErrorAction SilentlyContinue) -join ' | ')
 Check "nothing left to update" ((Run "claude-hr-ctl update --check --only self") -notmatch 'available')
 
 "== 5. uninstall + real profile untouched =="
