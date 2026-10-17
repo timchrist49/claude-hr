@@ -101,10 +101,16 @@ function Verify-Update($label, $v) {
 }
 
 "== 3. update --only self plugins (the daily job's order) =="
+# the helper is a task started by Task Scheduler: it must not open a console window (it used to open a Windows Terminal one)
+$watchOut = Join-Path $sb 'windows-seen.json'
+$watcher = Start-Process -FilePath python -ArgumentList "`"$repo\tests\windows\window_watch.py`"", 100, "`"$watchOut`"" -WindowStyle Hidden -PassThru
 $u1 = Run "claude-hr-ctl update --only self plugins"
 $u1.TrimEnd()
 Check "update reported self updated" ($u1 -match 'self\s+updated') $u1
 Verify-Update 'round 1' '9.0.2'
+$watcher | Wait-Process -Timeout 130 -ErrorAction SilentlyContinue
+$seen = $null; try { $seen = Get-Content $watchOut -Raw | ConvertFrom-Json } catch {}
+Check "the helper task opened no console window (a Windows Terminal one used to stay open for the whole reinstall)" ($seen -and (@($seen.opened_and_closed).Count -eq 0)) (($seen | ConvertTo-Json -Compress))
 
 "== 4. a second release, same sequence =="
 Set-Release $src '9.0.3'

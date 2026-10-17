@@ -130,7 +130,10 @@ def deliver(cfg: Config, alert: Alert) -> None:
         # Split into argv (no shell): the alert text reaches the command only via CLAUDE_HR_ALERT_* env vars.
         try:
             argv = shlex.split(str(m["alert_command"]), posix=not paths.IS_WINDOWS)
-            subprocess.run(argv, env=env, timeout=30, check=False)
+            extra = {"creationflags": procutil.CREATE_NO_WINDOW} if paths.IS_WINDOWS else {}
+            subprocess.run(
+                argv, env=env, timeout=30, check=False, stdin=subprocess.DEVNULL, **extra
+            )
         except (OSError, ValueError, subprocess.SubprocessError):
             pass
     if m.get("alert_ntfy_url"):

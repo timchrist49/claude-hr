@@ -146,15 +146,49 @@ def _windows_reinstall_script(cmd: list[str], pid: int, ppid: int, log, env=None
     return "\n".join(lines) + "\n"
 
 
+_HEADLESS_OK: dict[str, bool] = {}
+
+
+def _conhost_headless() -> str | None:
+    """Absolute path of conhost.exe when it understands --headless (Windows 10 1809+ / 11), else None.
+
+    A scheduled task whose action is a console program (powershell.exe) gets no console from Task Scheduler, so Windows
+    Terminal (the default host on Windows 11) opens a window for it and keeps it, minimised, for the whole run; -WindowStyle
+    Hidden does not stop that, and closing it kills the helper in the middle of the reinstall. `conhost.exe --headless <program>`
+    gives the program a console without a window. One cheap run of a no-op tells whether this machine supports it."""
+    root = os.environ.get("SystemRoot") or os.environ.get("windir") or r"C:\Windows"
+    conhost = os.path.join(root, "System32", "conhost.exe")
+    if not os.path.isfile(conhost):
+        return None
+    if conhost not in _HEADLESS_OK:
+        cmd_exe = os.path.join(root, "System32", "cmd.exe")
+        r = procutil.run([conhost, "--headless", cmd_exe, "/c", "exit 0"], timeout=10)
+        _HEADLESS_OK[conhost] = r.returncode == 0
+    return conhost if _HEADLESS_OK[conhost] else None
+
+
+def _helper_task_action(args: str) -> tuple[str, str]:
+    """(Execute, Argument) of the helper task: through conhost --headless when the machine supports it, else the shell itself."""
+    conhost = _conhost_headless()
+    if conhost is None:
+        return "powershell.exe", args
+    root = os.environ.get("SystemRoot") or os.environ.get("windir") or r"C:\Windows"
+    ps_exe = os.path.join(root, "System32", "WindowsPowerShell", "v1.0", "powershell.exe")
+    if not os.path.isfile(ps_exe):
+        return "powershell.exe", args
+    return conhost, f'--headless "{ps_exe}" {args}'
+
+
 def _start_helper_task(shell: str, script_path) -> bool:
     """Run the helper script from Windows Task Scheduler instead of as our child. uv's claude-hr-ctl.exe trampoline puts the
     updater in a Job Object that is killed when the trampoline exits (and refuses breakaway), so any child we spawn dies
     with us before it can reinstall. A task started by the scheduler lives outside that job. Registering and starting it is
     synchronous and finishes before we exit. Returns True if the task was started."""
     args = f'-NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -File "{script_path}"'
+    execute, argument = _helper_task_action(args)
     ps = (
         "$ErrorActionPreference = 'Stop'; "
-        f"$a = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument {_ps_quote(args)}; "
+        f"$a = New-ScheduledTaskAction -Execute {_ps_quote(execute)} -Argument {_ps_quote(argument)}; "
         "$s = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -MultipleInstances IgnoreNew "
         "-ExecutionTimeLimit (New-TimeSpan -Minutes 30); "
         f"Register-ScheduledTask -TaskName {_ps_quote(HELPER_TASK_NAME)} -TaskPath {_ps_quote(HELPER_TASK_FOLDER)} -Force "
