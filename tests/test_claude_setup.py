@@ -77,7 +77,7 @@ def test_settings_apply_is_idempotent_and_reversible(setup, sandbox):
     assert doc["model"] == "opusplan"  # never touched
     assert (
         doc["autoUpdatesChannel"] == "latest"
-    )  # user's explicit choice wins over the baseline's "stable"
+    )  # the user's own choice: the baseline follows it (claude.channel = "auto") and never replaces it
     assert doc["env"]["MINE"] == "1"
     assert doc["env"]["DISABLE_AUTOUPDATER"] == "1"
     assert "ANTHROPIC_BASE_URL" not in doc["env"]  # routing is per launch, never global
@@ -583,3 +583,128 @@ def test_plugin_listing_tolerates_wrapped_or_odd_output(setup):
     assert setup._installed_plugins() == [{"id": "a@b", "scope": "user"}]
     setup.fake.installed = "text"
     assert setup._installed_plugins() == []
+
+
+# ---- the Claude Code release channel: one answer for the updater and for the baseline -----------------------------------
+UNSET = object()
+
+
+@pytest.mark.parametrize(
+    "configured,user,effective,source",
+    [
+        (None, UNSET, "stable", "default"),  # auto, nothing set: stable
+        (None, "latest", "latest", "settings"),  # auto follows the user's own autoUpdatesChannel
+        (None, " Latest ", "latest", "settings"),  # ... however they spelled it
+        (None, "stable", "stable", "settings"),
+        (None, "beta", "stable", "default"),  # not a channel claude-hr knows
+        (None, 5, "stable", "default"),
+        (None, None, "stable", "default"),
+        (None, "", "stable", "default"),
+        ("stable", "latest", "stable", "config"),  # an explicit channel is used as written
+        ("latest", UNSET, "latest", "config"),
+        ("LATEST", "stable", "latest", "config"),
+        ("beta", "latest", "latest", "settings"),  # anything else is "auto"
+        ("beta", UNSET, "stable", "default"),
+    ],
+)
+def test_resolve_channel_table(sandbox, monkeypatch, configured, user, effective, source):
+    if configured is not None:
+        monkeypatch.setenv("CLAUDE_HR_CLAUDE__CHANNEL", configured)
+    if user is not UNSET:
+        paths.claude_settings().write_text(
+            json.dumps({"autoUpdatesChannel": user}), encoding="utf-8"
+        )
+    info = claude_setup.resolve_channel(config.load())
+    assert (info.effective, info.source) == (effective, source)
+    assert info.explicit == (source == "config")
+    assert info.raw == (configured or "auto")
+
+
+def test_resolve_channel_survives_a_settings_file_it_cannot_read(sandbox, monkeypatch):
+    paths.claude_settings().write_text("{ not json", encoding="utf-8")
+    assert claude_setup.resolve_channel(config.load()).effective == "stable"
+    monkeypatch.setenv("CLAUDE_HR_CLAUDE__CHANNEL", "latest")
+    assert claude_setup.resolve_channel(config.load()).effective == "latest"
+    paths.claude_settings().write_text("[1, 2]", encoding="utf-8")  # valid JSON, not an object
+    assert claude_setup.resolve_channel(config.load()).user is None
+
+
+def test_the_channel_is_described_with_where_it_came_from(sandbox, monkeypatch):
+    paths.claude_settings().write_text('{"autoUpdatesChannel": "latest"}', encoding="utf-8")
+    assert claude_setup.resolve_channel(config.load()).describe() == (
+        'latest (claude.channel = "auto": the autoUpdatesChannel in your settings.json)'
+    )
+    paths.claude_settings().unlink()
+    assert claude_setup.resolve_channel(config.load()).describe() == (
+        'stable (claude.channel = "auto": no autoUpdatesChannel of yours is set, so the default)'
+    )
+    monkeypatch.setenv("CLAUDE_HR_CLAUDE__CHANNEL", "latest")
+    assert (
+        claude_setup.resolve_channel(config.load()).describe()
+        == 'latest (claude.channel = "latest")'
+    )
+
+
+def _baseline_report(monkeypatch, configured=None, user=UNSET):
+    if configured is not None:
+        monkeypatch.setenv("CLAUDE_HR_CLAUDE__CHANNEL", configured)
+    if user is not UNSET:
+        paths.claude_settings().write_text(
+            json.dumps({"autoUpdatesChannel": user}), encoding="utf-8"
+        )
+    cfg = config.load()
+    s = claude_setup.ClaudeSetup(cfg, Headroom(cfg), Path("/fake/claude"))
+    return s, s.plan_settings()
+
+
+def test_the_baseline_writes_the_channel_in_force_when_the_user_set_none(sandbox, monkeypatch):
+    s, (current, doc, state, rep) = _baseline_report(monkeypatch)
+    assert doc["autoUpdatesChannel"] == "stable" and "autoUpdatesChannel" in rep.set
+    s, (current, doc, state, rep) = _baseline_report(monkeypatch, configured="latest")
+    assert doc["autoUpdatesChannel"] == "latest"
+    # what the baseline wrote is its own: a later change of claude.channel moves it
+    s.apply_settings()
+    monkeypatch.setenv("CLAUDE_HR_CLAUDE__CHANNEL", "stable")
+    cfg = config.load()
+    s = claude_setup.ClaudeSetup(cfg, Headroom(cfg), Path("/fake/claude"))
+    s.apply_settings()
+    assert json.loads(paths.claude_settings().read_text("utf-8"))["autoUpdatesChannel"] == "stable"
+
+
+def test_the_baseline_follows_a_users_own_channel_and_never_overwrites_it(sandbox, monkeypatch):
+    s, (current, doc, state, rep) = _baseline_report(monkeypatch, user="latest")
+    assert doc["autoUpdatesChannel"] == "latest"
+    assert "autoUpdatesChannel" not in rep.set and "autoUpdatesChannel" not in rep.kept
+    # a value that is not a channel is theirs too: kept, not replaced
+    s, (current, doc, state, rep) = _baseline_report(monkeypatch, user="beta")
+    assert doc["autoUpdatesChannel"] == "beta" and "autoUpdatesChannel" in rep.kept
+    # an explicit claude.channel that disagrees with the user's value does not overwrite it either
+    monkeypatch.setenv("CLAUDE_HR_CLAUDE__CHANNEL", "stable")
+    paths.claude_settings().write_text('{"autoUpdatesChannel": "latest"}', encoding="utf-8")
+    s, (current, doc, state, rep) = _baseline_report(monkeypatch)
+    assert doc["autoUpdatesChannel"] == "latest" and "autoUpdatesChannel" in rep.kept
+
+
+def test_the_baseline_leaves_the_channel_alone_when_claude_hr_does_not_manage_updates(
+    sandbox, monkeypatch
+):
+    monkeypatch.setenv("CLAUDE_HR_CLAUDE__MANAGE_UPDATES", "false")
+    s, (current, doc, state, rep) = _baseline_report(monkeypatch)
+    assert "autoUpdatesChannel" not in doc
+
+
+@pytest.mark.parametrize(
+    "offered,installed,newer",
+    [
+        ("1.1.0", "1.0.0", True),
+        ("1.0.0", "1.0.0", False),
+        ("1.0.0", "1.0.1", False),
+        ("6.4.2", "6.4.2-8ca22dba9a94", False),  # a build suffix is not a newer version
+        ("6.4.3", "6.4.2-8ca22dba9a94", True),
+        ("ea10b213686c", "ea10b213686c", False),  # a commit hash: equal is current
+        ("ea10b213686d", "ea10b213686c", True),
+        ("1.2.0", "ea10b213686c", True),
+    ],
+)
+def test_a_catalog_version_counts_as_newer_only_when_it_is(offered, installed, newer):
+    assert claude_setup._newer_version(offered, installed) is newer

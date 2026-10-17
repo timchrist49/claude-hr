@@ -725,3 +725,182 @@ def test_a_session_without_a_terminal_imports_neither_verify_nor_audit(tmp_path)
     # stdin is /dev/null here: the cheap checks stop it before any heavy module is touched
     loaded = _run_launcher_in_a_fresh_process(tmp_path, ["hello"])
     assert not {"claude_hr.verify", "claude_hr.audit"} & loaded
+
+
+# ---- `claude-hr update` updates everything; `--claude-only` is Claude Code's own updater ------------------------------
+@pytest.fixture
+def launch_recorder(monkeypatch, tmp_path):
+    """A fake Claude Code and a recorder for every program the launcher starts (exec on POSIX, subprocess.call on
+    Windows). Nothing real runs."""
+    import subprocess
+    from types import SimpleNamespace
+
+    world = SimpleNamespace(claude=_fake_claude(monkeypatch, tmp_path), started=[], updates=[])
+
+    def fake_call(argv, *a, **k):
+        world.started.append(list(argv))
+        return 7
+
+    def fake_execv(path, argv):
+        world.started.append(list(argv))
+        raise SystemExit(7)
+
+    monkeypatch.setattr(subprocess, "call", fake_call)
+    monkeypatch.setattr(launcher.os, "execv", fake_execv)
+    monkeypatch.setenv(
+        "CLAUDE_HR_NEST", "0"
+    )  # main() writes it for a nested launch: let monkeypatch undo that
+    monkeypatch.setenv("CLAUDE_HR_HEADROOM__ENABLED", "false")
+    return world
+
+
+@pytest.fixture
+def update_world(launch_recorder, monkeypatch):
+    """launch_recorder, and the update command of ctl replaced by a recorder (it answers 5)."""
+    from claude_hr import ctl
+
+    def fake_update_main(rest, prog="claude-hr-ctl update"):
+        launch_recorder.updates.append((list(rest), prog))
+        return 5
+
+    monkeypatch.setattr(ctl, "update_main", fake_update_main)
+    return launch_recorder
+
+
+def _main(argv):
+    try:
+        return launcher.main(argv)
+    except SystemExit as exc:
+        return exc.code
+
+
+@pytest.mark.parametrize(
+    "argv,rest",
+    [
+        (["update"], []),
+        (["upgrade"], []),
+        (["update", "--check"], ["--check"]),
+        (
+            ["update", "--only", "self", "plugins", "--force"],
+            ["--only", "self", "plugins", "--force"],
+        ),
+        (["--hr-verbose", "update", "--no-restart"], ["--no-restart"]),
+    ],
+)
+def test_update_reaches_the_update_command_and_starts_no_claude(update_world, argv, rest):
+    assert _main(argv) == 5
+    assert update_world.updates == [(rest, "claude-hr update")]
+    assert update_world.started == []
+
+
+def test_update_claude_only_is_claude_codes_own_update(update_world, monkeypatch):
+    assert _main(["update", "--claude-only", "x"]) == 7
+    assert update_world.started == [[str(update_world.claude), "update", "x"]]
+    update_world.started.clear()
+    assert _main(["upgrade", "--claude-only"]) == 7
+    assert update_world.started == [[str(update_world.claude), "upgrade"]]
+    assert update_world.updates == []  # claude-hr's own update never ran
+
+
+def test_update_claude_only_has_a_dry_run_plan_like_any_passthrough(update_world, capsys):
+    assert launcher.main(["--hr-dry-run", "update", "--claude-only"]) == 0
+    err = capsys.readouterr().err
+    command = next(ln.split("command: ", 1)[1] for ln in err.splitlines() if "command: " in ln)
+    assert "kind=passthrough" in err and command == f"{update_world.claude} update"
+    assert update_world.started == [] and update_world.updates == []
+
+
+def test_update_help_is_claude_hrs_own_help_not_claudes(launch_recorder, capsys):
+    for flag in ("--help", "-h"):
+        assert launcher.main(["update", flag]) == 0
+        out = capsys.readouterr().out
+        for word in (
+            "claude-hr update",
+            "--claude-only",
+            "--check",
+            "--only",
+            "--force",
+            "--no-restart",
+        ):
+            assert word in out, (flag, word)
+        assert "Claude Code" in out and "Exit codes" in out and "75" in out
+        assert (
+            "Check for updates and install if available" not in out
+        )  # what `claude update --help` says
+    assert launch_recorder.started == []  # Claude Code's own help was never asked for
+
+
+def test_a_session_spawned_by_claude_keeps_the_old_pass_through(update_world, monkeypatch):
+    """Hooks, plugin commands and agents run with CLAUDE_HR_SESSION=1: nothing Claude spawns may start an update of the setup."""
+    monkeypatch.setenv("CLAUDE_HR_SESSION", "1")
+    assert _main(["update"]) == 7
+    assert update_world.started == [[str(update_world.claude), "update"]]
+    assert update_world.updates == []
+
+
+def test_update_with_a_dry_run_prints_the_plan_and_runs_nothing(update_world, capsys):
+    assert launcher.main(["--hr-dry-run", "update", "--check"]) == 0
+    err = capsys.readouterr().err
+    assert "plan: kind=update" in err and "command: claude-hr-ctl update --check" in err
+    assert update_world.started == [] and update_world.updates == []
+
+
+def test_only_a_first_argument_update_is_the_update_command(update_world, capsys):
+    """`claude-hr -p update` asks Claude to do something called update: it is a prompt, not the subcommand."""
+    assert launcher.main(["--hr-dry-run", "-p", "update"]) == 0
+    assert "plan: kind=update" not in capsys.readouterr().err
+    assert update_world.updates == []
+
+
+def test_a_failure_of_the_update_command_says_what_is_left(update_world, monkeypatch, capsys):
+    from claude_hr import ctl
+
+    def boom(rest, prog=""):
+        raise RuntimeError("the update exploded")
+
+    monkeypatch.setattr(ctl, "update_main", boom)
+    assert launcher.main(["update"]) == 1
+    err = capsys.readouterr().err
+    assert "claude-hr update failed (RuntimeError: the update exploded)" in err
+    assert "claude-hr update --claude-only" in err
+    monkeypatch.setattr(
+        ctl, "update_main", lambda rest, prog="": (_ for _ in ()).throw(KeyboardInterrupt)
+    )
+    assert launcher.main(["update"]) == 130
+
+
+def test_version_does_not_import_the_update_machinery(tmp_path):
+    """`claude-hr --version` (and every plain launch) must not pay the ~170 ms of importing ctl and the updater."""
+    import os
+    import subprocess
+    import sys
+
+    code = (
+        "import sys, subprocess\n"
+        "from pathlib import Path\n"
+        "from claude_hr import launcher, procutil\n"
+        "real = Path(sys.executable)\n"
+        "procutil.find_claude = lambda *a, **k: real\n"
+        "def no_exec(*a, **k):\n"
+        "    raise SystemExit(0)\n"
+        "launcher.os.execv = no_exec\n"
+        "subprocess.call = lambda *a, **k: 0\n"
+        "try:\n"
+        "    launcher.main(['--version'])\n"
+        "except SystemExit:\n"
+        "    pass\n"
+        "loaded = sorted(m for m in sys.modules if m in ('claude_hr.ctl', 'claude_hr.updater'))\n"
+        "print('LOADED', *loaded)\n"
+    )
+    env = {**os.environ, "PYTHONPATH": str(Path(__file__).resolve().parents[1] / "src")}
+    env.pop("CLAUDE_HR_SESSION", None)
+    r = subprocess.run(
+        [sys.executable, "-c", code],
+        env=env,
+        cwd=str(tmp_path),
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    assert r.stdout.strip() == "LOADED", r.stdout + r.stderr

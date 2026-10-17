@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import subprocess
 import sys
 import time
 import tomllib
@@ -64,6 +65,8 @@ def _print_step(step: Step) -> None:
     out(f"[{mark}] {step.name}{' (changed)' if step.changed else ''}")
     for ln in step.lines:
         out(f"       {ln}")
+    for ln in step.needs:
+        out(f"       needs you: {ln}")
 
 
 # ---------------------------------------------------------------------------------------------
@@ -288,6 +291,9 @@ def cmd_status(a, cfg) -> int:
     out(
         f"  Sessions   : {snap['sessions']} running / limit {snap['session_limit']}   RAM free {snap['ram_free_gb']} of {snap['ram_total_gb']} GB   disk free {snap['disk_free_gb']} GB"
     )
+    last_update = updater.last_update_summary()
+    if last_update:
+        out(f"  Last update: {last_update}")
     led = usage.collect(1)
     t = led.total
     out(
@@ -556,12 +562,102 @@ def cmd_usage(a, cfg) -> int:
     return 0
 
 
+def _claude_only_update(cfg) -> int:
+    """`update --claude-only`: Claude Code's own `claude update`, with nothing of claude-hr's staging around it."""
+    claude = procutil.find_claude(str(cfg.get("claude.binary", "") or ""))
+    if not claude:
+        out("claude not found")
+        return 127
+    return subprocess.call([str(claude), "update"])
+
+
 def cmd_update(a, cfg) -> int:
-    u = updater.Updater(cfg, dry=a.check, force=a.force, allow_downgrade=a.allow_downgrade)
-    rep = u.run(a.only or None)
-    for r in rep.results:
-        out(r.line())
-    return 0 if rep.ok else 1
+    """Update everything (see updater.py), print the one report, and exit with 0 ok | 1 failed | 75 deferred (sessions run)."""
+    if a.claude_only:
+        return _claude_only_update(cfg)
+    if a.post and (a.check or a.only):
+        out("--post (the second half of a self-update) takes no --check or --only")
+        return updater.EXIT_REFUSED
+    u = updater.Updater(
+        cfg,
+        dry=a.check,
+        force=a.force,
+        allow_downgrade=a.allow_downgrade,
+        restart=not a.no_restart,
+    )
+    rep = u.run_post() if a.post else u.run(a.only or None)
+    for line in updater.format_report(rep):
+        out(line)
+    return rep.exit_code()
+
+
+UPDATE_DESCRIPTION = """Update everything in this setup, in one go, and say what happened in one table:
+  claude-hr itself (when a newer release exists), Claude Code (staged: smoke-tested, rolled back on failure),
+  Headroom, plugins and their marketplaces (user scope; never answers a prompt for you, adds no marketplace and
+  installs no plugin: that is `claude-hr-ctl plugins sync`), then it re-applies the managed settings and CLAUDE.md
+  block, restarts the Headroom proxy only when no session runs and it has stale settings, and ends with a health
+  verdict. Nothing that a running claude-hr session uses is replaced while one runs: it waits (exit 75).
+
+Exit codes: 0 ok or already current | 1 a component failed or was rolled back | 2 usage error |
+            75 deferred because claude-hr sessions are running (nothing is broken: close them, or use --force).
+`claude-hr update --claude-only` runs Claude Code's own `claude update` instead, with none of the above."""
+
+
+def _add_update_args(s: argparse.ArgumentParser) -> None:
+    s.add_argument(
+        "--check",
+        action="store_true",
+        help="preview only: what would change and why; writes nothing",
+    )
+    s.add_argument(
+        "--only",
+        nargs="+",
+        choices=list(updater.COMPONENTS),
+        metavar="STEP",
+        help="just these (any of: " + ", ".join(updater.COMPONENTS) + ")",
+    )
+    s.add_argument(
+        "--force", action="store_true", help="update even while claude-hr sessions are running"
+    )
+    s.add_argument(
+        "--allow-downgrade", action="store_true", help="also move to an older release when told to"
+    )
+    s.add_argument("--no-restart", action="store_true", help="never restart the Headroom proxy")
+    s.add_argument(
+        "--claude-only",
+        action="store_true",
+        help="only Claude Code's own `claude update` (no staging, no claude-hr)",
+    )
+    # the second half of a self-update: the helper starts it after the reinstall (see updater.py)
+    s.add_argument("--post", action="store_true", help=argparse.SUPPRESS)
+    s.set_defaults(fn=cmd_update)
+
+
+def update_main(argv: list[str], prog: str = "claude-hr-ctl update") -> int:
+    """`claude-hr update` (through the launcher) and `claude-hr-ctl update`: one parser, one implementation. Returns the
+    exit code (a usage error is 2, --help is 0) instead of exiting, so the launcher can hand it on."""
+    _utf8_stdio()
+    parser = argparse.ArgumentParser(
+        prog=prog,
+        description=UPDATE_DESCRIPTION,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    _add_update_args(parser)
+    try:
+        args = parser.parse_args(argv)
+    except SystemExit as exc:
+        return exc.code if isinstance(exc.code, int) else (0 if exc.code is None else 2)
+    try:
+        cfg = config_mod.load()
+    except ValueError as exc:
+        out(f"config error: {exc}")
+        return 2
+    try:
+        paths.tighten_existing()
+        return int(args.fn(args, cfg) or 0)
+    except Exception:
+        _log_crash(["update", *argv])
+        raise
 
 
 def cmd_schedule(a, cfg) -> int:
@@ -743,9 +839,14 @@ def cmd_job(a, cfg) -> int:
             msg = f"alerts={res['alerts']} note={res['note']}"
         elif a.name == "update":
             if cfg.flag("updates.enabled", True):
-                rep = updater.Updater(cfg, dry=not cfg.flag("updates.auto_apply", True)).run()
+                # auto_apply = false is a report-only job: it still records what it found
+                rep = updater.Updater(
+                    cfg, dry=not cfg.flag("updates.auto_apply", True), record=True
+                ).run()
                 msg = " | ".join(r.line() for r in rep.results)
-                rc = 0 if rep.ok else 1
+                # exit 75 (sessions are running, so something waits) is how the command says "nothing is broken": the
+                # scheduler must not call that a failure of the job
+                rc = 0 if rep.exit_code() in (updater.EXIT_OK, updater.EXIT_DEFERRED) else 1
         elif a.name == "maintain":
             p = maintenance.plan(cfg)
             n, freed = maintenance.apply(p)
@@ -1331,12 +1432,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     s.set_defaults(fn=cmd_usage)
 
-    s = sub.add_parser("update", help="staged upgrades with smoke tests and rollback")
-    s.add_argument("--check", action="store_true", help="report only")
-    s.add_argument("--only", nargs="+", choices=["claude", "headroom", "plugins", "self"])
-    s.add_argument("--force", action="store_true", help="upgrade even while sessions are running")
-    s.add_argument("--allow-downgrade", action="store_true")
-    s.set_defaults(fn=cmd_update)
+    s = sub.add_parser(
+        "update",
+        help="update everything: claude-hr, Claude Code, Headroom, plugins, baseline, proxy",
+        description=UPDATE_DESCRIPTION,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    _add_update_args(s)
 
     s = sub.add_parser("schedule")
     s.add_argument("action", choices=["install", "remove", "status"])

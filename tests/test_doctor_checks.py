@@ -24,6 +24,10 @@ def fake_claude(monkeypatch):
             else real_run(cmd, **k)
         ),
     )
+    # ... and no Claude Code session of the developer's own may turn up in what doctor says about running processes
+    from claude_hr import sysinfo
+
+    monkeypatch.setattr(sysinfo, "process_table", lambda: {})
 
 
 def checks(cwd: Path | None = None):
@@ -573,3 +577,111 @@ def test_the_settings_comparison_never_breaks_doctor(healthy_proxy, monkeypatch)
     monkeypatch.setattr(Headroom, "settings_state", boom)
     got = checks()
     assert got["headroom proxy"].status == "ok" and "headroom settings" not in got
+
+
+# ---- doctor: the update channel, and Claude Code processes claude-hr did not start ---------------------------------------
+def write_channel_settings(value):
+    paths.claude_settings().write_text(json.dumps({"autoUpdatesChannel": value}), encoding="utf-8")
+
+
+def test_doctor_names_the_claude_update_channel_in_force(sandbox, fake_claude):
+    got = checks()
+    assert got["claude update channel"].status == "info"
+    assert got["claude update channel"].detail == (
+        "stable (claude.channel=auto, settings.json autoUpdatesChannel=unset)"
+    )
+    write_channel_settings("latest")
+    got = checks()
+    assert got["claude update channel"].detail == (
+        "latest (claude.channel=auto, settings.json autoUpdatesChannel=latest)"
+    )
+    assert "claude channel conflict" not in got
+
+
+def test_doctor_warns_when_an_explicit_channel_disagrees_with_the_users_own(
+    sandbox, fake_claude, monkeypatch
+):
+    monkeypatch.setenv("CLAUDE_HR_CLAUDE__CHANNEL", "stable")
+    write_channel_settings("latest")
+    got = checks()
+    assert got["claude update channel"].detail == (
+        "stable (claude.channel=stable, settings.json autoUpdatesChannel=latest)"
+    )
+    warn = got["claude channel conflict"]
+    assert warn.status == "warn"
+    assert (
+        'claude.channel is "stable" but autoUpdatesChannel in settings.json is "latest"'
+        in warn.detail
+    )
+    assert "claude.channel auto" in warn.fix
+    # the same explicit channel on both sides, or no setting of the user's: nothing to warn about
+    write_channel_settings("stable")
+    assert "claude channel conflict" not in checks()
+    paths.claude_settings().unlink()
+    assert "claude channel conflict" not in checks()
+
+
+def test_the_auto_channel_never_conflicts_even_with_a_value_it_does_not_know(sandbox, fake_claude):
+    write_channel_settings("beta")
+    got = checks()
+    assert got["claude update channel"].detail == (
+        "stable (claude.channel=auto, settings.json autoUpdatesChannel=beta)"
+    )
+    assert "claude channel conflict" not in got
+
+
+def test_doctor_says_nothing_about_a_channel_claude_hr_does_not_manage(
+    sandbox, fake_claude, monkeypatch
+):
+    monkeypatch.setenv("CLAUDE_HR_CLAUDE__MANAGE_UPDATES", "false")
+    write_channel_settings("latest")
+    got = checks()
+    assert "claude update channel" not in got and "claude channel conflict" not in got
+
+
+def test_doctor_survives_a_settings_file_it_cannot_parse_with_the_channel_line_in_place(
+    sandbox, fake_claude
+):
+    paths.claude_settings().write_text("{ not json", encoding="utf-8")
+    got = checks()
+    assert got["settings.json"].status == "fail"
+    assert got["claude update channel"].detail.endswith("autoUpdatesChannel=unset)")
+
+
+def test_doctor_notes_claude_code_processes_that_claude_hr_did_not_start(
+    sandbox, fake_claude, monkeypatch
+):
+    from claude_hr import resources, sysinfo
+
+    table = {4100: (1, "claude.exe"), 4200: (1, "claude"), 4300: (1, "node.exe")}
+    monkeypatch.setattr(sysinfo, "process_table", lambda: table)
+    got = checks()
+    c = got["claude outside claude-hr"]
+    assert c.status == "info"
+    lines = c.detail.splitlines()
+    assert lines[0] == (
+        "2 Claude Code process(es) not started by claude-hr are running; their traffic does not go through Headroom "
+        "(no compression, no session limits, not seen by the update guard)"
+    )
+    assert "type `claude-hr` instead of `claude`" in lines[1]
+    assert "claude-hr-ctl shim install" in lines[2]
+    # one that claude-hr started (it is in the session registry) is not one of them
+    monkeypatch.setattr(resources, "live_sessions", lambda: [{"pid": 4100}])
+    assert checks()["claude outside claude-hr"].detail.startswith("1 Claude Code process(es)")
+    # nothing running, or Headroom switched off (there is no routing to miss): no line
+    monkeypatch.setattr(sysinfo, "process_table", lambda: {})
+    assert "claude outside claude-hr" not in checks()
+    monkeypatch.setattr(sysinfo, "process_table", lambda: table)
+    monkeypatch.setenv("CLAUDE_HR_HEADROOM__MODE", "off")
+    assert "claude outside claude-hr" not in checks()
+
+
+def test_the_process_probe_never_breaks_doctor(sandbox, fake_claude, monkeypatch):
+    from claude_hr import sysinfo
+
+    def boom():
+        raise OSError("no snapshot")
+
+    monkeypatch.setattr(sysinfo, "process_table", boom)
+    got = checks()
+    assert "claude outside claude-hr" not in got and "platform" in got

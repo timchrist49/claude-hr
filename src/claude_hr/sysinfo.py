@@ -252,3 +252,86 @@ def process_rss_mb(pid: int) -> float:
     except Exception:
         pass
     return 0.0
+
+
+def _win_process_table() -> dict[int, tuple[int, str]]:
+    """Every process through a toolhelp snapshot (kernel32 only: no psutil, no PowerShell, a few milliseconds)."""
+    import ctypes
+    from ctypes import wintypes
+
+    class PROCESSENTRY32W(ctypes.Structure):
+        _fields_ = [
+            ("dwSize", wintypes.DWORD),
+            ("cntUsage", wintypes.DWORD),
+            ("th32ProcessID", wintypes.DWORD),
+            ("th32DefaultHeapID", ctypes.c_size_t),
+            ("th32ModuleID", wintypes.DWORD),
+            ("cntThreads", wintypes.DWORD),
+            ("th32ParentProcessID", wintypes.DWORD),
+            ("pcPriClassBase", wintypes.LONG),
+            ("dwFlags", wintypes.DWORD),
+            ("szExeFile", ctypes.c_wchar * 260),
+        ]
+
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    k32.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
+    k32.CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
+    k32.Process32FirstW.argtypes = [wintypes.HANDLE, ctypes.POINTER(PROCESSENTRY32W)]
+    k32.Process32NextW.argtypes = [wintypes.HANDLE, ctypes.POINTER(PROCESSENTRY32W)]
+    k32.CloseHandle.argtypes = [wintypes.HANDLE]
+    snap = k32.CreateToolhelp32Snapshot(0x2, 0)  # TH32CS_SNAPPROCESS
+    if snap in (None, 0, ctypes.c_void_p(-1).value):
+        return {}
+    table: dict[int, tuple[int, str]] = {}
+    try:
+        entry = PROCESSENTRY32W()
+        entry.dwSize = ctypes.sizeof(PROCESSENTRY32W)
+        ok = k32.Process32FirstW(snap, ctypes.byref(entry))
+        while ok:
+            table[int(entry.th32ProcessID)] = (int(entry.th32ParentProcessID), entry.szExeFile)
+            ok = k32.Process32NextW(snap, ctypes.byref(entry))
+    finally:
+        k32.CloseHandle(snap)
+    return table
+
+
+def _linux_process_table(proc_root: str | Path = "/proc") -> dict[int, tuple[int, str]]:
+    """pid -> (ppid, name) from /proc/<pid>/stat: `pid (name) state ppid ...`, where the name may hold spaces and brackets."""
+    table: dict[int, tuple[int, str]] = {}
+    try:
+        entries = [e for e in os.listdir(proc_root) if e.isdigit()]
+    except OSError:
+        return table
+    for entry in entries:
+        try:
+            raw = (Path(proc_root) / entry / "stat").read_text(encoding="utf-8", errors="replace")
+            head, _, tail = raw.rpartition(")")
+            table[int(entry)] = (int(tail.split()[1]), head.partition("(")[2])
+        except (OSError, ValueError, IndexError):
+            continue  # the process ended while we looked
+    return table
+
+
+def parse_ps_table(text: str) -> dict[int, tuple[int, str]]:
+    """pid -> (ppid, executable name) from `ps -axo pid=,ppid=,comm=` (macOS prints the full path as comm)."""
+    table: dict[int, tuple[int, str]] = {}
+    for line in text.splitlines():
+        parts = line.strip().split(None, 2)
+        if len(parts) == 3 and parts[0].isdigit() and parts[1].isdigit():
+            table[int(parts[0])] = (int(parts[1]), os.path.basename(parts[2].strip()))
+    return table
+
+
+def process_table() -> dict[int, tuple[int, str]]:
+    """{pid: (parent pid, executable name)} of every running process; {} when that cannot be told. Never raises."""
+    try:
+        if paths.IS_WINDOWS:
+            return _win_process_table()
+        if paths.IS_LINUX and Path("/proc/self/stat").exists():
+            return _linux_process_table()
+        r = subprocess.run(
+            ["ps", "-axo", "pid=,ppid=,comm="], capture_output=True, text=True, timeout=10
+        )
+        return parse_ps_table(r.stdout) if r.returncode == 0 else {}
+    except Exception:
+        return {}

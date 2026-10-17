@@ -78,6 +78,11 @@ check "claudemd lint"               claude-hr-ctl claudemd lint
 check "cleanup dry-run"             claude-hr-ctl cleanup
 check "usage"                       claude-hr-ctl usage --days 1
 check "update --check"              claude-hr-ctl update --check --only claude headroom
+# `claude-hr update` is "update everything": through the launcher a preview exits 0 and names the channel Claude Code follows
+update_preview() { local out rc; out="$(claude-hr update --check 2>&1)"; rc=$?; echo "$out"; [ "$rc" -eq 0 ] && echo "$out" | grep -q 'Claude Code channel: '; }
+check "claude-hr update --check exits 0 and prints the channel line"  update_preview
+check "claude-hr update --help is claude-hr's own help"                bash -c "claude-hr update --help | grep -q -e '--claude-only' && ! claude-hr update --help | grep -q 'Check for updates and install if available'"
+check "claude-hr update --claude-only is Claude Code's own updater"    bash -c "claude-hr --hr-dry-run update --claude-only 2>&1 | grep -q 'kind=passthrough'"
 check "bash guard blocks .env"      bash -c "echo '{\"tool_input\":{\"command\":\"cat .env\"}}' | claude-hr-ctl hook bash-guard; test \$? -eq 2"
 
 echo "== 6b. development loop: end-of-turn gate, trust, audit, scaffolding, footprint =="

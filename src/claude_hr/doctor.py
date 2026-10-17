@@ -157,6 +157,61 @@ def _footprint_check(cfg: Config, listing: list[dict]) -> Check | None:
     )
 
 
+def _channel_checks(cfg: Config) -> list[Check]:
+    """Which Claude Code release channel claude-hr's updater follows, and a WARN when claude.channel names one explicitly and
+    the autoUpdatesChannel in the user's settings.json says another (Claude Code's own setting and the updater then disagree)."""
+    try:
+        ch = claude_setup.resolve_channel(cfg)
+    except Exception:  # noqa: BLE001 - an informational line must never break doctor
+        return []
+    user = ch.user if ch.user is not None else "unset"
+    checks = [
+        Check(
+            "claude update channel",
+            INFO,
+            f"{ch.effective} (claude.channel={ch.raw}, settings.json autoUpdatesChannel={user})",
+        )
+    ]
+    if ch.explicit and ch.user is not None and ch.user.strip().lower() != ch.effective:
+        checks.append(
+            Check(
+                "claude channel conflict",
+                WARN,
+                f'claude.channel is "{ch.effective}" but autoUpdatesChannel in settings.json is "{ch.user}": '
+                "claude-hr's updater and Claude Code's own setting follow different channels",
+                "claude-hr-ctl config set claude.channel auto   (follow your autoUpdatesChannel), or "
+                "claude-hr-ctl setup --only settings after changing claude.channel",
+            )
+        )
+    return checks
+
+
+def _unrouted_claude_check(cfg: Config) -> Check | None:
+    """INFO when Claude Code processes run that claude-hr did not start: their traffic does not go through Headroom and
+    nothing here limits them. The two ways to route Claude through claude-hr are named, one per line."""
+    if (
+        not cfg.flag("headroom.enabled", True)
+        or str(cfg.get("headroom.mode", "persistent")) == "off"
+    ):
+        return None
+    try:
+        from . import updater
+
+        n = len(updater.unmanaged_claude_processes())
+    except Exception:  # noqa: BLE001 - an optional probe must never break doctor
+        return None
+    if not n:
+        return None
+    return Check(
+        "claude outside claude-hr",
+        INFO,
+        f"{n} Claude Code process(es) not started by claude-hr are running; their traffic does not go through Headroom "
+        "(no compression, no session limits, not seen by the update guard)\n"
+        "         use: type `claude-hr` instead of `claude`\n"
+        "         or:  claude-hr-ctl shim install   (then put ~/.claude-hr/bin first on PATH)",
+    )
+
+
 REAPPLY = "claude-hr-ctl setup --only settings claude-md plugins"
 
 
@@ -283,6 +338,8 @@ def run(cfg: Config, cwd: Path, deep: bool = False) -> list[Check]:
                     "claude-hr-ctl setup",
                 )
             )
+        if cfg.flag("claude.manage_updates", True):
+            out += _channel_checks(cfg)
         base = env.get("ANTHROPIC_BASE_URL")
         if base:
             alive = procutil.http_json(base.rstrip("/") + "/health", timeout=0.6)[0] == 200
@@ -541,6 +598,9 @@ def run(cfg: Config, cwd: Path, deep: bool = False) -> list[Check]:
         )
     )
     out.append(Check("sessions", OK, f"{adm.running} running / limit {adm.limit}"))
+    unrouted = _unrouted_claude_check(cfg)
+    if unrouted:
+        out.append(unrouted)
     if paths.IS_LINUX:
         cap, _ = resources.memory_limits_gb(cfg)
         if cap > 0 and resources.caps_available():

@@ -1,9 +1,15 @@
 # Windows regression test for the self-update path (Windows PowerShell 5.1 or 7):
 #   powershell -NoProfile -ExecutionPolicy Bypass -File tests\windows\verify-windows-selfupdate.ps1 [-FromRef v0.1.2]
 # Builds a throwaway git origin with releases v9.0.1 -> v9.0.2 -> v9.0.3 from this checkout (or from -FromRef, to test an
-# older updater), installs v9.0.1 into an isolated sandbox, then runs `claude-hr-ctl update --only self plugins` (the order of
-# the daily job) twice. After each run the tool environment must still work: the detached reinstall must not overlap with the
-# plugin update (it used to leave claude-hr without site-packages: "ModuleNotFoundError: No module named 'claude_hr'").
+# older updater), installs v9.0.1 into an isolated sandbox, then runs the update with `--only self plugins` (the order of
+# the daily job) twice: round 1 through the LAUNCHER (`claude-hr update`), round 2 through `claude-hr-ctl update`. After each
+# run the tool environment must still work: the detached reinstall must not overlap with the plugin update (it used to leave
+# claude-hr without site-packages: "ModuleNotFoundError: No module named 'claude_hr'"), and the post phase chained behind the
+# reinstall (`claude-hr-ctl update --post`, which needs the NEW code) must have run: state\update-last.json is complete and
+# was written by the new release. That helper is a scheduled task, which does not inherit this sandbox: it must work on the
+# sandbox profile (never the real one), so a record in the sandbox is also the proof that it did.
+# With -FromRef the installed updater is an OLDER one (no `claude-hr update`, no post phase): round 1 then uses
+# `claude-hr-ctl update` and the post-phase checks are skipped.
 # No Headroom download, no scheduled jobs, no model calls; ~3 minutes. Never writes to your real ~/.claude or ~/.claude-hr.
 param([string]$FromRef = '')
 $ErrorActionPreference = 'Continue'
@@ -87,6 +93,27 @@ function Wait-ForVersion($v, $seconds) {
   }
   return $o
 }
+# The post phase runs in the helper after the reinstall: wait for it to finish the record (phase 'complete', written by $v)
+function Wait-ForLastUpdate($v, $seconds) {
+  $f = "$sb\h\.claude-hr\state\update-last.json"
+  $deadline = (Get-Date).AddSeconds($seconds)
+  $rec = $null
+  while ((Get-Date) -lt $deadline) {
+    try { $rec = Get-Content $f -Raw -ErrorAction Stop | ConvertFrom-Json } catch { $rec = $null }
+    if ($rec -and $rec.phase -eq 'complete' -and $rec.versions.'claude-hr' -eq $v) { return $rec }
+    Start-Sleep -Seconds 3
+  }
+  return $rec
+}
+function Verify-PostPhase($label, $v) {
+  $rec = Wait-ForLastUpdate $v 150
+  Check "$label : the post phase ran after the reinstall (state\update-last.json is complete and written by $v)" ($rec -and $rec.phase -eq 'complete' -and $rec.versions.'claude-hr' -eq $v) (($rec | ConvertTo-Json -Compress -Depth 4))
+  Check "$label : the record names the self update and the plugins step" ((@($rec.results | Where-Object { $_.component -eq 'self' -and $_.action -eq 'updated' }).Count -eq 1) -and (@($rec.results | Where-Object { $_.component -eq 'plugins' }).Count -eq 1)) (($rec.results | ConvertTo-Json -Compress -Depth 4))
+  $helperLog = Get-Content "$sb\h\.claude-hr\logs\self-update.log" -Raw -ErrorAction SilentlyContinue
+  Check "$label : the helper log shows the reinstall succeeded and the post phase exited 0" (($helperLog -match 'reinstall exit code 0') -and ($helperLog -match 'post phase exit code 0')) $helperLog
+  $st = Run "claude-hr-ctl status"
+  Check "$label : claude-hr-ctl status shows the last update" ($st -match 'Last update: ') $st
+}
 function Verify-Update($label, $v) {
   $o = Wait-ForVersion $v 150
   if ($o -notmatch "claude-hr $([regex]::Escape($v))") { "  --- helper log:"; Get-Content "$sb\h\.claude-hr\logs\self-update.log" -ErrorAction SilentlyContinue | ForEach-Object { "      $_" } }
@@ -104,10 +131,14 @@ function Verify-Update($label, $v) {
 # the helper is a task started by Task Scheduler: it must not open a console window (it used to open a Windows Terminal one)
 $watchOut = Join-Path $sb 'windows-seen.json'
 $watcher = Start-Process -FilePath python -ArgumentList "`"$repo\tests\windows\window_watch.py`"", 100, "`"$watchOut`"" -WindowStyle Hidden -PassThru
-$u1 = Run "claude-hr-ctl update --only self plugins"
+$u1 = if ($FromRef) { Run "claude-hr-ctl update --only self plugins" } else { Run "claude-hr update --only self plugins" }
+$u1rc = $LASTEXITCODE
 $u1.TrimEnd()
-Check "update reported self updated" ($u1 -match 'self\s+updated') $u1
+Check "the update command exited 0" ($u1rc -eq 0) "exit code $u1rc"
+Check "update reported self updated" ($u1 -match '(?m)^self\s.*updated') $u1
+if (-not $FromRef) { Check "update said that the rest finishes in the background" ($u1 -match 'claude-hr itself is updating in the background; the rest finishes there') $u1 }
 Verify-Update 'round 1' '9.0.2'
+if (-not $FromRef) { Verify-PostPhase 'round 1' '9.0.2' }
 $watcher | Wait-Process -Timeout 130 -ErrorAction SilentlyContinue
 $seen = $null; try { $seen = Get-Content $watchOut -Raw | ConvertFrom-Json } catch {}
 Check "the helper task opened no console window (a Windows Terminal one used to stay open for the whole reinstall)" ($seen -and (@($seen.opened_and_closed).Count -eq 0)) (($seen | ConvertTo-Json -Compress))
@@ -118,8 +149,9 @@ git -C $src add -A 2>&1 | Out-Null; git -C $src commit -q -m "release 9.0.3" 2>&
 git -C $src push -q "$sb\origin.git" main --tags 2>&1 | Out-Null
 $u2 = Run "claude-hr-ctl update --only self plugins"
 $u2.TrimEnd()
-Check "update reported self updated again" ($u2 -match 'self\s+updated') $u2
+Check "update reported self updated again" ($u2 -match '(?m)^self\s.*updated') $u2
 Verify-Update 'round 2' '9.0.3'
+if (-not $FromRef) { Verify-PostPhase 'round 2' '9.0.3' }
 # the helper's last two lines (delete its script, unregister its task) run just after the reinstall that Verify-Update waited for
 $cleaned = $false
 foreach ($i in 1..15) {

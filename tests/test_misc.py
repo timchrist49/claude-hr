@@ -724,3 +724,55 @@ def test_hook_write_is_false_not_an_error_when_the_folder_is_a_file(tmp_path, mo
     (tmp_path / "hrhome").mkdir()
     (tmp_path / "hrhome" / "logs").write_text("in the way", encoding="utf-8")
     assert paths.hook_write(paths.logs_dir() / "crash.log", "x") is False
+
+
+# ---- the process table behind "Claude Code processes claude-hr did not start" ------------------------------------------
+def test_linux_process_table_reads_proc_stat_including_awkward_names(tmp_path):
+    from claude_hr import sysinfo
+
+    root = tmp_path / "proc"
+    for pid, stat in {
+        "100": "100 (claude) S 1 100 100 0 -1 4194560 1 0 0 0",
+        "200": "200 (my (odd) name) R 100 200 200 0 -1 4194560",
+        "400": "garbage",  # not a stat line
+    }.items():
+        (root / pid).mkdir(parents=True)
+        (root / pid / "stat").write_text(stat + "\n", encoding="utf-8")
+    (root / "300").mkdir()  # the process ended while we looked: no stat file
+    (root / "self").mkdir()  # not a process
+    (root / "cpuinfo").write_text("x", encoding="utf-8")
+    assert sysinfo._linux_process_table(root) == {100: (1, "claude"), 200: (100, "my (odd) name")}
+    assert sysinfo._linux_process_table(tmp_path / "missing") == {}
+
+
+def test_ps_output_is_read_into_the_same_table():
+    from claude_hr import sysinfo
+
+    text = (
+        "    1     0 /sbin/launchd\n"
+        "  501     1 /Applications/Some App/claude\n"
+        "  502   501 python3\n"
+        "this line is not a process\n"
+    )
+    assert sysinfo.parse_ps_table(text) == {
+        1: (0, "launchd"),
+        501: (1, "claude"),
+        502: (501, "python3"),
+    }
+
+
+def test_process_table_lists_this_process_and_never_raises(monkeypatch):
+    from claude_hr import paths, sysinfo
+
+    table = sysinfo.process_table()
+    assert isinstance(table, dict)
+    assert all(
+        isinstance(pid, int) and isinstance(ppid, int) and isinstance(name, str)
+        for pid, (ppid, name) in table.items()
+    )
+    assert os.getpid() in table or table == {}  # the platform can say, and then we are in it
+    monkeypatch.setattr(paths, "IS_WINDOWS", True)
+    monkeypatch.setattr(
+        sysinfo, "_win_process_table", lambda: (_ for _ in ()).throw(OSError("no snapshot"))
+    )
+    assert sysinfo.process_table() == {}

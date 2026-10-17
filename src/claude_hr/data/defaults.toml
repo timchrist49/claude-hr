@@ -10,7 +10,8 @@ update_ref = "stable"        # what the self-updater tracks: "stable" = newest v
 [claude]
 binary = ""                  # empty = auto-detect the real `claude` (never the claude-hr shim)
 manage_updates = true        # claude-hr stages Claude Code upgrades (smoke-tested, rollback) instead of the built-in updater
-channel = "stable"           # release channel the staged updater follows: "stable" | "latest"
+channel = "auto"             # release channel the staged updater follows: "stable" | "latest" are used as written; "auto" = the autoUpdatesChannel you set in
+                             #   ~/.claude/settings.json when it is stable or latest, else stable (one answer for claude-hr and the baseline it writes there)
 pin = ""                     # exact version to hold (overrides channel), e.g. "2.1.292"
 privacy = "standard"         # standard: error reporting off | strict: also telemetry + nonessential traffic off
                              #   (strict removes feature-flagged features such as /skill-doctor and plugin sync)

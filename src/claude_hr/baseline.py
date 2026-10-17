@@ -178,9 +178,12 @@ def build(
     if bool(cfg.get("github.readonly_allow", True)):
         doc.setdefault("permissions", {})["allow"] = list(GH_READONLY_ALLOW)
 
-    channel = str(c.get("channel", "") or "")
-    if channel and bool(c.get("manage_updates", True)):
-        doc["autoUpdatesChannel"] = channel
+    if str(c.get("channel", "") or "") and bool(c.get("manage_updates", True)):
+        # the channel the updater follows, so Claude Code's own setting never says something else. A value the user set is
+        # theirs: the merge keeps it (and with "auto" the resolved channel IS that value, so there is nothing to keep apart)
+        from .claude_setup import resolve_channel  # lazy: claude_setup imports this module
+
+        doc["autoUpdatesChannel"] = resolve_channel(cfg).effective
 
     days = int(cfg.get("maintenance.transcript_retention_days", 30) or 30)
     if days != 30 and days >= 1:  # 30 is Claude's own default; only write a deliberate change

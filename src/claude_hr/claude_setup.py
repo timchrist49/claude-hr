@@ -49,6 +49,16 @@ def _same_path(a: str | Path, b: str | Path) -> bool:
     return bool(str(a)) and bool(str(b)) and norm(a) == norm(b)
 
 
+def _newer_version(offered: str, installed: str) -> bool:
+    """Is `offered` a newer plugin version than `installed`? Compared as X.Y.Z when both carry one (a build suffix such as
+    "6.4.2-8ca22dba9a94" does not count), otherwise any difference counts (versions that are commit hashes)."""
+    a = re.search(r"(\d+)\.(\d+)\.(\d+)", offered)
+    b = re.search(r"(\d+)\.(\d+)\.(\d+)", installed)
+    if a and b:
+        return tuple(map(int, a.groups())) > tuple(map(int, b.groups()))
+    return offered != installed
+
+
 def applied_version(step: str = "settings") -> str | None:
     """The claude-hr version whose baseline `step` was last applied by `setup`, or None (never recorded: set up by a release
     before 0.2.0, or the step was skipped / never ran)."""
@@ -136,12 +146,61 @@ def unattended_reapply() -> tuple[list[str], str]:
     )
 
 
+CHANNELS = ("stable", "latest")
+
+
+@dataclass(frozen=True)
+class ChannelInfo:
+    # the channel in force: "stable" | "latest"
+    effective: str
+    # claude.channel as configured ("auto" by default)
+    raw: str
+    # the autoUpdatesChannel of the user's own settings.json (None: not set, or not text)
+    user: str | None
+    # "config" | "settings" | "default": where `effective` came from
+    source: str
+
+    @property
+    def explicit(self) -> bool:
+        """claude.channel names a channel itself instead of leaving the choice to settings.json."""
+        return self.source == "config"
+
+    def describe(self) -> str:
+        if self.source == "config":
+            return f'{self.effective} (claude.channel = "{self.raw}")'
+        if self.source == "settings":
+            return f'{self.effective} (claude.channel = "{self.raw}": the autoUpdatesChannel in your settings.json)'
+        return f'{self.effective} (claude.channel = "{self.raw}": no autoUpdatesChannel of yours is set, so the default)'
+
+
+def resolve_channel(cfg: Config) -> ChannelInfo:
+    """The Claude Code release channel in force. The updater (which release to install) and the baseline (what it writes to
+    settings.json as autoUpdatesChannel) both ask here, so the two can never disagree.
+
+    "stable" and "latest" in claude.channel are used as written. Anything else ("auto", the default) follows the user's own
+    autoUpdatesChannel when that is stable or latest, and is "stable" when it is unset or not a channel claude-hr knows."""
+    raw = str(cfg.get("claude.channel", "auto") or "auto").strip()
+    user: str | None = None
+    try:
+        value = (read_json(paths.claude_settings(), {}) or {}).get("autoUpdatesChannel")
+        user = value if isinstance(value, str) else None
+    except (JsonFileError, OSError, AttributeError):
+        user = None  # an unreadable settings.json is reported by doctor; it is never a reason to stop an update
+    if raw.lower() in CHANNELS:
+        return ChannelInfo(raw.lower(), raw, user, "config")
+    if user is not None and user.strip().lower() in CHANNELS:
+        return ChannelInfo(user.strip().lower(), raw, user, "settings")
+    return ChannelInfo("stable", raw, user, "default")
+
+
 @dataclass
 class Step:
     name: str
     ok: bool = True
     changed: bool = False
     lines: list[str] = field(default_factory=list)
+    # what only a person can do (a plugin update that wants confirmation)
+    needs: list[str] = field(default_factory=list)
 
     def add(self, msg: str) -> None:
         self.lines.append(msg)
@@ -547,7 +606,46 @@ class ClaudeSetup:
                 # no -y: an unattended job must never auto-accept a marketplace-declared command
                 u = self._claude("plugin", "update", p["id"], "--scope", "user", timeout=300)
                 out = (u.stdout or u.stderr).strip().splitlines()
-                if out and "up to date" not in out[-1].lower() and "already" not in out[-1].lower():
+                if u.returncode != 0:
+                    # it wants an answer (a marketplace-declared command to confirm) or failed: say so, never answer for the user
+                    step.needs.append(
+                        f"{p['id']} was not updated ({(out[-1] if out else 'no message')[:100]}): "
+                        f"run `claude plugin update {p['id']} --scope user` yourself"
+                    )
+                elif (
+                    out and "up to date" not in out[-1].lower() and "already" not in out[-1].lower()
+                ):
                     step.changed = True
                     step.add(f"{p['id']}: {out[-1][:140]}")
         return step
+
+    def available_updates(self) -> list[tuple[str, str, str]] | None:
+        """(plugin id, installed version, version its marketplace catalog offers) for the user-scope plugins whose catalog
+        entry names a newer one, or None when claude cannot say. Read-only: one `claude plugin list --json --available`,
+        which reads the catalogs claude already has (they are refreshed by the update, not by this), so a plugin whose
+        catalog gives no version, or one that comes from a git commit (its version is a commit hash), is not judged."""
+        r = self._claude("plugin", "list", "--json", "--available", timeout=90)
+        try:
+            data = json.loads(r.stdout) if r.returncode == 0 else None
+        except json.JSONDecodeError:
+            return None
+        if not isinstance(data, dict) or not isinstance(data.get("installed"), list):
+            return None
+        offered = {
+            p["pluginId"]: p["version"]
+            for p in data.get("available") or []
+            if isinstance(p, dict)
+            and isinstance(p.get("pluginId"), str)
+            and isinstance(p.get("version"), str)
+            and p["version"]
+        }
+        out: list[tuple[str, str, str]] = []
+        for p in data["installed"]:
+            if not (
+                isinstance(p, dict) and p.get("scope") == "user" and isinstance(p.get("id"), str)
+            ):
+                continue
+            have, new = str(p.get("version") or ""), offered.get(p["id"])
+            if new and have and _newer_version(new, have):
+                out.append((p["id"], have, new))
+        return out

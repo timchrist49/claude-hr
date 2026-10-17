@@ -1,10 +1,32 @@
 import json
+import os
+import shlex
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
 
 from claude_hr import config, resources, updater
+from claude_hr.checks import FAIL, INFO, WARN, Check
+
+
+@pytest.fixture(autouse=True)
+def _hermetic_report(monkeypatch):
+    """A run's report asks the machine two things no test here is about: which processes run (a Claude Code session on the
+    developer's machine would add an INFO line) and what doctor says. Tests that are about them replace these again."""
+    from claude_hr import doctor
+
+    monkeypatch.setattr(updater.sysinfo, "process_table", lambda: {})
+    monkeypatch.setattr(doctor, "run", lambda cfg, cwd, deep=False: [])
+    # ... and no run may ask the machine's real claude whether its background service is busy
+    from claude_hr import launcher
+
+    monkeypatch.setattr(
+        launcher,
+        "_daemon_status",
+        lambda claude: {"running": False, "pid": 0, "starter_pid": 0, "workers": 0},
+    )
 
 
 def make(sandbox, monkeypatch, current="2.1.292", target="2.1.300", **kw):
@@ -34,7 +56,9 @@ def test_dry_run_reports_available_without_acting(sandbox, monkeypatch):
     u = make(sandbox, monkeypatch, dry=True)
     res = u.update_claude()
     assert res.action == "available"
-    assert calls == []
+    # the only thing a preview may ask claude is read-only (the daemon's state); nothing is installed
+    assert not [c for c in calls if "install" in c[0]]
+    assert res.detail == "Claude Code 2.1.292 -> channel stable offers 2.1.300"
 
 
 def test_up_to_date_is_a_noop(sandbox, monkeypatch):
@@ -836,18 +860,20 @@ def test_reapply_baseline_does_not_need_claude_code_installed(upgraded_machine):
 def test_the_full_update_run_never_installs_a_plugin_or_passes_y(upgraded_machine, monkeypatch):
     """SECURITY.md: unattended updates never pass `-y` and never add a marketplace or install a plugin."""
     u = upgraded_machine
-    for name in ("update_claude", "update_headroom", "update_self"):
+    for name in ("update_claude", "update_headroom", "update_self", "update_proxy"):
         comp = name.split("_", 1)[1]
         monkeypatch.setattr(u, name, lambda comp=comp: updater.Result(comp))
     rep = u.run()  # the real update_plugins runs too
-    assert rep.results[0].component == "baseline" and rep.results[0].action == "updated"
+    by = {r.component: r for r in rep.results}
+    assert by["baseline"].action == "updated"
     assert u.calls, "update_plugins should have asked the fake claude something"
+    assert ("plugin", "marketplace", "update") in [c[:3] for c in u.calls]
     for call in u.calls:
         assert "-y" not in call and "--yes" not in call, call
         assert call[:2] != ("plugin", "install") and call[:3] != ("plugin", "marketplace", "add")
 
 
-def test_reapply_baseline_does_nothing_on_a_dry_run_or_a_machine_setup_never_ran_on(
+def test_reapply_baseline_only_says_what_it_would_do_on_a_dry_run_and_skips_a_machine_setup_never_ran_on(
     upgraded_machine, sandbox
 ):
     from claude_hr import claude_setup, paths
@@ -855,7 +881,11 @@ def test_reapply_baseline_does_nothing_on_a_dry_run_or_a_machine_setup_never_ran
     u = upgraded_machine
     before = paths.claude_settings().read_text(encoding="utf-8")
     u.dry = True
-    assert u.reapply_baseline() is None
+    preview = u.reapply_baseline()
+    assert (
+        preview.action == "available" and preview.detail == "would re-apply settings and claude-md"
+    )
+    assert (preview.current, preview.target) == ("0.1.9", claude_setup.running_version())
     assert paths.claude_settings().read_text(encoding="utf-8") == before
     assert claude_setup.applied_version("settings") == "0.1.9"
     u.dry = False
@@ -965,30 +995,39 @@ def test_reapply_baseline_that_fails_is_reported_retried_and_never_raises(
     assert res.action == "failed" and "RuntimeError" in res.detail and "disk full" in res.detail
 
 
-def test_a_full_update_run_starts_with_the_baseline_and_a_partial_one_does_not(
+def _stub_components(monkeypatch, target, names=("claude", "headroom", "self", "plugins", "proxy")):
+    for comp in names:
+        monkeypatch.setattr(target, f"update_{comp}", lambda *a, comp=comp: updater.Result(comp))
+
+
+def test_a_full_update_run_re_applies_the_baseline_after_the_components_and_a_partial_one_does_not(
     upgraded_machine, monkeypatch
 ):
+    from claude_hr import claude_setup
+
     u = upgraded_machine
-    for name in ("update_claude", "update_headroom", "update_self", "update_plugins"):
-        comp = name.split("_", 1)[1]
-        monkeypatch.setattr(u, name, lambda comp=comp: updater.Result(comp))
+    _stub_components(monkeypatch, u)
     rep = u.run(["plugins"])
     assert [r.component for r in rep.results] == [
         "plugins"
-    ]  # `update --only plugins` is not an upgrade of the config
+    ]  # `--only plugins` is not an upgrade of the config
     rep = u.run()
     assert [r.component for r in rep.results] == [
-        "baseline",
+        "self",
         "claude",
         "headroom",
-        "self",
         "plugins",
+        "baseline",
+        "proxy",
     ]
-    assert rep.results[0].action == "updated" and rep.ok
-    rep = u.run()  # applied now: no row at all
-    assert [r.component for r in rep.results] == ["claude", "headroom", "self", "plugins"]
+    assert rep.results[4].action == "updated" and rep.ok
+    rep = (
+        u.run()
+    )  # applied now: the row stays (the report shows every component) but says nothing was due
+    baseline = next(r for r in rep.results if r.component == "baseline")
+    assert baseline.action == "none" and baseline.current == claude_setup.running_version()
     log = (updater.paths.logs_dir() / "update.jsonl").read_text(encoding="utf-8")
-    assert '"component": "baseline"' in log
+    assert '"component": "baseline", "from": "0.1.9"' in log
 
 
 def test_a_failed_baseline_makes_the_update_run_fail_but_does_not_stop_it(
@@ -998,14 +1037,18 @@ def test_a_failed_baseline_makes_the_update_run_fail_but_does_not_stop_it(
 
     u = upgraded_machine
     paths.claude_settings().write_text("{ not json", encoding="utf-8")
-    for name in ("update_claude", "update_headroom", "update_self", "update_plugins"):
-        comp = name.split("_", 1)[1]
-        monkeypatch.setattr(u, name, lambda comp=comp: updater.Result(comp))
+    _stub_components(monkeypatch, u)
     rep = u.run()
-    assert [r.component for r in rep.results][:2] == ["baseline", "claude"] and len(
-        rep.results
-    ) == 5
-    assert not rep.ok
+    assert [r.component for r in rep.results] == [
+        "self",
+        "claude",
+        "headroom",
+        "plugins",
+        "baseline",
+        "proxy",
+    ]  # the step after the failed one still ran
+    assert next(r for r in rep.results if r.component == "baseline").action == "failed"
+    assert not rep.ok and rep.exit_code() == updater.EXIT_FAILED
 
 
 def test_the_scheduled_update_job_reapplies_the_baseline_at_its_start(
@@ -1013,12 +1056,10 @@ def test_the_scheduled_update_job_reapplies_the_baseline_at_its_start(
 ):
     from claude_hr import claude_setup, ctl, paths
 
-    for name in ("update_claude", "update_headroom", "update_self", "update_plugins"):
-        comp = name.split("_", 1)[1]
-        monkeypatch.setattr(updater.Updater, name, lambda self, comp=comp: updater.Result(comp))
+    _stub_components(monkeypatch, updater.Updater)
     assert ctl._run(["job", "update"]) == 0
     line = (paths.logs_dir() / "job-update.log").read_text(encoding="utf-8")
-    assert "rc=0" in line and line.index("baseline") < line.index("claude ")
+    assert "rc=0" in line and line.index("plugins") < line.index("baseline")
     assert claude_setup.baseline_is_stale()[0] is False
     # auto_apply = false only reports: nothing may be written
     (paths.state_dir() / "applied-version.json").write_text(
@@ -1035,3 +1076,982 @@ def test_the_scheduled_update_job_reapplies_the_baseline_at_its_start(
     monkeypatch.setenv("CLAUDE_HR_UPDATES__AUTO_APPLY", "false")
     assert ctl._run(["job", "update"]) in (0, 1)
     assert not paths.claude_settings().exists()
+
+
+# ---- `update` is one command: its order, its report, its exit codes ---------------------------------------------------
+def _spied(monkeypatch, events, **rows):
+    """An Updater whose components only record that they ran (and return the row given for them, else an untouched one)."""
+    u = updater.Updater(config.load())
+    for comp in ("self", "claude", "headroom", "plugins", "proxy"):
+
+        def fn(comp=comp):
+            events.append(comp)
+            return rows.get(comp) or updater.Result(comp)
+
+        monkeypatch.setattr(u, f"update_{comp}", fn)
+    monkeypatch.setattr(u, "reapply_baseline", lambda: events.append("baseline"))
+    return u
+
+
+def _patch_class(monkeypatch, rows=None):
+    """Every Updater of this test (the ones ctl creates too) answers with `rows[component]` (else an untouched row)."""
+    rows = rows or {}
+    for comp in ("self", "claude", "headroom", "plugins", "proxy"):
+        monkeypatch.setattr(
+            updater.Updater,
+            f"update_{comp}",
+            lambda self, comp=comp: rows.get(comp) or updater.Result(comp),
+        )
+    monkeypatch.setattr(updater.Updater, "reapply_baseline", lambda self: rows.get("baseline"))
+
+
+def test_a_full_run_goes_self_claude_headroom_plugins_then_baseline_and_proxy(sandbox, monkeypatch):
+    events = []
+    rep = _spied(monkeypatch, events).run()
+    assert events == ["self", "claude", "headroom", "plugins", "baseline", "proxy"]
+    assert [r.component for r in rep.results] == events
+
+
+def test_only_means_just_these_and_keeps_the_run_order(sandbox, monkeypatch):
+    events = []
+    u = _spied(monkeypatch, events)
+    u.run(["proxy", "claude", "self"])
+    assert events == ["self", "claude", "proxy"]
+    events.clear()
+    u.run(["baseline"])
+    assert events == ["baseline"]
+
+
+def test_the_report_of_a_machine_that_is_up_to_date(sandbox, monkeypatch, capsys):
+    from claude_hr import claude_setup, ctl, paths
+
+    (paths.state_dir()).mkdir(parents=True, exist_ok=True)
+    (paths.state_dir() / "install.json").write_text(
+        "{}", encoding="utf-8"
+    )  # a machine `setup` ran on
+    rows = {
+        "self": updater.Result("self", "v0.2.3", "v0.2.3"),
+        "claude": updater.Result("claude", "2.1.302", "2.1.302"),
+        "headroom": updater.Result("headroom", "0.41.0", "0.41.0"),
+    }
+    _patch_class(monkeypatch, rows)
+    assert ctl._run(["update"]) == 0
+    lines = capsys.readouterr().out.splitlines()
+    assert lines[0].split() == ["component", "before", "->", "after", "result"]
+    table = [" ".join(ln.split()) for ln in lines[2:8]]
+    assert table == [
+        "self v0.2.3 up to date",
+        "claude 2.1.302 up to date",
+        "headroom 0.41.0 up to date",
+        "plugins - up to date",
+        f"baseline {claude_setup.running_version()} up to date",
+        "proxy - up to date",
+    ]
+    assert lines[-2:] == ["Everything is up to date.", "doctor: no warnings, no failures"]
+    assert "Pending" not in "\n".join(lines)
+    assert lines[-3] == ""  # the verdict stands apart from the table
+
+
+def test_the_report_lists_what_is_pending_and_why_and_names_the_way_out_of_a_deferral(
+    sandbox, monkeypatch, capsys
+):
+    from claude_hr import ctl
+
+    waiting = updater.Result(
+        "claude",
+        "2.1.301",
+        "2.1.302",
+        action="deferred",
+        detail="2 claude-hr session(s) running",
+        busy=True,
+    )
+    _patch_class(monkeypatch, {"claude": waiting})
+    assert ctl._run(["update"]) == 75
+    text = capsys.readouterr().out
+    lines = text.splitlines()
+    assert next(ln for ln in lines if ln.startswith("claude ")).split()[1:] == [
+        "2.1.301",
+        "->",
+        "2.1.302",
+        "deferred",
+    ]
+    assert "Pending:" in lines and "  claude: 2 claude-hr session(s) running" in lines
+    assert "Everything is up to date." not in text
+    assert (
+        "Nothing is broken. Close the claude-hr sessions and run `claude-hr update` again" in text
+    )
+    assert "--force" in text
+
+
+@pytest.mark.parametrize(
+    "rows,code",
+    [
+        ({}, 0),
+        ({"claude": updater.Result("claude", "2.1.1", "2.1.2", action="updated")}, 0),
+        ({"claude": updater.Result("claude", action="failed", detail="boom")}, 1),
+        ({"headroom": updater.Result("headroom", action="rolled-back", detail="smoke")}, 1),
+        (
+            {
+                "claude": updater.Result(
+                    "claude", action="deferred", detail="1 claude-hr session(s) running", busy=True
+                )
+            },
+            75,
+        ),
+        # deferred for another reason (the baseline went to another Claude config directory): sessions are not why, so 0
+        ({"baseline": updater.Result("baseline", action="deferred", detail="elsewhere")}, 0),
+        (
+            {
+                "claude": updater.Result("claude", action="deferred", busy=True, detail="x"),
+                "headroom": updater.Result("headroom", action="failed", detail="boom"),
+            },
+            1,
+        ),
+    ],
+)
+def test_the_update_command_exits_0_ok_1_failed_75_deferred(sandbox, monkeypatch, rows, code):
+    from claude_hr import ctl
+
+    _patch_class(monkeypatch, rows)
+    assert ctl._run(["update"]) == code
+
+
+def test_a_usage_error_exits_2_and_a_preview_always_exits_0(sandbox, monkeypatch, capsys):
+    from claude_hr import ctl, paths
+
+    assert ctl.update_main(["--bogus"]) == 2
+    assert ctl.update_main(["--only", "bogus"]) == 2
+    assert ctl.update_main(["--post", "--check"]) == 2  # the helper's half takes no preview
+    with pytest.raises(SystemExit) as exc:
+        ctl._run(["update", "--bogus"])
+    assert exc.value.code == 2
+    capsys.readouterr()
+    _patch_class(monkeypatch, {"claude": updater.Result("claude", action="failed", detail="boom")})
+    assert ctl._run(["update", "--check"]) == 0
+    assert "claude" in capsys.readouterr().out
+    # ... and it writes nothing of its own: no log line, no record of a run
+    assert not (paths.logs_dir() / "update.jsonl").exists()
+    assert not (paths.state_dir() / "update-last.json").exists()
+    assert not (paths.state_dir() / "update-state.json").exists()
+
+
+def test_the_scheduled_job_does_not_call_a_deferral_a_failure(sandbox, monkeypatch):
+    from claude_hr import ctl, paths
+
+    waiting = updater.Result("claude", action="deferred", detail="1 session", busy=True)
+    _patch_class(monkeypatch, {"claude": waiting})
+    assert ctl._run(["update"]) == 75  # the command says "deferred" ...
+    assert ctl._run(["job", "update"]) == 0  # ... the scheduler hears "fine"
+    assert " rc=0 " in (paths.logs_dir() / "job-update.log").read_text(encoding="utf-8")
+    _patch_class(monkeypatch, {"claude": updater.Result("claude", action="failed", detail="boom")})
+    assert ctl._run(["job", "update"]) == 1
+
+
+def test_update_claude_only_runs_claude_codes_own_updater(sandbox, monkeypatch):
+    from claude_hr import ctl
+
+    seen = []
+    monkeypatch.setattr(ctl.procutil, "find_claude", lambda *a, **k: Path("/fake/claude"))
+    monkeypatch.setattr(ctl.subprocess, "call", lambda argv, *a, **k: seen.append(argv) or 7)
+    monkeypatch.setattr(
+        updater.Updater, "run", lambda *a, **k: pytest.fail("claude-hr's own update must not run")
+    )
+    assert ctl._run(["update", "--claude-only"]) == 7
+    assert seen == [[str(Path("/fake/claude")), "update"]]
+
+
+def test_an_update_run_from_a_claude_code_shell_works_but_never_installs_a_plugin(
+    upgraded_machine, monkeypatch, capsys
+):
+    """It is non-interactive and asks nobody anything; installing a missing profile plugin is `plugins sync`, never this."""
+    from claude_hr import ctl, human
+
+    monkeypatch.setenv("CLAUDECODE", "1")
+    assert human.not_a_person()
+    u = upgraded_machine
+    for comp in ("self", "claude", "headroom", "proxy"):
+        monkeypatch.setattr(
+            updater.Updater, f"update_{comp}", lambda self, c=comp: updater.Result(c)
+        )
+    assert ctl._run(["update"]) == 0
+    assert "Everything is up to date." in capsys.readouterr().out
+    assert u.calls, "the plugin step should have asked the fake claude something"
+    for call in u.calls:
+        assert "-y" not in call and "--yes" not in call
+        assert call[:2] != ("plugin", "install") and call[:3] != ("plugin", "marketplace", "add")
+
+
+# ---- self-update: the post phase is chained behind the reinstall ------------------------------------------------------
+POST = [r"C:\Program Files\tool env\python.exe", "-m", "claude_hr.ctl", "update", "--post"]
+
+
+def test_the_windows_helper_runs_the_post_phase_only_after_a_reinstall_that_exited_with_0():
+    script = updater._windows_reinstall_script(
+        ["uv", "tool", "install"], 1, 2, "log.txt", env={}, post=POST
+    )
+    lines = script.splitlines()
+    rc = lines.index("$rc = $LASTEXITCODE")
+    guard = lines.index("if ($rc -eq 0) {")
+    post = next(i for i, ln in enumerate(lines) if ln.startswith("  & ") and "'--post'" in ln)
+    assert next(i for i, ln in enumerate(lines) if "reinstall exit code" in ln) > rc
+    assert rc < guard < post < next(i for i, ln in enumerate(lines) if ln.startswith("} else {"))
+    # quoted as one literal per argument (a space in the path), and its output goes to the same log
+    assert lines[post].startswith(
+        "  & 'C:\\Program Files\\tool env\\python.exe' '-m' 'claude_hr.ctl' 'update' '--post' 2>&1 | ForEach-Object"
+    )
+    assert "Add-Content -LiteralPath $log" in lines[post]
+    assert "the reinstall did not succeed: the post phase was not run" in script
+    # without a post phase the script is what it always was
+    plain = updater._windows_reinstall_script(["uv", "tool", "install"], 1, 2, "log.txt", env={})
+    assert "--post" not in plain and "if ($rc" not in plain
+
+
+def test_the_post_phase_of_the_helper_works_on_the_profile_the_update_resolved():
+    env = {"CLAUDE_CONFIG_DIR": r"D:\Tim's profile", "CLAUDE_HR_HOME": r"D:\hr", "UNRELATED": "x"}
+    lines = updater._windows_reinstall_script(
+        ["uv"], 1, 2, "log.txt", env=env, post=POST
+    ).splitlines()
+    assert r"$env:CLAUDE_CONFIG_DIR = 'D:\Tim''s profile'" in lines
+    assert r"$env:CLAUDE_HR_HOME = 'D:\hr'" in lines
+    assert not any("UNRELATED" in ln for ln in lines)
+    first_command = next(i for i, ln in enumerate(lines) if ln.startswith("& "))
+    assert max(i for i, ln in enumerate(lines) if ln.startswith("$env:")) < first_command
+
+
+def test_the_post_phase_script_parses_with_the_real_powershell_parser(tmp_path):
+    shell = __import__("shutil").which("powershell") or __import__("shutil").which("pwsh")
+    if shell is None:
+        pytest.skip("needs PowerShell")
+    script = updater._windows_reinstall_script(
+        ["C:\\Users\\Tim\u2019s\\uv.exe", "tool", "install"],
+        1,
+        2,
+        "C:\\l\u2018og\\x.log",
+        env={"CLAUDE_CONFIG_DIR": "C:\\a $(calc) b"},
+        post=["C:\\Users\\Tim\u2019s\\py thon.exe", "-m", "claude_hr.ctl", "update", "--post"],
+    )
+    ps1 = tmp_path / "helper.ps1"
+    ps1.write_bytes(b"\xef\xbb\xbf" + script.encode("utf-8"))
+    check = (
+        "$e = $null; $t = $null; [void][System.Management.Automation.Language.Parser]::ParseFile("
+        f"'{ps1}', [ref]$t, [ref]$e); if ($e.Count -eq 0) {{ 'PARSE_OK' }} else {{ $e | ForEach-Object {{ $_.Message }} }}"
+    )
+    out = subprocess.run(
+        [shell, "-NoProfile", "-NonInteractive", "-Command", check],
+        capture_output=True,
+        text=True,
+        timeout=60,
+    ).stdout
+    assert "PARSE_OK" in out, out
+
+
+def test_the_posix_wrapper_quotes_every_argument_and_runs_post_second():
+    cmd = ["/opt/my tools/uv", "tool", "install", "/home/o'neil/.claude-hr/repo"]
+    post = ["/usr/bin/python 3", "-m", "claude_hr.ctl", "update", "--post"]
+    chained = updater._posix_chain(cmd, post)
+    assert chained[:2] == ["/bin/sh", "-c"] and len(chained) == 3
+    script = chained[2]
+    assert shlex.join(cmd) in script and shlex.join(post) in script
+    assert script.index(shlex.join(cmd)) < script.index(shlex.join(post))
+    assert (
+        "$" not in script and "%" not in script
+    )  # systemd would expand them in a unit's command line
+
+
+@pytest.mark.skipif(os.name == "nt" or not os.path.exists("/bin/sh"), reason="needs a POSIX sh")
+def test_the_posix_wrapper_really_runs_post_only_when_the_reinstall_succeeded(tmp_path):
+    work = tmp_path / "o'neil dir"
+    work.mkdir()
+    out = work / "out.txt"
+
+    def run(code):
+        out.unlink(missing_ok=True)
+        reinstall = [
+            sys.executable,
+            "-c",
+            "import sys; open(sys.argv[1], 'a').write('reinstall ' + sys.argv[2] + chr(10)); sys.exit(int(sys.argv[2]))",
+            str(out),
+            str(code),
+        ]
+        post = [
+            sys.executable,
+            "-c",
+            "import sys; open(sys.argv[1], 'a').write('post' + chr(10))",
+            str(out),
+        ]
+        proc = subprocess.run(updater._posix_chain(reinstall, post), capture_output=True, text=True)
+        return proc.returncode, out.read_text(encoding="utf-8").split(chr(10))[:-1]
+
+    assert run(0) == (0, ["reinstall 0", "post"])
+    rc, ran = run(3)
+    assert rc != 0 and ran == [
+        "reinstall 3"
+    ]  # the post phase never ran, and the unit reports the failure
+
+
+def test_the_reinstall_carries_the_post_phase_on_both_posix_routes_and_in_the_windows_script(
+    sandbox, monkeypatch
+):
+    started, spawned = [], []
+    monkeypatch.setattr(updater.paths, "IS_WINDOWS", False)
+    monkeypatch.setattr(
+        updater, "_start_systemd_service", lambda cmd, log: started.append(cmd) or True
+    )
+    monkeypatch.setattr(updater, "_spawn_detached", lambda cmd, log=None: spawned.append(cmd))
+    u = updater.Updater(config.load())
+    u._pending_reinstall = ["uv", "tool", "install"]
+    u._launch_reinstall(post=POST)
+    assert started == [updater._posix_chain(["uv", "tool", "install"], POST)] and spawned == []
+    monkeypatch.setattr(updater, "_start_systemd_service", lambda cmd, log: False)
+    u._pending_reinstall = ["uv", "tool", "install"]
+    u._launch_reinstall(post=POST)
+    assert spawned == [updater._posix_chain(["uv", "tool", "install"], POST)]
+    u._pending_reinstall = ["uv", "tool", "install"]
+    u._launch_reinstall()  # no post phase asked for: the reinstall alone, as before
+    assert spawned[-1] == ["uv", "tool", "install"]
+    # Windows: the scheduled-task helper's script
+    scripts = []
+    monkeypatch.setattr(updater.paths, "IS_WINDOWS", True)
+    monkeypatch.setattr(updater.procutil, "which_all", lambda name: [r"C:\Windows\powershell.exe"])
+    monkeypatch.setattr(
+        updater,
+        "_start_helper_task",
+        lambda shell, ps1: scripts.append(ps1.read_text("utf-8-sig")) or True,
+    )
+    u._pending_reinstall = ["uv", "tool", "install"]
+    u._launch_reinstall(post=POST)
+    assert "'--post'" in scripts[0] and scripts[0].index("$rc -eq 0") < scripts[0].index("'--post'")
+
+
+def test_the_post_command_is_the_console_interpreter_of_this_env_and_carries_the_flags(
+    sandbox, monkeypatch
+):
+    cfg = config.load()
+    cmd = updater.Updater(cfg)._post_command()
+    assert cmd[1:] == ["-m", "claude_hr.ctl", "update", "--post"]
+    cmd = updater.Updater(cfg, restart=False, force=True)._post_command()
+    assert cmd[-2:] == ["--no-restart", "--force"]
+    # the scheduled jobs run under pythonw.exe, whose output would vanish: the helper gets python.exe instead
+    exe_dir = Path(sandbox) / "env"
+    exe_dir.mkdir()
+    (exe_dir / "python.exe").write_bytes(b"")
+    monkeypatch.setattr(updater.sys, "executable", str(exe_dir / "pythonw.exe"))
+    assert updater._console_python() == str(exe_dir / "python.exe")
+
+
+def test_a_queued_self_update_leaves_the_post_steps_to_the_helper_and_says_so(sandbox, monkeypatch):
+    from claude_hr import paths
+
+    events, launched = [], []
+    u = _spied(monkeypatch, events)
+
+    def queue():
+        events.append("self")
+        u._pending_reinstall = ["uv", "tool", "install"]
+        return updater.Result("self", "v0.2.2", "v0.2.3", action="updated")
+
+    monkeypatch.setattr(u, "update_self", queue)
+    monkeypatch.setattr(u, "_launch_reinstall", lambda post=None: launched.append(post))
+    rep = u.run()
+    assert events == [
+        "self",
+        "claude",
+        "headroom",
+        "plugins",
+    ]  # baseline and proxy need the NEW code
+    assert launched and launched[0][-3:] == ["claude_hr.ctl", "update", "--post"]
+    rec = updater.read_last()
+    assert rec["phase"] == "pending" and rec["post"] == {
+        "steps": ["baseline", "proxy"],
+        "doctor": True,
+    }
+    assert [r["component"] for r in rec["results"]] == ["self", "claude", "headroom", "plugins"]
+    log = str(paths.logs_dir() / "self-update.log")
+    assert rep.background == log
+    text = "\n".join(updater.format_report(rep))
+    assert (
+        f"claude-hr itself is updating in the background; the rest finishes there: see {log}; "
+        "claude-hr-ctl status shows the result" in text
+    )
+    assert "Everything is up to date." not in text
+    row = next(ln for ln in text.splitlines() if ln.startswith("self "))
+    assert "updated, finishing in the background" in row
+    # `--only self` still chains the helper (to finish the record) with no post steps and no doctor run
+    events.clear()
+    u.run(["self"])
+    assert updater.read_last()["post"] == {"steps": [], "doctor": False}
+
+
+def test_the_post_phase_continues_the_run_that_queued_the_reinstall(sandbox, monkeypatch):
+    from claude_hr import __version__
+
+    events, launched = [], []
+    u = _spied(monkeypatch, events)
+    monkeypatch.setattr(
+        u,
+        "update_self",
+        lambda: (
+            setattr(u, "_pending_reinstall", ["uv"])
+            or updater.Result("self", "v0.2.2", "v0.2.3", action="updated")
+        ),
+    )
+    monkeypatch.setattr(u, "_launch_reinstall", lambda post=None: launched.append(post))
+    u.run()
+    # ... in the new process, after the reinstall: `update --post`
+    from claude_hr import doctor
+
+    monkeypatch.setattr(
+        doctor,
+        "run",
+        lambda cfg, cwd, deep=False: [
+            Check("a", INFO, "fine"),
+            Check("b", WARN, "slow"),
+            Check("c", FAIL, "broken"),
+        ],
+    )
+    events2 = []
+    u2 = _spied(monkeypatch, events2)
+    rep = u2.run_post()
+    assert events2 == ["baseline", "proxy"]  # exactly the post steps, nothing of phase A again
+    assert [r.component for r in rep.results] == [
+        "self",
+        "claude",
+        "headroom",
+        "plugins",
+        "baseline",
+        "proxy",
+    ]
+    assert rep.results[0].detail == f"reinstalled: claude-hr {__version__} is running"
+    rec = updater.read_last()
+    assert rec["phase"] == "complete" and rec["versions"]["claude-hr"] == __version__
+    assert rec["doctor"] == {"warn": 1, "fail": 1, "first": ["FAIL c: broken", "WARN b: slow"]}
+    assert [r["component"] for r in rec["results"]][-2:] == ["baseline", "proxy"]
+    assert "doctor: 1 warning(s), 1 failure(s)" in "\n".join(updater.format_report(rep))
+    assert "post" not in rec
+    assert "claude-hr itself is updating" not in "\n".join(updater.format_report(rep))
+
+
+def test_update_post_runs_the_post_steps_through_the_command_and_survives_a_missing_record(
+    sandbox, monkeypatch, capsys
+):
+    from claude_hr import ctl
+
+    events = []
+    monkeypatch.setattr(updater.Updater, "reapply_baseline", lambda self: events.append("baseline"))
+    monkeypatch.setattr(
+        updater.Updater,
+        "update_proxy",
+        lambda self: events.append("proxy") or updater.Result("proxy"),
+    )
+    assert ctl._run(["update", "--post"]) == 0
+    assert events == ["baseline", "proxy"]  # no record of a pending run: the full post phase
+    rec = updater.read_last()
+    assert rec["phase"] == "complete" and rec["doctor"] == {"warn": 0, "fail": 0, "first": []}
+    assert "doctor: no warnings, no failures" in capsys.readouterr().out
+    # a record of a run that never finished long ago is not continued
+    rec.update(
+        phase="pending",
+        ts=1.0,
+        post={"steps": [], "doctor": False},
+        results=[{"component": "self"}],
+    )
+    updater.write_json(updater.paths.state_dir() / "update-last.json", rec)
+    events.clear()
+    assert ctl._run(["update", "--post"]) == 0
+    assert events == ["baseline", "proxy"]
+    # ... nor one whose time somebody edited into something that is not a number
+    rec.update(phase="pending", ts="yesterday", post={"steps": [], "doctor": False})
+    updater.write_json(updater.paths.state_dir() / "update-last.json", rec)
+    events.clear()
+    assert ctl._run(["update", "--post"]) == 0
+    assert events == ["baseline", "proxy"]
+
+
+def test_status_reads_the_record_of_the_last_run(sandbox, monkeypatch):
+    import claude_hr
+
+    events = []
+    u = _spied(monkeypatch, events)
+    assert updater.last_update_summary() is None
+    u.run()
+    line = updater.last_update_summary()
+    assert line and "nothing to update" in line and "doctor 0 warning(s), 0 failure(s)" in line
+    u = _spied(
+        monkeypatch,
+        events,
+        claude=updater.Result("claude", "2.1.1", "2.1.2", action="updated"),
+        headroom=updater.Result(
+            "headroom", "0.41.0", "0.40.0", action="none"
+        ),  # held: stays on 0.41.0
+    )
+    u.run()
+    assert "updated claude 2.1.1 -> 2.1.2" in updater.last_update_summary()
+    versions = updater.read_last()["versions"]
+    assert versions == {"claude-hr": claude_hr.__version__, "claude": "2.1.2", "headroom": "0.41.0"}
+    # a pending record: still going, then given up on
+    rec = updater.read_last()
+    rec.update(phase="pending", ts=__import__("time").time())
+    updater.write_json(updater.paths.state_dir() / "update-last.json", rec)
+    assert "updating in the background" in updater.last_update_summary()
+    rec["ts"] = 1.0
+    updater.write_json(updater.paths.state_dir() / "update-last.json", rec)
+    assert "did not finish" in updater.last_update_summary()
+
+
+# ---- the proxy step ----------------------------------------------------------------------------------------------------
+class _ProxyWorld:
+    state = "changed"
+    running = True
+
+    def __init__(self):
+        self.events = []
+
+
+@pytest.fixture
+def proxy(sandbox, monkeypatch):
+    """A Headroom whose proxy runs with the settings state a test sets; stop and ensure only record what was asked."""
+    from claude_hr.headroom import Headroom, Health
+
+    w = _ProxyWorld()
+    monkeypatch.setattr(Headroom, "binary", lambda self: Path("/fake/headroom"))
+    monkeypatch.setattr(Headroom, "settings_state", lambda self: w.state)
+    monkeypatch.setattr(
+        Headroom,
+        "health_patient",
+        lambda self, patience_s=4.0: Health(
+            w.running, "healthy" if w.running else "down", "0.41.0"
+        ),
+    )
+    monkeypatch.setattr(Headroom, "stop", lambda self: w.events.append("stop") or True)
+    monkeypatch.setattr(
+        Headroom,
+        "ensure",
+        lambda self, wait_s=0.0, announce=None: (
+            w.events.append(f"ensure:{wait_s:g}") or Health(True, "healthy", "0.41.0")
+        ),
+    )
+    return w
+
+
+def test_the_proxy_is_restarted_when_it_runs_stale_settings_and_no_session_runs(proxy):
+    res = updater.Updater(config.load()).update_proxy()
+    assert res.action == "updated" and "restarted" in res.detail
+    assert "other settings than the configuration asks for now" in res.detail
+    assert proxy.events == [
+        "stop",
+        "ensure:90",
+    ]  # waits for it: a restart that never came up must be seen
+    proxy.state, proxy.events[:] = "older", []
+    res = updater.Updater(config.load()).update_proxy()
+    assert res.action == "updated" and "older claude-hr" in res.detail
+
+
+@pytest.mark.parametrize("state", ["current", "unknown"])
+def test_a_proxy_with_current_or_unrecorded_settings_is_left_alone(proxy, state):
+    proxy.state = state
+    res = updater.Updater(config.load()).update_proxy()
+    assert (
+        res.action == "none" and proxy.events == []
+    )  # a proxy somebody else started is not judged
+
+
+def test_the_proxy_waits_while_a_claude_hr_session_runs_unless_forced(proxy):
+    resources.register_session(os.getpid(), "/x")
+    try:
+        res = updater.Updater(config.load()).update_proxy()
+        assert (
+            res.action == "deferred" and res.busy and "1 claude-hr session(s) running" in res.detail
+        )
+        assert proxy.events == []
+        assert updater.Report(results=[res]).exit_code() == updater.EXIT_DEFERRED
+        res = updater.Updater(config.load(), force=True).update_proxy()
+        assert res.action == "updated" and proxy.events == ["stop", "ensure:90"]
+    finally:
+        resources.unregister_session(os.getpid())
+
+
+def test_no_restart_keeps_the_proxy_running_and_says_what_is_left(proxy):
+    res = updater.Updater(config.load(), restart=False).update_proxy()
+    assert res.action == "deferred" and not res.busy and "--no-restart" in res.detail
+    assert proxy.events == []
+    rep = updater.Report(results=[res])
+    assert rep.exit_code() == 0 and "needs a restart" in "\n".join(updater.format_report(rep))
+
+
+def test_a_proxy_that_is_not_running_or_a_preview_is_never_restarted(proxy):
+    proxy.running = False
+    res = updater.Updater(config.load()).update_proxy()
+    assert res.action == "none" and "not running" in res.detail and proxy.events == []
+    proxy.running = True
+    res = updater.Updater(config.load(), dry=True).update_proxy()
+    assert res.action == "available" and res.detail.startswith("would restart: ")
+    assert proxy.events == []
+
+
+def test_a_headroom_upgrade_counts_unless_that_run_already_restarted_the_proxy(proxy):
+    proxy.state = "current"
+    u = updater.Updater(config.load())
+    u.headroom_upgraded = True
+    res = u.update_proxy()
+    assert res.action == "updated" and "Headroom was upgraded" in res.detail
+    u = updater.Updater(config.load())
+    u.headroom_upgraded = u.proxy_restarted = True
+    proxy.events.clear()
+    res = u.update_proxy()
+    assert res.action == "none" and proxy.events == []
+
+
+def test_update_headroom_remembers_that_it_upgraded_and_restarted_the_proxy(sandbox, monkeypatch):
+    from claude_hr.headroom import Headroom
+
+    state = {"v": "0.40.0"}
+    _patch_headroom(monkeypatch, state)
+    monkeypatch.setattr(
+        Headroom, "latest_version", lambda self, timeout=15.0, cooldown_days=0.0: "0.40.1"
+    )
+
+    def fake_install(self, version=None, upgrade=True, exclude_newer=None):
+        state["v"] = version
+        return subprocess.CompletedProcess([], 0, "", "")
+
+    monkeypatch.setattr(Headroom, "install", fake_install)
+    monkeypatch.setattr(updater.Updater, "smoke_headroom", lambda self, wait_s=150.0: True)
+    u = updater.Updater(config.load())
+    assert u.update_headroom().action == "updated"
+    assert u.headroom_upgraded and u.proxy_restarted
+
+
+def test_a_disabled_headroom_has_no_proxy_step(sandbox, monkeypatch):
+    monkeypatch.setenv("CLAUDE_HR_HEADROOM__ENABLED", "false")
+    res = updater.Updater(config.load()).update_proxy()
+    assert res.action == "none" and res.state == "skipped"
+
+
+# ---- channel, versions and reasons in the report ----------------------------------------------------------------------
+def test_a_newer_install_than_the_channel_offers_names_the_channel_and_the_way_to_follow_the_newest(
+    sandbox, monkeypatch
+):
+    u = make(sandbox, monkeypatch, current="2.1.301", target="2.1.292")
+    res = u.update_claude()
+    assert res.action == "none" and res.state == "held"
+    assert res.detail == (
+        "installed 2.1.301 is newer than channel stable (2.1.292): not downgrading; "
+        'set claude.channel = "latest" to follow the newest'
+    )
+    monkeypatch.setenv(
+        "CLAUDE_HR_CLAUDE__CHANNEL", "latest"
+    )  # on latest there is nothing to switch to
+    res = make(sandbox, monkeypatch, current="2.1.301", target="2.1.292").update_claude()
+    assert res.detail == "installed 2.1.301 is newer than channel latest (2.1.292): not downgrading"
+
+
+def test_a_preview_names_the_channel_what_it_offers_and_what_would_hold_it_up(sandbox, monkeypatch):
+    monkeypatch.setenv("CLAUDE_HR_CLAUDE__CHANNEL", "latest")
+    u = make(sandbox, monkeypatch, current="2.1.301", target="2.1.302", dry=True)
+    res = u.update_claude()
+    assert res.action == "available"
+    assert res.detail == "Claude Code 2.1.301 -> channel latest offers 2.1.302"
+    assert u.header == ['Claude Code channel: latest (claude.channel = "latest")']
+    resources.register_session(os.getpid(), "/x")
+    try:
+        res = make(
+            sandbox, monkeypatch, current="2.1.301", target="2.1.302", dry=True
+        ).update_claude()
+    finally:
+        resources.unregister_session(os.getpid())
+    assert res.detail.endswith("; it would wait now: 1 claude-hr session(s) running")
+
+
+def test_a_pinned_claude_is_reported_as_pinned_not_as_a_channel(sandbox, monkeypatch):
+    monkeypatch.setenv("CLAUDE_HR_CLAUDE__PIN", "2.1.292")
+    u = make(sandbox, monkeypatch, current="2.1.301", target="2.1.292", dry=True)
+    res = u.update_claude()
+    assert res.detail == "Claude Code 2.1.301 -> claude.pin holds 2.1.292"
+    assert u.header == ["Claude Code is pinned to 2.1.292 (claude.pin)"]
+
+
+@pytest.mark.parametrize(
+    "settings,configured,channel",
+    [
+        (None, None, "stable"),  # auto, nothing set: stable
+        ({"autoUpdatesChannel": "latest"}, None, "latest"),  # auto follows the user's own setting
+        (
+            {"autoUpdatesChannel": "latest"},
+            "stable",
+            "stable",
+        ),  # an explicit channel is used as written
+        ({"autoUpdatesChannel": "beta"}, None, "stable"),  # not a channel claude-hr knows
+        ({"autoUpdatesChannel": "stable"}, "latest", "latest"),
+    ],
+)
+def test_claude_target_reads_the_release_file_of_the_channel_in_force(
+    sandbox, monkeypatch, settings, configured, channel
+):
+    import urllib.request
+
+    from claude_hr import paths
+
+    if settings is not None:
+        paths.claude_settings().write_text(json.dumps(settings), encoding="utf-8")
+    if configured:
+        monkeypatch.setenv("CLAUDE_HR_CLAUDE__CHANNEL", configured)
+    urls = []
+
+    class Resp:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def read(self):
+            return b"2.1.302\n"
+
+    monkeypatch.setattr(
+        urllib.request, "urlopen", lambda url, timeout=0: urls.append(url) or Resp()
+    )
+    assert updater.Updater(config.load()).claude_target() == "2.1.302"
+    assert urls == [f"{updater.CLAUDE_RELEASES}/{channel}"]
+
+
+def _pypi(monkeypatch, releases):
+    monkeypatch.setattr(
+        updater.procutil,
+        "http_json",
+        lambda *a, **k: (200, {"releases": releases, "info": {"version": "0.41.0"}}),
+    )
+
+
+def test_a_newer_headroom_than_the_cooldown_allows_says_so_and_when_the_cooldown_ends(
+    sandbox, monkeypatch
+):
+    from claude_hr.headroom import Headroom
+
+    now = __import__("time").time()
+    _pypi(monkeypatch, {"0.40.0": rel(8, now), "0.41.0": rel(2.5, now)})
+    _patch_headroom(monkeypatch, {"v": "0.41.0"})
+    monkeypatch.setattr(
+        Headroom, "latest_version", lambda self, timeout=15.0, cooldown_days=0.0: "0.40.0"
+    )
+    res = updater.Updater(config.load()).update_headroom()
+    assert res.action == "none" and res.state == "held"
+    assert res.detail.startswith(
+        "installed 0.41.0 is newer than the cooldown-eligible 0.40.0: not downgrading (0.41.0 came out "
+    )
+    assert "; the 5-day cooldown ends " in res.detail
+    # a preview of an up-to-date Headroom still says what is held back by the cooldown
+    _pypi(monkeypatch, {"0.40.0": rel(8, now), "0.42.0": rel(1, now)})
+    _patch_headroom(monkeypatch, {"v": "0.40.0"})
+    res = updater.Updater(config.load(), dry=True).update_headroom()
+    assert res.action == "none" and res.detail.startswith("0.42.0 came out ")
+    assert "the 5-day cooldown ends " in res.detail
+    # ... and says nothing once the cooldown is over
+    _pypi(monkeypatch, {"0.40.0": rel(8, now), "0.42.0": rel(6, now)})
+    assert updater.Updater(config.load(), dry=True).update_headroom().detail == ""
+
+
+def test_a_headroom_preview_names_the_release_it_would_install(sandbox, monkeypatch):
+    from claude_hr.headroom import Headroom
+
+    _patch_headroom(monkeypatch, {"v": "0.40.0"})
+    monkeypatch.setattr(
+        Headroom, "latest_version", lambda self, timeout=15.0, cooldown_days=0.0: "0.40.1"
+    )
+    res = updater.Updater(config.load(), dry=True).update_headroom()
+    assert res.action == "available"
+    assert res.detail == "Headroom 0.40.0 -> 0.40.1 (newest release past the cooldown)"
+
+
+# ---- the plugins step -------------------------------------------------------------------------------------------------
+INSTALLED = [
+    {"id": "a@m", "scope": "user", "version": "1.0.0"},
+    {"id": "b@m", "scope": "user", "version": "2.0.0"},
+    {"id": "c@m", "scope": "project", "version": "0.1.0"},
+    {"id": "d@m", "scope": "user", "version": "ea10b213686c"},
+    {"id": "e@m", "scope": "user", "version": "6.4.2-8ca22dba9a94"},
+]
+AVAILABLE = [
+    {"pluginId": "a@m", "version": "1.1.0"},
+    {"pluginId": "b@m", "version": "2.0.0"},
+    {"pluginId": "c@m", "version": "9.9.9"},
+    {"pluginId": "d@m", "version": "ea10b213686c"},
+    {"pluginId": "e@m", "version": "6.4.2"},
+    {"pluginId": "f@m", "version": "1.0.0"},
+]
+
+
+def _fake_plugin_cli(monkeypatch, installed=None, available=None, available_rc=0, update_rc=0):
+    from claude_hr import claude_setup
+
+    calls = []
+
+    def fake(self, *args, timeout=120):
+        calls.append(args)
+        if args == ("plugin", "list", "--json", "--available"):
+            body = json.dumps({"installed": installed or [], "available": available or []})
+            return subprocess.CompletedProcess(
+                args, available_rc, body if not available_rc else "", ""
+            )
+        if args[:3] == ("plugin", "list", "--json"):
+            return subprocess.CompletedProcess(args, 0, json.dumps(installed or []), "")
+        if args[:2] == ("plugin", "update"):
+            return subprocess.CompletedProcess(
+                args, update_rc, "", "needs confirmation" if update_rc else ""
+            )
+        return subprocess.CompletedProcess(args, 0, "refreshed", "")
+
+    monkeypatch.setattr(claude_setup.ClaudeSetup, "_claude", fake)
+    return calls
+
+
+def test_the_plugin_preview_lists_user_scope_plugins_the_catalogs_have_a_newer_version_of(
+    sandbox, monkeypatch
+):
+    calls = _fake_plugin_cli(monkeypatch, INSTALLED, AVAILABLE)
+    u = updater.Updater(config.load(), dry=True)
+    u.claude = Path("/fake/claude")
+    res = u.update_plugins()
+    assert res.action == "available"
+    # a project-scope plugin, an equal version, a commit-hash version and a build suffix are not "newer"
+    assert res.detail == "newer in the catalogs claude has: a@m 1.0.0 -> 1.1.0"
+    assert calls == [
+        ("plugin", "list", "--json", "--available")
+    ]  # one read-only question, nothing else
+
+
+def test_the_plugin_preview_says_so_when_claude_cannot_tell(sandbox, monkeypatch):
+    calls = _fake_plugin_cli(monkeypatch, INSTALLED, AVAILABLE, available_rc=1)
+    u = updater.Updater(config.load(), dry=True)
+    u.claude = Path("/fake/claude")
+    res = u.update_plugins()
+    assert res.action == "none" and res.state == "not checked"
+    assert res.detail == "checked when you run update"
+    assert all(c[:3] == ("plugin", "list", "--json") for c in calls)
+
+
+def test_a_plugin_that_wants_a_confirmation_is_reported_for_the_person_not_answered(
+    sandbox, monkeypatch
+):
+    calls = _fake_plugin_cli(monkeypatch, INSTALLED[:1], update_rc=1)
+    u = updater.Updater(config.load())
+    u.claude = Path("/fake/claude")
+    res = u.update_plugins()
+    assert ("plugin", "update", "a@m", "--scope", "user") in calls
+    assert all("-y" not in c and "--yes" not in c for c in calls)
+    assert res.detail == "nothing was updated"
+    assert "run `claude plugin update a@m --scope user` yourself" in res.pending
+    rep = updater.Report(results=[res])
+    text = "\n".join(updater.format_report(rep))
+    assert "Pending:" in text and "  plugins: a@m was not updated (needs confirmation)" in text
+    assert rep.exit_code() == 0  # asking the person is not a failure
+
+
+# ---- Claude Code processes claude-hr did not start --------------------------------------------------------------------
+def test_the_report_says_when_claude_code_processes_run_that_claude_hr_did_not_start(
+    sandbox, monkeypatch
+):
+    me = os.getpid()
+    table = {
+        8000: (1, "claude.exe"),  # a plain `claude` somebody typed
+        8001: (1, "claude"),
+        me: (7000, "claude.exe"),  # a claude-hr session (registered) ...
+        7000: (6000, "claude.exe"),  # ... under the thin launcher Windows keeps above it
+        7001: (me, "claude.exe"),  # ... and one it started itself
+        9000: (1, "node.exe"),  # not Claude Code
+    }
+    monkeypatch.setattr(updater.sysinfo, "process_table", lambda: table)
+    resources.register_session(me, "/x")
+    try:
+        assert updater.unmanaged_claude_processes() == [8000, 8001]
+        rep = _spied(monkeypatch, []).run(["proxy"])
+    finally:
+        resources.unregister_session(me)
+    assert rep.notes == [
+        "2 Claude Code process(es) not started by claude-hr are running; they are unaffected by a proxy restart "
+        "(they do not use it) and the updated claude takes effect when they restart"
+    ]
+    assert "INFO: 2 Claude Code process(es) not started by claude-hr" in "\n".join(
+        updater.format_report(rep)
+    )
+    monkeypatch.setattr(updater.sysinfo, "process_table", lambda: {})
+    assert _spied(monkeypatch, []).run(["proxy"]).notes == []
+
+
+def test_a_process_scan_that_fails_is_no_news_and_no_error(sandbox, monkeypatch):
+    def boom():
+        raise OSError("no snapshot")
+
+    monkeypatch.setattr(updater.sysinfo, "process_table", boom)
+    assert updater.unmanaged_claude_processes() == []
+
+
+def test_the_session_guard_itself_still_counts_only_registered_sessions(sandbox, monkeypatch):
+    """A plain claude is reported (INFO), not a reason to wait: otherwise a person who keeps a session open for days would
+    never be updated."""
+    monkeypatch.setattr(updater.sysinfo, "process_table", lambda: {8000: (1, "claude.exe")})
+    u = updater.Updater(config.load())
+    u.claude = None
+    assert u._busy() == ""
+
+
+def test_status_shows_the_last_update_line(sandbox, monkeypatch, capsys):
+    """`claude-hr-ctl status` is where the background self-update message sends the person to see the result."""
+    from claude_hr import ctl
+    from claude_hr.headroom import Headroom, Health
+
+    monkeypatch.setattr(
+        ctl.monitor,
+        "snapshot",
+        lambda cfg: {
+            "sessions": 0,
+            "session_limit": 3,
+            "ram_free_gb": 8,
+            "ram_total_gb": 16,
+            "disk_free_gb": 100,
+        },
+    )
+    monkeypatch.setattr(
+        Headroom, "health_patient", lambda self, patience_s=4.0: Health(False, "down")
+    )
+    assert ctl._run(["status"]) == 0
+    assert "Last update" not in capsys.readouterr().out
+    _spied(
+        monkeypatch, [], claude=updater.Result("claude", "2.1.1", "2.1.2", action="updated")
+    ).run()
+    assert ctl._run(["status"]) == 0
+    out = capsys.readouterr().out
+    assert "  Last update: " in out and "updated claude 2.1.1 -> 2.1.2" in out
+
+
+def test_a_real_self_update_queues_the_reinstall_with_the_post_phase_behind_it(
+    managed_repo, monkeypatch
+):
+    """update_self for real (a throwaway git origin with a newer tag), the helper replaced by a recorder: the reinstall
+    first, the post phase behind it, in whatever form this platform starts the helper."""
+    origin, work, managed = managed_repo
+    _release_v020(work)
+    _stub_uv(monkeypatch)
+    started = []
+    monkeypatch.setattr(updater, "_start_systemd_service", lambda cmd, log: False)
+    monkeypatch.setattr(
+        updater, "_spawn_detached", lambda cmd, log=None: started.append(" ".join(cmd))
+    )
+    monkeypatch.setattr(
+        updater,
+        "_start_helper_task",
+        lambda shell, ps1: started.append(ps1.read_text(encoding="utf-8-sig")) or True,
+    )
+    rep = updater.Updater(config.load()).run(["self"])
+    assert [(r.component, r.action, r.target) for r in rep.results] == [
+        ("self", "updated", "v0.2.0")
+    ]
+    assert len(started) == 1
+    helper = started[0]
+    assert "tool install --python 3.13 --force --reinstall" in helper.replace("'", "").replace(
+        '"', ""
+    )
+    assert helper.index("--reinstall") < helper.index(
+        "claude_hr.ctl"
+    )  # the post phase comes after the reinstall
+    assert "--post" in helper
+    assert updater.read_last()["phase"] == "pending"

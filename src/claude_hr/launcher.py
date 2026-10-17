@@ -11,7 +11,8 @@ claude-hr-only switches (stripped before Claude sees the args):
     --hr-force       ignore the RAM / session limits    --hr-no-limits no admission/limits
     --hr-dry-run     print the plan and exit            --hr-verbose   explain decisions on stderr
     --hr-wait N      seconds to wait for a cold proxy
-Management lives in `claude-hr ctl ...` (same as the `claude-hr-ctl` command).
+Management lives in `claude-hr ctl ...` (same as the `claude-hr-ctl` command). `claude-hr update` updates the whole setup (same
+as `claude-hr-ctl update`); `claude-hr update --claude-only` is Claude Code's own `claude update`.
 
 All claude-hr chatter goes to stderr so `-p --output-format json` pipelines stay clean. The one thing that ever asks a
 question is the one-time offer of the end-of-turn test gate (gate_offer.py): only for a plain interactive session with a
@@ -394,6 +395,30 @@ def _prepare_daemon(cfg, claude: Path, proxy_url: str, verbose: bool) -> None:
 
 
 # ---------------------------------------------------------------------------------------------
+def _update_everything(rest: list[str], opts: dict) -> int:
+    """`claude-hr update [...]`: the update command of claude-hr-ctl. Imported here and only here: the update machinery costs
+    ~170 ms to import, and a plain `claude-hr` launch must not pay it."""
+    if opts.get("dry-run"):
+        _say(
+            "plan: kind=update; claude-hr, Claude Code, Headroom, plugins, then the settings baseline, "
+            "a proxy restart if it is idle and stale, a health verdict"
+        )
+        _say("command: claude-hr-ctl update " + " ".join(rest))
+        return 0
+    try:
+        from . import ctl
+
+        return ctl.update_main(rest, prog="claude-hr update")
+    except KeyboardInterrupt:
+        return 130
+    except Exception as exc:  # noqa: BLE001 - say what is left, never a traceback
+        _say(
+            f"claude-hr update failed ({type(exc).__name__}: {exc}). "
+            "Claude Code's own updater is still available: claude-hr update --claude-only"
+        )
+        return 1
+
+
 def main(argv: list[str] | None = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
     if argv and argv[0] == "ctl":
@@ -427,6 +452,15 @@ def main(argv: list[str] | None = None) -> int:
 
             return subprocess.call([str(real), *args])
         os.execv(str(real), [str(real), *args])
+
+    if args[:1] in (["update"], ["upgrade"]):
+        # `claude-hr update` is "update everything" (claude-hr, Claude Code, Headroom, plugins ...), not Claude's own updater.
+        # Only a command a person typed gets here: whatever Claude spawns itself (CLAUDE_HR_SESSION, above) passes straight
+        # through. `--claude-only` is the old meaning: Claude Code's `claude update`, without any claude-hr staging.
+        if "--claude-only" in args[1:]:
+            args = [args[0], *(a for a in args[1:] if a != "--claude-only")]
+        else:
+            return _update_everything(args[1:], opts)
 
     verbose = bool(opts.get("verbose")) or os.environ.get("CLAUDE_HR_VERBOSE") == "1"
     real = _absolute(procutil.find_claude(_configured_binary()))
