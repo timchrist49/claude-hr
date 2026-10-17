@@ -310,13 +310,13 @@ class Headroom:
         try:
             if paths.IS_WINDOWS:
                 flags = (
-                    getattr(subprocess, "DETACHED_PROCESS", 0x8)
-                    | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x200)
-                    | getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
-                )
+                    procutil.windows_background_flags()
+                )  # no window, ever: see there for why not DETACHED_PROCESS
                 try:
                     proc = subprocess.Popen(
-                        [str(b), *self.proxy_args()], creationflags=flags | 0x01000000, **kwargs
+                        [str(b), *self.proxy_args()],
+                        creationflags=flags | procutil.CREATE_BREAKAWAY_FROM_JOB,
+                        **kwargs,
                     )
                 except OSError:  # CREATE_BREAKAWAY_FROM_JOB not permitted by the parent job
                     proc = subprocess.Popen(

@@ -36,7 +36,10 @@ Check "claude-hr / claude-hr-ctl / claude-hr-hook installed" ((Test-Path "$sb\to
 Check "headroom installed" ((headroom --version 2>&1) -match '0\.\d+\.\d+')
 
 "== 2. proxy =="
-$h = claude-hr-ctl headroom start --wait 300 2>&1 | Out-String
+# the proxy is started through Headroom.start() under a watch for new console windows (0.2.1 opened an empty terminal window)
+$probe = & "$sb\tooldir\claude-hr\Scripts\python.exe" "$repo\tests\windows\proxy_window_probe.py" --keep --watch 300 2>&1 | Out-String
+Check "starting the proxy opens no console window, and it comes up healthy" ($LASTEXITCODE -eq 0) $probe
+$h = claude-hr-ctl headroom start --wait 60 2>&1 | Out-String
 Check "proxy healthy" ($h -match 'healthy') $h
 Check "compression smoke test" ((claude-hr-ctl headroom bench --wait 120 2>&1 | Out-String) -match 'PASS')
 

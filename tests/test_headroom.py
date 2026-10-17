@@ -172,6 +172,37 @@ def test_start_records_a_hash_of_the_settings_it_used(spawn):
     assert cmd[1:] == h.proxy_args()  # what is hashed is what was spawned
 
 
+def test_start_on_windows_asks_for_no_window_and_never_detaches(spawn, monkeypatch):
+    """DETACHED_PROCESS overrides CREATE_NO_WINDOW: uv's headroom.exe trampoline then has no console, the python.exe it starts
+    gets a NEW visible one (an empty Windows Terminal tab titled with the path of headroom.exe), and closing it kills the proxy."""
+    monkeypatch.setattr(headroom.paths, "IS_WINDOWS", True)
+    assert hr().start() is not None
+    flags = spawn[0][1]["creationflags"]
+    assert flags & 0x08000000, "CREATE_NO_WINDOW"
+    assert flags & 0x00000200, "CREATE_NEW_PROCESS_GROUP"
+    assert flags & 0x01000000, "CREATE_BREAKAWAY_FROM_JOB is tried first"
+    assert not flags & 0x00000008, "DETACHED_PROCESS must never be set"
+
+
+def test_start_on_windows_falls_back_without_breakaway_but_still_without_a_window(
+    sandbox, full, monkeypatch
+):
+    monkeypatch.setattr(Headroom, "binary", lambda self: Path("/fake/headroom"))
+    monkeypatch.setattr(headroom.paths, "IS_WINDOWS", True)
+    calls = []
+
+    def popen(cmd, **kwargs):
+        calls.append(kwargs["creationflags"])
+        if len(calls) == 1:
+            raise OSError("the parent job does not allow breakaway")
+        return FakeProc()
+
+    monkeypatch.setattr(headroom.subprocess, "Popen", popen)
+    assert hr().start() is not None
+    assert len(calls) == 2 and calls[0] & 0x01000000 and not calls[1] & 0x01000000
+    assert all(c & 0x08000000 and not c & 0x00000008 for c in calls)
+
+
 @pytest.mark.parametrize(
     "name, value",
     [

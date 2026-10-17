@@ -512,7 +512,11 @@ def test_detached_helper_breaks_away_from_the_trampoline_job_and_logs(
     log = tmp_path / "self-update.log"
     updater._spawn_detached(["powershell", "-File", "x"], log)
     assert calls[0][1]["creationflags"] & 0x01000000  # CREATE_BREAKAWAY_FROM_JOB first
-    assert calls[0][1]["creationflags"] & 0x00000008  # DETACHED_PROCESS
+    for call in calls:
+        assert call[1]["creationflags"] & 0x08000000  # CREATE_NO_WINDOW
+        assert not call[1]["creationflags"] & 0x00000008, (
+            "DETACHED_PROCESS overrides CREATE_NO_WINDOW: the shell the helper starts would open a visible console"
+        )
     assert not calls[1][1]["creationflags"] & 0x01000000  # fallback without it
     assert (
         log.exists() and calls[1][1]["stdout"] is not subprocess.DEVNULL

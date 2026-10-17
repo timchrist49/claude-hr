@@ -135,6 +135,24 @@ def find_claude(configured: str = "") -> Path | None:
     return found
 
 
+# Windows process creation flags (the subprocess module only exposes some of them on Windows builds, so they are spelled out)
+_CREATE_NEW_PROCESS_GROUP = 0x00000200
+_CREATE_NO_WINDOW = 0x08000000
+CREATE_BREAKAWAY_FROM_JOB = 0x01000000
+
+
+def windows_background_flags() -> int:
+    """Creation flags for a long-lived background child on Windows: no window, own process group.
+
+    NEVER add DETACHED_PROCESS: it overrides CREATE_NO_WINDOW ("ignored if used with DETACHED_PROCESS"), so the child gets no
+    console at all, and a console program that child starts (uv's headroom.exe trampoline starts python.exe) then makes
+    Windows create a NEW visible console: an empty terminal window or Windows Terminal tab titled with the program's path.
+    Closing it kills the proxy (exit code 0xC000013A). CREATE_NO_WINDOW alone gives the child a hidden console that its own
+    children inherit, so no window ever appears and nothing a person can close owns the process. The caller adds
+    CREATE_BREAKAWAY_FROM_JOB where the parent's job may allow it."""
+    return _CREATE_NO_WINDOW | _CREATE_NEW_PROCESS_GROUP
+
+
 def run(
     cmd: list[str],
     timeout: float | None = 60,

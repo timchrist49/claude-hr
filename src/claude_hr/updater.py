@@ -209,12 +209,12 @@ def _spawn_detached(cmd: list[str], log_path=None) -> None:
     try:
         if paths.IS_WINDOWS:
             flags = (
-                0x08000000 | 0x00000008 | 0x00000200
-            )  # CREATE_NO_WINDOW | DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
+                procutil.windows_background_flags()
+            )  # no window: DETACHED_PROCESS would make the shell open one
             try:
                 subprocess.Popen(
-                    cmd, creationflags=flags | 0x01000000, **kwargs
-                )  # | CREATE_BREAKAWAY_FROM_JOB
+                    cmd, creationflags=flags | procutil.CREATE_BREAKAWAY_FROM_JOB, **kwargs
+                )
             except OSError:  # the parent job does not allow breakaway
                 subprocess.Popen(cmd, creationflags=flags, **kwargs)
         else:

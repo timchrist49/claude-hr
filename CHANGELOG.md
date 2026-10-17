@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.2.2
+- **Fixed: an empty terminal window titled with the path of `headroom.exe` kept popping up on Windows, and closing it killed the
+  Headroom proxy.** Every proxy start (the launcher's cold start, and the monitor job restarting a dead proxy) was made with
+  `DETACHED_PROCESS`, which overrides `CREATE_NO_WINDOW`: uv's `headroom.exe` trampoline then had no console, and the
+  `python.exe` it starts got a new visible one (a window, or a Windows Terminal tab). Closing that tab ended the proxy (exit code
+  `0xC000013A`); the monitor restarted it 15 minutes later and the window came back. The proxy is now started with
+  `CREATE_NO_WINDOW` only, so it owns a hidden console that its own child inherits and no window can appear. The self-update
+  helper's fallback start had the same flag and got the same fix. One shared definition, `procutil.windows_background_flags()`.
+- **Tests:** unit tests for the flags of both spawn sites, a real-window test (starts a console program from a console program
+  with the flags claude-hr uses and looks at the desktop session's windows; `CLAUDE_HR_TEST_WINDOW_CONTROL=1` adds the control
+  that the old flags do open one), and `tests/windows/proxy_window_probe.py`, which starts the real proxy through
+  `Headroom.start()` and reports any new console window.
+- If you are on 0.2.1 and see the window: update (`claude-hr-ctl update`, or `install.ps1` again) and, once no Claude session is
+  running, `claude-hr-ctl headroom restart`.
+
 ## 0.2.1
 The end-of-turn test gate is now offered, once per folder, instead of waiting for you to find three commands. The model of trust
 is unchanged: the checks still run only after a person approved the exact file, and an agent still cannot approve it.
