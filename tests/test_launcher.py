@@ -1,3 +1,4 @@
+import os
 from pathlib import Path
 
 import pytest
@@ -844,7 +845,11 @@ def test_a_session_spawned_by_claude_through_the_shim_keeps_the_old_pass_through
     spawns may start an update of the setup, even where a person at a terminal would get one."""
     monkeypatch.setenv("CLAUDE_HR_SESSION", "1")
     monkeypatch.setattr(launcher, "_on_a_terminal", lambda: True)
-    for name in ("claude.exe", "claude", r"C:\Users\x\.claude-hr\bin\claude.exe"):
+    # a Windows path is only a path on Windows: POSIX takes the backslashes for part of a file name
+    names = ("claude.exe", "claude") + (
+        (r"C:\Users\x\.claude-hr\bin\claude.exe",) if os.name == "nt" else ()
+    )
+    for name in names:
         _as(monkeypatch, name)
         assert _main(["update"]) == 7
         assert update_world.started == [[str(update_world.claude), "update"]], name

@@ -198,13 +198,15 @@ u._launch_reinstall()
     printf '%s\n' '#!/bin/sh' 'echo "reinstall|$(pwd)" >> /tmp/hr-chain/ran' 'exit 0' > "$d/reinstall"
     printf '%s\n' '#!/bin/sh' 'echo "post|$(pwd)" >> /tmp/hr-chain/ran' 'exit 3' > "$d/post"
     chmod +x "$d/reinstall" "$d/post"
+    printf '%s' "$d" > /tmp/hr-chain/dirpath   # the outer transient unit would expand ${HOME}, $$ and %h in an ARGUMENT: hand the path over in a file
     systemd-run --user --wait --collect --quiet -p Type=oneshot "$py" -c '
 import sys
 from claude_hr import config, updater
 u = updater.Updater(config.load())
-u._pending_reinstall = [sys.argv[1] + "/reinstall"]
-u._launch_reinstall(post=[sys.argv[1] + "/post"])
-' "$d" || return 1
+d = open("/tmp/hr-chain/dirpath").read()
+u._pending_reinstall = [d + "/reinstall"]
+u._launch_reinstall(post=[d + "/post"])
+' || return 1
     for _ in $(seq 1 30); do [ "$(wc -l < /tmp/hr-chain/ran 2>/dev/null || echo 0)" -ge 2 ] && break; sleep 1; done
     grep -qx "reinstall|$HOME/.claude-hr/state" /tmp/hr-chain/ran || return 1
     grep -qx "post|$HOME/.claude-hr/state" /tmp/hr-chain/ran || return 1

@@ -351,6 +351,10 @@ def test_the_posix_shim_script_tells_the_launcher_it_is_the_shim(sandbox, monkey
 
     monkeypatch.setattr(ctl.paths, "IS_WINDOWS", False)
     monkeypatch.setattr(procutil, "which_all", lambda name, path=None: [])
+    # a claude-hr entry point next to the interpreter (a project install, as in a uv-built test env) would be found first
+    monkeypatch.setattr(
+        ctl.sys, "executable", str(paths.bin_dir().parent / "no-such-env" / "bin" / "python")
+    )
     ns = type("A", (), {"action": "install"})()
     assert ctl.cmd_shim(ns, config.load()) == 0
     script = (paths.bin_dir() / "claude").read_text(encoding="utf-8")
