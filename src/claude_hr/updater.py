@@ -430,6 +430,11 @@ def _profile_env(env) -> dict[str, str]:
     return {k: str(env[k]) for k in _PROFILE_VARS if env.get(k)}
 
 
+def _tool_env() -> str:
+    """The folder of the tool environment this process runs from: what a reinstall replaces."""
+    return os.path.realpath(sys.prefix)
+
+
 def _windows_reinstall_script(
     cmd: list[str], pid: int, ppid: int, log, env=None, post: list[str] | None = None, cwd=None
 ) -> str:
@@ -452,15 +457,36 @@ def _windows_reinstall_script(
         *([f"Set-Location -LiteralPath {_ps_quote(str(cwd))}"] if cwd else []),
         f"$log = {_ps_quote(str(log))}",
         "function Log($m) { Add-Content -LiteralPath $log -Encoding UTF8 -Value ('[' + (Get-Date -Format s) + '] ' + $m) }",
+        # What can keep uv from replacing the tool environment is not only the updater's pid: the venv's python.exe stub and
+        # the entry-point trampolines (claude-hr.exe, claude-hr-ctl.exe, claude-hr-hook.exe) live a moment longer than the
+        # interpreter that ran the update, and "Access is denied" while uv removes Scripts\ leaves the tool environment
+        # half-deleted. So wait until nothing runs from it, and try again if uv still fails.
+        f"$toolEnv = {_ps_quote(_tool_env())}",
+        "$exeNames = @('claude-hr.exe', 'claude-hr-ctl.exe', 'claude-hr-hook.exe')",
+        "function Get-Holders { Get-Process -ErrorAction SilentlyContinue | Where-Object { "
+        "$p = $null; try { $p = $_.Path } catch {}; "
+        "$p -and $_.Id -ne $PID -and ($p.StartsWith($toolEnv + '\\', [StringComparison]::OrdinalIgnoreCase) "
+        "-or $exeNames -contains [IO.Path]::GetFileName($p).ToLower()) } }",
+        "function Wait-ForHolders($seconds) { $until = (Get-Date).AddSeconds($seconds); "
+        "while ((Get-Date) -lt $until) { if (@(Get-Holders).Count -eq 0) { return $true }; Start-Sleep -Milliseconds 500 }; "
+        "return $false }",
         f"$ids = @({pid})",
         f"$parent = Get-Process -Id {ppid} -ErrorAction SilentlyContinue",
         "if ($parent -and $parent.ProcessName -like 'claude-hr*') { $ids += $parent.Id }",
         "Log ('waiting for pid(s) ' + ($ids -join ',') + ' to exit before reinstalling')",
         "Wait-Process -Id $ids -Timeout 120 -ErrorAction SilentlyContinue",
-        "Log ('running: ' + " + _ps_quote(" ".join(cmd)) + ")",
-        "& " + " ".join(_ps_quote(part) for part in cmd) + _PS_TO_LOG,
-        "$rc = $LASTEXITCODE",
-        "Log ('reinstall exit code ' + $rc)",
+        "if (-not (Wait-ForHolders 120)) { Log ('still running from the tool environment: ' + "
+        "((Get-Holders | ForEach-Object { $_.ProcessName + ':' + $_.Id }) -join ', ')) }",
+        "$rc = 1; $attempt = 0",
+        "while ($rc -ne 0 -and $attempt -lt 3) {",
+        "  $attempt++",
+        "  if ($attempt -gt 1) { Log ('retrying the reinstall (attempt ' + $attempt + ' of 3)'); "
+        "Start-Sleep -Seconds 10; [void](Wait-ForHolders 60) }",
+        "  Log ('running: ' + " + _ps_quote(" ".join(cmd)) + ")",
+        "  & " + " ".join(_ps_quote(part) for part in cmd) + _PS_TO_LOG,
+        "  $rc = $LASTEXITCODE",
+        "  Log ('reinstall exit code ' + $rc)",
+        "}",
     ]
     if post:
         lines += [

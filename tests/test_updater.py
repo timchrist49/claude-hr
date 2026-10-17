@@ -12,11 +12,14 @@ from claude_hr.checks import FAIL, INFO, WARN, Check
 
 
 @pytest.fixture(autouse=True)
-def _hermetic_report(monkeypatch):
+def _hermetic_report(monkeypatch, tmp_path):
     """A run's report asks the machine two things no test here is about: which processes run (a Claude Code session on the
     developer's machine would add an INFO line) and what doctor says. Tests that are about them replace these again."""
     from claude_hr import doctor
 
+    # the helper script waits for everything that runs from the tool environment: the pytest interpreter does, so a script
+    # run for real by a test must look at a folder nothing runs from
+    monkeypatch.setattr(updater, "_tool_env", lambda: str(tmp_path / "no-tool-env"))
     monkeypatch.setattr(updater.sysinfo, "process_table", lambda: {})
     monkeypatch.setattr(doctor, "run", lambda cfg, cwd, deep=False: [])
     # ... nor may the machine's routing decide a test: a shell inside a claude-hr session has ANTHROPIC_BASE_URL pointing at
@@ -577,7 +580,7 @@ def test_reinstall_script_recreates_the_uv_environment(sandbox):
     assert not any("UNRELATED" in ln or "CLAUDE_CONFIG_DIR" in ln for ln in lines)
     last_env = max(i for i, ln in enumerate(lines) if ln.startswith("$env:"))
     assert last_env < next(
-        i for i, ln in enumerate(lines) if ln.startswith("& ")
+        i for i, ln in enumerate(lines) if ln.lstrip().startswith("& ")
     )  # set before uv runs
 
 
@@ -592,7 +595,7 @@ def test_reinstall_script_logs_each_step_and_quotes_awkward_paths():
     lines = script.splitlines()
     assert "$ids = @(111)" in lines and any("Get-Process -Id 222" in ln for ln in lines)
     assert any(ln.startswith("Wait-Process -Id $ids") for ln in lines)
-    uv_line = next(ln for ln in lines if ln.startswith("& "))
+    uv_line = next(ln for ln in lines if ln.lstrip().startswith("& ")).lstrip()
     assert uv_line.startswith(
         r"& 'C:\Users\O''Neil\uv.exe' 'tool' 'install' 'D:\a b\repo' 2>&1 | ForEach-Object"
     )
@@ -1323,7 +1326,7 @@ def test_the_windows_helper_runs_the_post_phase_only_after_a_reinstall_that_exit
         ["uv", "tool", "install"], 1, 2, "log.txt", env={}, post=POST
     )
     lines = script.splitlines()
-    rc = lines.index("$rc = $LASTEXITCODE")
+    rc = lines.index("  $rc = $LASTEXITCODE")
     guard = lines.index("if ($rc -eq 0) {")
     post = next(i for i, ln in enumerate(lines) if ln.startswith("    & ") and "'--post'" in ln)
     assert next(i for i, ln in enumerate(lines) if "reinstall exit code" in ln) > rc
@@ -1352,7 +1355,7 @@ def test_the_post_phase_of_the_helper_works_on_the_profile_the_update_resolved()
     assert r"$env:CLAUDE_CONFIG_DIR = 'D:\Tim''s profile'" in lines
     assert r"$env:CLAUDE_HR_HOME = 'D:\hr'" in lines
     assert not any("UNRELATED" in ln for ln in lines)
-    first_command = next(i for i, ln in enumerate(lines) if ln.startswith("& "))
+    first_command = next(i for i, ln in enumerate(lines) if ln.lstrip().startswith("& "))
     assert max(i for i, ln in enumerate(lines) if ln.startswith("$env:")) < first_command
 
 
@@ -3022,3 +3025,101 @@ def test_the_helper_logs_the_real_outcome_of_a_post_command_that_cannot_start(tm
     )
     assert "post phase exit code 3" in run([cmd_exe, "/c", "exit 3"])
     assert "post phase exit code 0" in run([cmd_exe, "/c", "exit 0"])
+
+
+# ---- the Windows helper waits for whatever still runs from the tool environment, and retries a failed reinstall --------
+def test_the_helper_script_waits_for_the_tool_environment_to_be_free_and_retries(tmp_path):
+    """uv failed with 'Access is denied' removing the Scripts folder when the venv's python.exe stub or an entry-point trampoline was
+    still shutting down, and left the tool environment half-deleted (claude-hr unusable until reinstalled)."""
+    script = updater._windows_reinstall_script(["uv", "tool", "install"], 1, 2, "log.txt", env={})
+    assert f"$toolEnv = '{tmp_path / 'no-tool-env'}'" in script
+    for needle in (
+        "function Get-Holders",
+        "function Wait-ForHolders",
+        "claude-hr.exe",
+        "claude-hr-ctl.exe",
+        "claude-hr-hook.exe",
+        "retrying the reinstall (attempt ",
+        "$attempt -lt 3",
+    ):
+        assert needle in script, needle
+    lines = script.splitlines()
+    wait = next(i for i, ln in enumerate(lines) if ln.startswith("if (-not (Wait-ForHolders 120))"))
+    run = next(i for i, ln in enumerate(lines) if ln.lstrip().startswith("& 'uv'"))
+    assert wait < run, "the wait comes before the first reinstall"
+    assert "Log ('reinstall exit code ' + $rc)" in script
+
+
+def _run_helper(tmp_path, cmd, tool_env, post=None):
+    """The generated helper under the real shell (the lines that remove the script and unregister the task are cut)."""
+    shell = __import__("shutil").which("powershell") or __import__("shutil").which("pwsh")
+    log = tmp_path / "self-update.log"
+    log.unlink(missing_ok=True)
+    script = updater._windows_reinstall_script(
+        cmd, 999999, 999998, log, env={}, post=post, cwd=tmp_path
+    )
+    keep = [
+        ln
+        for ln in script.splitlines()
+        if not ln.startswith("Unregister-ScheduledTask") and "Remove-Item" not in ln
+    ]
+    ps1 = tmp_path / "helper.ps1"
+    ps1.write_bytes(b"\xef\xbb\xbf" + ("\n".join(keep) + "\n").encode("utf-8"))
+    subprocess.run(
+        [shell, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", str(ps1)],
+        capture_output=True,
+        text=True,
+        timeout=180,
+    )
+    return log.read_text(encoding="utf-8-sig")
+
+
+@pytest.mark.skipif(os.name != "nt", reason="the helper is a Windows PowerShell script")
+def test_the_real_helper_retries_a_reinstall_that_fails_and_stops_when_it_works(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(updater, "_tool_env", lambda: str(tmp_path / "no-tool-env"))
+    cmd_exe = os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32", "cmd.exe")
+    flag = tmp_path / "second.flag"
+    # fails the first time, succeeds the second: a batch line with a marker file
+    bat = tmp_path / "flaky.cmd"
+    bat.write_text(
+        f'@echo off\r\nif exist "{flag}" (exit /b 0)\r\ntype nul > "{flag}"\r\nexit /b 5\r\n',
+        encoding="ascii",
+    )
+    text = _run_helper(tmp_path, [cmd_exe, "/c", str(bat)], tmp_path / "no-tool-env")
+    assert "reinstall exit code 5" in text
+    assert "retrying the reinstall (attempt 2 of 3)" in text
+    assert "reinstall exit code 0" in text and "attempt 3" not in text
+
+
+@pytest.mark.skipif(os.name != "nt", reason="the helper is a Windows PowerShell script")
+def test_the_real_helper_waits_for_a_process_that_still_runs_from_the_tool_environment(
+    tmp_path, monkeypatch
+):
+    """A holder (a copy of cmd.exe started from inside the tool environment folder) that lives 6 s: the reinstall may not
+    start before it is gone."""
+    import shutil
+    import time
+
+    env_dir = tmp_path / "tool-env" / "Scripts"
+    env_dir.mkdir(parents=True)
+    holder_exe = (
+        env_dir / "cmd.exe"
+    )  # a copy of a program that runs on its own, from inside the tool environment folder
+    shutil.copy2(
+        os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32", "cmd.exe"), holder_exe
+    )
+    monkeypatch.setattr(updater, "_tool_env", lambda: str(tmp_path / "tool-env"))
+    cmd_exe = os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32", "cmd.exe")
+    stamp = tmp_path / "reinstall-started.txt"
+    holder = subprocess.Popen([str(holder_exe), "/c", "ping -n 7 127.0.0.1 > nul"])
+    t0 = time.monotonic()
+    try:
+        text = _run_helper(
+            tmp_path, [cmd_exe, "/c", f"echo started > {stamp}"], tmp_path / "tool-env"
+        )
+    finally:
+        holder.kill()
+    assert stamp.exists() and "reinstall exit code 0" in text
+    assert time.monotonic() - t0 >= 5, "the helper did not wait for the holder"
