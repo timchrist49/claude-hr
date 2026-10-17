@@ -49,16 +49,6 @@ def _same_path(a: str | Path, b: str | Path) -> bool:
     return bool(str(a)) and bool(str(b)) and norm(a) == norm(b)
 
 
-def _newer_version(offered: str, installed: str) -> bool:
-    """Is `offered` a newer plugin version than `installed`? Compared as X.Y.Z when both carry one (a build suffix such as
-    "6.4.2-8ca22dba9a94" does not count), otherwise any difference counts (versions that are commit hashes)."""
-    a = re.search(r"(\d+)\.(\d+)\.(\d+)", offered)
-    b = re.search(r"(\d+)\.(\d+)\.(\d+)", installed)
-    if a and b:
-        return tuple(map(int, a.groups())) > tuple(map(int, b.groups()))
-    return offered != installed
-
-
 def applied_version(step: str = "settings") -> str | None:
     """The claude-hr version whose baseline `step` was last applied by `setup`, or None (never recorded: set up by a release
     before 0.2.0, or the step was skipped / never ran)."""
@@ -146,6 +136,15 @@ def unattended_reapply() -> tuple[list[str], str]:
     )
 
 
+def _tail(r, limit: int = 160) -> str:
+    """The last non-empty line a finished process printed (stderr first), clipped: enough to say why it failed."""
+    for text in (r.stderr, r.stdout):
+        lines = [ln.strip() for ln in (text or "").splitlines() if ln.strip()]
+        if lines:
+            return lines[-1][:limit]
+    return "no message"
+
+
 CHANNELS = ("stable", "latest")
 
 
@@ -184,8 +183,10 @@ def resolve_channel(cfg: Config) -> ChannelInfo:
     try:
         value = (read_json(paths.claude_settings(), {}) or {}).get("autoUpdatesChannel")
         user = value if isinstance(value, str) else None
-    except (JsonFileError, OSError, AttributeError):
-        user = None  # an unreadable settings.json is reported by doctor; it is never a reason to stop an update
+    except (JsonFileError, OSError, AttributeError, ValueError):
+        # an unreadable settings.json (garbage, a list, UTF-16 from a Windows PowerShell redirect: UnicodeDecodeError is a
+        # ValueError) is reported by doctor; it is never a reason to stop an update
+        user = None
     if raw.lower() in CHANNELS:
         return ChannelInfo(raw.lower(), raw, user, "config")
     if user is not None and user.strip().lower() in CHANNELS:
@@ -201,6 +202,8 @@ class Step:
     lines: list[str] = field(default_factory=list)
     # what only a person can do (a plugin update that wants confirmation)
     needs: list[str] = field(default_factory=list)
+    # why the marketplace catalogs could not be refreshed ("" when they were): a newer plugin may exist that was not looked for
+    stale: str = ""
 
     def add(self, msg: str) -> None:
         self.lines.append(msg)
@@ -506,19 +509,24 @@ class ClaudeSetup:
             out.append(spec)
         return out
 
-    def _installed_plugins(self) -> list[dict]:
+    def _plugin_list(self) -> tuple[list[dict], str]:
+        """(the plugins `claude plugin list --json` names, "") or ([], why) when claude could not say: a failed list is not
+        an empty one, and an update that cannot tell what is installed must not report that nothing needs updating."""
         r = self._claude("plugin", "list", "--json")
+        if r.returncode != 0:
+            return [], f"`claude plugin list` exited {r.returncode}: {_tail(r)}"
         try:
-            data = json.loads(r.stdout) if r.returncode == 0 else []
+            data = json.loads(r.stdout)
         except json.JSONDecodeError:
-            return []
+            return [], "`claude plugin list --json` did not print JSON"
         if isinstance(data, dict):  # some builds wrap the list: {"plugins": [...]}
             data = data.get("plugins", [])
-        return (
-            [p for p in data if isinstance(p, dict) and isinstance(p.get("id"), str)]
-            if isinstance(data, list)
-            else []
-        )
+        if not isinstance(data, list):
+            return [], "`claude plugin list --json` printed an unexpected shape"
+        return [p for p in data if isinstance(p, dict) and isinstance(p.get("id"), str)], ""
+
+    def _installed_plugins(self) -> list[dict]:
+        return self._plugin_list()[0]
 
     def _known_marketplaces(self) -> set[str]:
         r = self._claude("plugin", "marketplace", "list", "--json")
@@ -598,10 +606,22 @@ class ClaudeSetup:
         return step
 
     def update_marketplaces(self) -> Step:
+        """Refresh the marketplace catalogs, then ask claude to update each user-scope plugin. A refresh that failed is
+        `step.stale` (the plugins were then updated from the catalogs claude already had), a plugin list that failed is
+        `step.ok = False`: neither is ever "already current"."""
         step = Step("plugin-update")
         r = self._claude("plugin", "marketplace", "update", timeout=600)
-        step.add((r.stdout or r.stderr).strip()[-300:] or "marketplaces refreshed")
-        for p in self._installed_plugins():
+        if r.returncode != 0:
+            step.stale = _tail(r)
+            step.add(f"marketplace refresh failed: {step.stale}")
+        else:
+            step.add((r.stdout or r.stderr).strip()[-300:] or "marketplaces refreshed")
+        plugins, why = self._plugin_list()
+        if why:
+            step.ok = False
+            step.add(f"could not check plugins: {why}")
+            return step
+        for p in plugins:
             if p.get("scope") == "user" and not self.dry:
                 # no -y: an unattended job must never auto-accept a marketplace-declared command
                 u = self._claude("plugin", "update", p["id"], "--scope", "user", timeout=300)
@@ -618,34 +638,3 @@ class ClaudeSetup:
                     step.changed = True
                     step.add(f"{p['id']}: {out[-1][:140]}")
         return step
-
-    def available_updates(self) -> list[tuple[str, str, str]] | None:
-        """(plugin id, installed version, version its marketplace catalog offers) for the user-scope plugins whose catalog
-        entry names a newer one, or None when claude cannot say. Read-only: one `claude plugin list --json --available`,
-        which reads the catalogs claude already has (they are refreshed by the update, not by this), so a plugin whose
-        catalog gives no version, or one that comes from a git commit (its version is a commit hash), is not judged."""
-        r = self._claude("plugin", "list", "--json", "--available", timeout=90)
-        try:
-            data = json.loads(r.stdout) if r.returncode == 0 else None
-        except json.JSONDecodeError:
-            return None
-        if not isinstance(data, dict) or not isinstance(data.get("installed"), list):
-            return None
-        offered = {
-            p["pluginId"]: p["version"]
-            for p in data.get("available") or []
-            if isinstance(p, dict)
-            and isinstance(p.get("pluginId"), str)
-            and isinstance(p.get("version"), str)
-            and p["version"]
-        }
-        out: list[tuple[str, str, str]] = []
-        for p in data["installed"]:
-            if not (
-                isinstance(p, dict) and p.get("scope") == "user" and isinstance(p.get("id"), str)
-            ):
-                continue
-            have, new = str(p.get("version") or ""), offered.get(p["id"])
-            if new and have and _newer_version(new, have):
-                out.append((p["id"], have, new))
-        return out

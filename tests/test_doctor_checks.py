@@ -28,6 +28,8 @@ def fake_claude(monkeypatch):
     from claude_hr import sysinfo
 
     monkeypatch.setattr(sysinfo, "process_table", lambda: {})
+    # ... nor may the shell the tests run in: inside a claude-hr session ANTHROPIC_BASE_URL points at the proxy
+    monkeypatch.delenv("ANTHROPIC_BASE_URL", raising=False)
 
 
 def checks(cwd: Path | None = None):
@@ -674,6 +676,28 @@ def test_doctor_notes_claude_code_processes_that_claude_hr_did_not_start(
     monkeypatch.setattr(sysinfo, "process_table", lambda: table)
     monkeypatch.setenv("CLAUDE_HR_HEADROOM__MODE", "off")
     assert "claude outside claude-hr" not in checks()
+
+
+def test_doctor_does_not_say_unmanaged_claude_bypasses_headroom_when_settings_route_it_there(
+    sandbox, fake_claude, monkeypatch
+):
+    from claude_hr import sysinfo
+
+    monkeypatch.setattr(sysinfo, "process_table", lambda: {4100: (1, "claude.exe")})
+    monkeypatch.setattr(doctor.procutil, "http_json", lambda *a, **k: (200, {}))
+    port = Headroom(config.load()).port
+    write_settings({"ANTHROPIC_BASE_URL": f"http://127.0.0.1:{port}"})
+    c = checks()["claude outside claude-hr"]
+    first = c.detail.splitlines()[0]
+    assert first == (
+        "1 Claude Code process(es) not started by claude-hr are running; their traffic goes through Headroom because "
+        "ANTHROPIC_BASE_URL points at the proxy (no session limits, not seen by the update guard; a proxy restart "
+        "waits for them)"
+    )
+    assert "does not go through Headroom" not in c.detail
+    # another proxy in settings.json, or none: the old wording
+    write_settings({"ANTHROPIC_BASE_URL": "http://127.0.0.1:6767"})
+    assert "does not go through Headroom" in checks()["claude outside claude-hr"].detail
 
 
 def test_the_process_probe_never_breaks_doctor(sandbox, fake_claude, monkeypatch):

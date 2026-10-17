@@ -188,6 +188,30 @@ u._launch_reinstall()
     return 1
   }
   check "reinstall started by a systemd job still completes"  helper_survives
+
+  chain_through_systemd() {
+    # The real reinstall+post chain, through the real user manager, over a directory whose name systemd would expand
+    # (${HOME}, $$, %h): the program must start in the state directory and the failed post phase must show in the log.
+    local py="$HOME/.local/share/uv/tools/claude-hr/bin/python" d
+    d='/tmp/hr-chain/dir-${HOME}-$$-100%h'
+    rm -rf /tmp/hr-chain; mkdir -p "$d"
+    printf '%s\n' '#!/bin/sh' 'echo "reinstall|$(pwd)" >> /tmp/hr-chain/ran' 'exit 0' > "$d/reinstall"
+    printf '%s\n' '#!/bin/sh' 'echo "post|$(pwd)" >> /tmp/hr-chain/ran' 'exit 3' > "$d/post"
+    chmod +x "$d/reinstall" "$d/post"
+    systemd-run --user --wait --collect --quiet -p Type=oneshot "$py" -c '
+import sys
+from claude_hr import config, updater
+u = updater.Updater(config.load())
+u._pending_reinstall = [sys.argv[1] + "/reinstall"]
+u._launch_reinstall(post=[sys.argv[1] + "/post"])
+' "$d" || return 1
+    for _ in $(seq 1 30); do [ "$(wc -l < /tmp/hr-chain/ran 2>/dev/null || echo 0)" -ge 2 ] && break; sleep 1; done
+    grep -qx "reinstall|$HOME/.claude-hr/state" /tmp/hr-chain/ran || return 1
+    grep -qx "post|$HOME/.claude-hr/state" /tmp/hr-chain/ran || return 1
+    for _ in $(seq 1 10); do grep -q 'the post phase did not finish (exit code 3)' "$HOME/.claude-hr/logs/self-update.log" && return 0; sleep 1; done
+    return 1
+  }
+  check "the reinstall and post chain survives dollar and percent signs in a path, starts in the state directory and logs a failed post phase" chain_through_systemd
 fi
 
 if [ "$HAVE_SYSTEMD" = 1 ]; then

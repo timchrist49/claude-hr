@@ -577,8 +577,29 @@ def _claude_only_update(cfg) -> int:
 
 
 def cmd_update(a, cfg) -> int:
-    """Update everything (see updater.py), print the one report, and exit with 0 ok | 1 failed | 75 deferred (sessions run)."""
+    """Update everything (see updater.py), print the one report, and exit with 0 ok | 1 failed | 75 deferred (sessions run,
+    or another update is running) | 2 refused."""
     if a.claude_only:
+        # Claude Code's own updater takes none of claude-hr's switches: refuse them rather than ignore them (a real
+        # `claude update` under --check would be a surprise)
+        clash = [
+            flag
+            for flag, given in (
+                ("--check", a.check),
+                ("--only", bool(a.only)),
+                ("--force", a.force),
+                ("--allow-downgrade", a.allow_downgrade),
+                ("--no-restart", a.no_restart),
+                ("--post", a.post),
+            )
+            if given
+        ]
+        if clash:
+            out(
+                f"--claude-only runs Claude Code's own `claude update` and takes none of {', '.join(clash)}: "
+                "leave --claude-only out to use them"
+            )
+            return updater.EXIT_REFUSED
         return _claude_only_update(cfg)
     if a.post and (a.check or a.only):
         out("--post (the second half of a self-update) takes no --check or --only")
@@ -590,48 +611,74 @@ def cmd_update(a, cfg) -> int:
         allow_downgrade=a.allow_downgrade,
         restart=not a.no_restart,
     )
-    rep = u.run_post() if a.post else u.run(a.only or None)
+    try:
+        rep = u.run_post() if a.post else u.run(a.only or None)
+    except updater.UpdateInProgress:
+        out("another update is running (state/update.lock): try again when it has finished")
+        return updater.EXIT_DEFERRED
     for line in updater.format_report(rep):
         out(line)
     return rep.exit_code()
 
 
 UPDATE_DESCRIPTION = """Update everything in this setup, in one go, and say what happened in one table:
-  claude-hr itself (when a newer release exists), Claude Code (staged: smoke-tested, rolled back on failure),
-  Headroom, plugins and their marketplaces (user scope; never answers a prompt for you, adds no marketplace and
-  installs no plugin: that is `claude-hr-ctl plugins sync`), then it re-applies the managed settings and CLAUDE.md
-  block, restarts the Headroom proxy only when no session runs and it has stale settings, and ends with a health
-  verdict. Nothing that a running claude-hr session uses is replaced while one runs: it waits (exit 75).
+  claude-hr itself (when a newer release exists), Claude Code (the native build only; staged: smoke-tested, rolled back on
+  failure), Headroom (staged the same way), plugins and their marketplaces (user scope; never answers a prompt for you,
+  adds no marketplace and installs no plugin: that is `claude-hr-ctl plugins sync`), then the managed settings and
+  CLAUDE.md block (re-applied only on a machine `setup` ran on, for an older release), and the Headroom proxy (restarted
+  only when it runs stale settings and nothing uses it). A full run ends with a health verdict; when claude-hr itself
+  updates, its reinstall, the last steps and the verdict run in the background after this command
+  (logs/self-update.log). claude-hr itself, Claude Code, Headroom and the proxy wait while claude-hr sessions or Claude
+  background sessions run (exit 75); plugins and marketplaces do not.
 
-Exit codes: 0 ok or already current | 1 a component failed or was rolled back | 2 usage error |
-            75 deferred because claude-hr sessions are running (nothing is broken: close them, or use --force).
-`claude-hr update --claude-only` runs Claude Code's own `claude update` instead, with none of the above."""
+Exit codes: 0 ok, already current, or a preview that found nothing wrong | 1 a component failed or was rolled back
+            (with --check: could not be checked) | 2 usage error or unreadable configuration |
+            75 something waits (claude-hr or Claude background sessions run, or another update is running):
+            close the sessions and run it again, or use --force.
+A Claude Code installed with npm, Homebrew or WinGet is left to that package manager; `claude-hr update --claude-only`
+runs Claude Code's own `claude update` instead of all of this (it takes none of the switches below).
+Through the launcher, `update` (or `upgrade`) must be the first argument, or follow plain flags only (--verbose ...):
+`claude-hr --model opus update` is Claude Code's own updater."""
 
 
 def _add_update_args(s: argparse.ArgumentParser) -> None:
     s.add_argument(
         "--check",
         action="store_true",
-        help="preview only: what would change and why; writes nothing",
+        help="preview only: nothing is installed, restarted or re-applied (it does fetch claude-hr's newest "
+        "release tags into its checkout); plugins are not previewed",
     )
     s.add_argument(
         "--only",
         nargs="+",
         choices=list(updater.COMPONENTS),
         metavar="STEP",
-        help="just these (any of: " + ", ".join(updater.COMPONENTS) + ")",
+        help="just these, always in the order of a full run (any of: "
+        + ", ".join(updater.COMPONENTS)
+        + ")",
     )
     s.add_argument(
-        "--force", action="store_true", help="update even while claude-hr sessions are running"
+        "--force",
+        action="store_true",
+        help="update even while claude-hr sessions are running (claude-hr itself too: it does not wait for them), "
+        "and skip the Headroom release cooldown",
     )
     s.add_argument(
-        "--allow-downgrade", action="store_true", help="also move to an older release when told to"
+        "--allow-downgrade",
+        action="store_true",
+        help="also move Claude Code and Headroom to an older release (claude-hr itself never moves back; "
+        "claude.pin and headroom.version need no flag)",
     )
-    s.add_argument("--no-restart", action="store_true", help="never restart the Headroom proxy")
+    s.add_argument(
+        "--no-restart",
+        action="store_true",
+        help="never restart the Headroom proxy: a Headroom upgrade and a restart for stale settings are skipped "
+        "(--force does not override this)",
+    )
     s.add_argument(
         "--claude-only",
         action="store_true",
-        help="only Claude Code's own `claude update` (no staging, no claude-hr)",
+        help="only Claude Code's own `claude update` (no staging, no claude-hr; no other switch)",
     )
     # the second half of a self-update: the helper starts it after the reinstall (see updater.py)
     s.add_argument("--post", action="store_true", help=argparse.SUPPRESS)
@@ -753,7 +800,9 @@ def cmd_shim(a, cfg) -> int:
         )
     else:
         f = b / "claude"
-        f.write_text(f'#!/bin/sh\nexec "{target}" "$@"\n', encoding="utf-8")
+        # --hr-shim: the launcher cannot see the name this script has, and `claude update` through the shim is not
+        # the whole-setup update for a script or an IDE (launcher._wants_update_everything)
+        f.write_text(f'#!/bin/sh\nexec "{target}" --hr-shim "$@"\n', encoding="utf-8")
         f.chmod(0o755)
         out(f"created {f}")
         out(f'Put it first on PATH, e.g. add to your shell profile:  export PATH="{b}:$PATH"')
@@ -849,14 +898,18 @@ def cmd_job(a, cfg) -> int:
             msg = f"alerts={res['alerts']} note={res['note']}"
         elif a.name == "update":
             if cfg.flag("updates.enabled", True):
-                # auto_apply = false is a report-only job: it still records what it found
-                rep = updater.Updater(
-                    cfg, dry=not cfg.flag("updates.auto_apply", True), record=True
-                ).run()
-                msg = " | ".join(r.line() for r in rep.results)
-                # exit 75 (sessions are running, so something waits) is how the command says "nothing is broken": the
-                # scheduler must not call that a failure of the job
-                rc = 0 if rep.exit_code() in (updater.EXIT_OK, updater.EXIT_DEFERRED) else 1
+                # auto_apply = false is a report-only job: it still records what it found, and a component it could not
+                # check (or that failed) still fails the job
+                try:
+                    rep = updater.Updater(
+                        cfg, dry=not cfg.flag("updates.auto_apply", True), record=True
+                    ).run()
+                    msg = " | ".join(r.line() for r in rep.results)
+                    # exit 75 (sessions are running, so something waits) is how the command says "nothing is broken": the
+                    # scheduler must not call that a failure of the job
+                    rc = 0 if rep.exit_code() in (updater.EXIT_OK, updater.EXIT_DEFERRED) else 1
+                except updater.UpdateInProgress:
+                    msg = "another update is running; nothing to do"
         elif a.name == "maintain":
             p = maintenance.plan(cfg)
             n, freed = maintenance.apply(p)

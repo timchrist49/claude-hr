@@ -198,15 +198,21 @@ def _unrouted_claude_check(cfg: Config) -> Check | None:
         from . import updater
 
         n = len(updater.unmanaged_claude_processes())
+        routed = n > 0 and updater.plain_claude_uses_proxy(Headroom(cfg))
     except Exception:  # noqa: BLE001 - an optional probe must never break doctor
         return None
     if not n:
         return None
+    effect = (
+        "their traffic goes through Headroom because ANTHROPIC_BASE_URL points at the proxy (no session limits, not seen "
+        "by the update guard; a proxy restart waits for them)"
+        if routed
+        else "their traffic does not go through Headroom (no compression, no session limits, not seen by the update guard)"
+    )
     return Check(
         "claude outside claude-hr",
         INFO,
-        f"{n} Claude Code process(es) not started by claude-hr are running; their traffic does not go through Headroom "
-        "(no compression, no session limits, not seen by the update guard)\n"
+        f"{n} Claude Code process(es) not started by claude-hr are running; {effect}\n"
         "         use: type `claude-hr` instead of `claude`\n"
         "         or:  claude-hr-ctl shim install   (then put ~/.claude-hr/bin first on PATH)",
     )

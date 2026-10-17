@@ -9,11 +9,13 @@ Rules that keep it safe to run unattended:
   * never downgrade unless a pin says so; never upgrade the shared proxy or Claude Code while sessions run
   * every upgrade is smoke-tested; a failed smoke test restores the previous version
   * every decision is appended to logs/update.jsonl; the outcome of the last run is state/update-last.json
+  * one update at a time: a run that writes (not a preview) holds state/update.lock; a second one exits 75
   * never `-y`, never a marketplace added, never a plugin installed: that is `plugins sync`, a person's decision
 """
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import pathlib
@@ -35,6 +37,7 @@ from .claude_setup import (
     was_set_up,
 )
 from .config import Config
+from .filelock import LockTimeout, locked
 from .headroom import Headroom
 from .jsonio import read_json, write_json
 from .schedule import ps_quote
@@ -52,6 +55,15 @@ COMPONENTS = PHASE_A + POST
 LAST_FILE = "update-last.json"
 # an unfinished record older than this is not what `update --post` should continue
 PENDING_MAX_AGE_S = 6 * 3600
+UPDATE_LOCK = "update.lock"
+# a full run can take a long time (a Claude Code install alone may run 15 minutes): a lock is only stale when its owner is gone
+UPDATE_LOCK_STALE_S = 4 * 3600
+# how long `update --post` waits for a run that holds the lock (the post phase of a self-update must not be lost to it)
+POST_LOCK_WAIT_S = 120.0
+
+
+class UpdateInProgress(RuntimeError):
+    """Another update holds state/update.lock: this one does not run (the command exits 75)."""
 
 
 def installed_is_behind(repo) -> tuple[str, str] | None:
@@ -116,12 +128,13 @@ class Report:
         return not any(r.action in {"failed", "rolled-back"} for r in self.results)
 
     def exit_code(self) -> int:
-        """0 ok or already current | 1 a component failed or was rolled back | 75 something waits for running sessions.
-        (2, a refusal, is decided before a run starts.) A preview always exits 0."""
-        if self.check:
-            return EXIT_OK
+        """0 ok or already current | 1 a component failed or was rolled back (in a preview: could not be checked) | 75
+        something waits for running sessions. (2, a refusal, is decided before a run starts.) A preview that found no
+        failure exits 0 whatever it found, and never defers."""
         if not self.ok:
             return EXIT_FAILED
+        if self.check:
+            return EXIT_OK
         return EXIT_DEFERRED if any(r.busy for r in self.results) else EXIT_OK
 
 
@@ -137,7 +150,7 @@ _LABELS = {
 
 def _label(r: Result, rep: Report) -> str:
     if r.action == "none":
-        return r.state or "up to date"
+        return r.state or ("pending" if r.pending else "up to date")
     if r.component == "self" and r.action == "updated" and rep.background:
         return "updated, finishing in the background"
     return _LABELS.get(r.action, r.action)
@@ -149,18 +162,34 @@ def _before_after(r: Result) -> str:
     return r.current or "-"
 
 
+def _failed(r: Result) -> bool:
+    return r.action in {"failed", "rolled-back"}
+
+
 def _pending(r: Result) -> str:
     """What is left to do for this component, in one phrase, or "" when nothing is."""
     if r.pending:
         return r.pending
+    if r.state == "waiting":  # a reinstall started moments ago is still to finish
+        return r.detail
     if r.action in {"available", "deferred", "failed", "rolled-back"}:
         return r.detail or _LABELS[r.action]
     return ""
 
 
+# What --force really does, for the hint under a deferral: _busy() answers "" for every component, claude-hr's own reinstall
+# included, and the helper that runs that reinstall waits for this process, never for the sessions.
+_FORCE_SELF = (
+    "--force also reinstalls claude-hr itself without waiting for the sessions; on Windows a running claude-hr session "
+    "can make that reinstall fail. To update the rest now and leave claude-hr itself for later: "
+    "`claude-hr update --force --only claude headroom plugins`."
+)
+
+
 def format_report(rep: Report) -> list[str]:
     """The one report at the end of an update run (and of a preview): the channel in force, a table of component |
-    before -> after | result, what each row has to say, then either "Everything is up to date." or what is pending and why."""
+    before -> after | result, what each row has to say, then what failed (or could not be checked), what is pending (or
+    available) and why, or "Everything is up to date." when there is nothing to say."""
     lines = [*rep.header, ""] if rep.header else []
     rows = [("component", "before -> after", "result")] + [
         (r.component, _before_after(r), _label(r, rep)) for r in rep.results
@@ -175,25 +204,38 @@ def format_report(rep: Report) -> list[str]:
         if r.detail:
             lines.append(f"  {r.component}: {r.detail}")
     lines += [f"INFO: {n}" for n in rep.notes]
-    todo = [(r.component, _pending(r)) for r in rep.results if _pending(r)]
+    failed = [(r.component, _pending(r)) for r in rep.results if _failed(r)]
+    todo = [(r.component, _pending(r)) for r in rep.results if not _failed(r) and _pending(r)]
     lines.append("")
     if rep.background:
         lines.append(
             f"claude-hr itself is updating in the background; the rest finishes there: see {rep.background}; "
             "claude-hr-ctl status shows the result"
         )
+    if failed:
+        lines.append("Could not check:" if rep.check else "Failed:")
+        lines += [f"  {c}: {why}" for c, why in failed]
     if todo:
-        lines.append("Pending:" if not rep.check else "Available:")
+        lines.append("Available:" if rep.check else "Pending:")
         lines += [f"  {c}: {why}" for c, why in todo]
-        if rep.check:
+        if rep.check and any(r.action == "available" for r in rep.results):
             lines.append("Run `claude-hr update` to apply it.")
-        elif any(r.busy for r in rep.results):
-            lines.append(
-                "Nothing is broken. Close the claude-hr sessions and run `claude-hr update` again, "
-                "or use `claude-hr update --force` to update now."
-            )
-    elif not rep.background:
-        lines.append("Everything is up to date.")
+    busy = [r for r in rep.results if r.busy]
+    if busy and not rep.check:
+        lines.append(
+            ("" if failed else "Nothing is broken. ")
+            + "Close the claude-hr sessions and run `claude-hr update` again, "
+            + "or use `claude-hr update --force` to update now."
+        )
+        if any(r.component == "self" for r in busy):
+            lines.append(_FORCE_SELF)
+    if not (failed or todo or rep.background):
+        previewed_all = not any(r.state == "not previewed" for r in rep.results)
+        lines.append(
+            "Everything is up to date."
+            if previewed_all
+            else "Nothing to update among what a preview can see."
+        )
     if rep.doctor is not None:
         d = rep.doctor
         if d["warn"] or d["fail"]:
@@ -206,29 +248,75 @@ def format_report(rep: Report) -> list[str]:
 
 def unmanaged_claude_processes() -> list[int]:
     """Process ids of Claude Code processes that claude-hr did not start: named claude, and neither registered as a session
-    nor above or below one (Windows runs a thin launcher above the registered claude.exe). Empty when that cannot be told."""
+    nor above or below one (Windows runs a thin launcher above the registered claude.exe). Neither this process and
+    what it started, nor the `claude` shim that started it (a copy of the launcher named claude.exe, the parent of this
+    interpreter), is one. Empty when that cannot be told."""
     try:
         table = sysinfo.process_table()
         mine = {int(s.get("pid", 0)) for s in resources.live_sessions()} - {0}
     except Exception:  # noqa: BLE001 - a note for the report must never fail the update
         return []
+    me = os.getpid()
     managed: set[int] = set()
     for pid in mine:  # the sessions, their ancestors and (below) their descendants
         cur, hops = pid, 0
         while cur and cur not in managed and hops < 64:
             managed.add(cur)
             cur, hops = table.get(cur, (0, ""))[0], hops + 1
+    # the shim: the unbroken run of `claude` processes directly above this one. A Claude Code further up (this command
+    # was started from its Bash tool) is a real, unmanaged session and stays in the count.
+    cur, hops = table.get(me, (0, ""))[0], 0
+    while cur and hops < 64 and table.get(cur, (0, ""))[1].lower() in {"claude", "claude.exe"}:
+        managed.add(cur)
+        cur, hops = table.get(cur, (0, ""))[0], hops + 1
     found = []
     for pid, (_ppid, name) in table.items():
-        if name.lower() not in {"claude", "claude.exe"} or pid == os.getpid() or pid in managed:
+        if name.lower() not in {"claude", "claude.exe"} or pid == me or pid in managed:
             continue
         cur, hops, below = table.get(pid, (0, ""))[0], 0, False
         while cur and hops < 64 and not below:
-            below = cur in mine
+            below = cur in mine or cur == me
             cur, hops = table.get(cur, (0, ""))[0], hops + 1
         if not below:
             found.append(pid)
     return sorted(found)
+
+
+def plain_claude_uses_proxy(hr: Headroom) -> bool:
+    """Does the configuration route a Claude Code that claude-hr did not start through claude-hr's own proxy? That is the
+    case when ANTHROPIC_BASE_URL in ~/.claude/settings.json `env` (doctor accepts that state) or in this process's
+    environment names the proxy: such a process is a consumer of the proxy like a session is. Never raises."""
+    try:
+        from .doctor import _is_own_proxy
+
+        urls = [os.environ.get("ANTHROPIC_BASE_URL") or ""]
+        env = (read_json(paths.claude_settings(), {}) or {}).get("env")
+        if isinstance(env, dict):
+            urls.append(str(env.get("ANTHROPIC_BASE_URL") or ""))
+        return any(u and _is_own_proxy(u, hr.port) for u in urls)
+    except Exception:  # noqa: BLE001 - an unreadable settings.json (any encoding) is "no"; doctor reports it
+        return False
+
+
+def _own_cgroup() -> str | None:
+    try:
+        return pathlib.Path("/proc/self/cgroup").read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return None
+
+
+def in_systemd_service() -> bool:
+    """Is this process part of a systemd service unit, so that whatever it starts is killed when the unit ends? Needs
+    INVOCATION_ID, and where the control group can be read, a group that is a service: a terminal that is itself a
+    service hands the variable on to every shell it starts, and a shell is not a unit that ends under what it started."""
+    if not os.environ.get("INVOCATION_ID"):
+        return False
+    for line in (_own_cgroup() or "").splitlines():
+        _id, _sep, rest = line.partition(":")
+        controllers, _sep, group = rest.partition(":")
+        if controllers in {"", "name=systemd"} and group:
+            return group.rstrip("/").rsplit("/", 1)[-1].endswith(".service")
+    return True
 
 
 def _result_from(row: dict) -> Result:
@@ -245,11 +333,24 @@ def read_last() -> dict:
     return rec if isinstance(rec, dict) else {}
 
 
+def _rows(rec: dict) -> list[dict]:
+    """The result rows of a record: dicts only, whatever else somebody (or another release) put there."""
+    rows = rec.get("results")
+    return [r for r in rows if isinstance(r, dict)] if isinstance(rows, list) else []
+
+
 def last_update_summary() -> str | None:
-    """One line about the last update run for `claude-hr-ctl status`, or None when there was none."""
-    rec = read_last()
+    """One line about the last update run for `claude-hr-ctl status`, or None when there was none. A record of the wrong
+    shape (hand-edited, another release's) is no news, never an error."""
+    try:
+        return _last_update_summary(read_last())
+    except (OSError, OverflowError, ValueError, TypeError, AttributeError):
+        return None
+
+
+def _last_update_summary(rec: dict) -> str | None:
     ts = rec.get("ts")
-    if not isinstance(ts, (int, float)):
+    if isinstance(ts, bool) or not isinstance(ts, (int, float)) or ts <= 0:
         return None
     when = time.strftime("%Y-%m-%d %H:%M", time.localtime(ts))
     if rec.get("phase") == "pending":
@@ -259,7 +360,7 @@ def last_update_summary() -> str | None:
             f"{when}: the self-update did not finish (log: {paths.logs_dir() / 'self-update.log'}); "
             "run `claude-hr update` again"
         )
-    rows = [r for r in rec.get("results", []) if isinstance(r, dict)]
+    rows = _rows(rec)
     done = [
         f"{r.get('component')} {r.get('current') or '?'} -> {r.get('target')}"
         for r in rows
@@ -330,14 +431,15 @@ def _profile_env(env) -> dict[str, str]:
 
 
 def _windows_reinstall_script(
-    cmd: list[str], pid: int, ppid: int, log, env=None, post: list[str] | None = None
+    cmd: list[str], pid: int, ppid: int, log, env=None, post: list[str] | None = None, cwd=None
 ) -> str:
     """PowerShell source for the helper that reinstalls claude-hr after the updater process (and the claude-hr-ctl.exe
     trampoline that started it) has exited. Everything it does is appended to logs/self-update.log (UTF-8), and it deletes
     its own script file and the one-shot scheduled task that started it.
 
     `post` is the command of the post phase (`claude-hr-ctl update --post`): it needs the NEW code, so it runs here, after
-    the reinstall, and only when the reinstall exited with 0."""
+    the reinstall, and only when the reinstall exited with 0. `cwd` is the directory everything runs in (never the
+    directory a person typed `update` in)."""
     env = os.environ if env is None else env
     lines = [
         "$ErrorActionPreference = 'Continue'",
@@ -347,6 +449,7 @@ def _windows_reinstall_script(
             if post
             else []
         ),
+        *([f"Set-Location -LiteralPath {_ps_quote(str(cwd))}"] if cwd else []),
         f"$log = {_ps_quote(str(log))}",
         "function Log($m) { Add-Content -LiteralPath $log -Encoding UTF8 -Value ('[' + (Get-Date -Format s) + '] ' + $m) }",
         f"$ids = @({pid})",
@@ -363,8 +466,13 @@ def _windows_reinstall_script(
         lines += [
             "if ($rc -eq 0) {",
             "  Log ('running the post phase: ' + " + _ps_quote(" ".join(post)) + ")",
-            "  & " + " ".join(_ps_quote(part) for part in post) + _PS_TO_LOG,
-            "  Log ('post phase exit code ' + $LASTEXITCODE)",
+            # $LASTEXITCODE still holds the reinstall's code: a post command that cannot start must not report that as its own
+            "  $global:LASTEXITCODE = $null",
+            "  try {",
+            "    & " + " ".join(_ps_quote(part) for part in post) + _PS_TO_LOG,
+            "  } catch { Log ('could not start the post phase: ' + $_.Exception.Message) }",
+            "  if ($null -eq $LASTEXITCODE) { Log 'the post phase did not run (no exit code)' } "
+            "else { Log ('post phase exit code ' + $LASTEXITCODE) }",
             "} else { Log 'the reinstall did not succeed: the post phase was not run' }",
         ]
     lines += [
@@ -377,12 +485,17 @@ def _windows_reinstall_script(
 
 def _posix_chain(cmd: list[str], post: list[str]) -> list[str]:
     """`cmd` (the reinstall) followed by `post` (the post phase) when - and only when - the reinstall succeeded, as one
-    command for systemd-run or a detached spawn. Both are quoted with shlex.join; the script has no `$` and no `%`, which
-    systemd would expand in a unit's command line."""
+    command for systemd-run or a detached spawn. Both are quoted with shlex.join. The chain says how each part ended and
+    exits with the code of the part that failed, so a unit or a log never reads as a clean run after a failed post phase.
+    Run under systemd it must pass through `_systemd_words`: the script has `$`, and so may the paths."""
     script = (
-        f"if {shlex.join(cmd)}; then echo 'claude-hr: the reinstall succeeded, running the post phase'; "
-        f"{shlex.join(post)}; echo 'claude-hr: the post phase finished'; "
-        "else echo 'claude-hr: the reinstall did not succeed, the post phase was not run'; false; fi"
+        f"{shlex.join(cmd)}; rc=$?; "
+        'if [ "$rc" -ne 0 ]; then echo "claude-hr: the reinstall did not succeed (exit code $rc), '
+        'the post phase was not run"; exit "$rc"; fi; '
+        "echo 'claude-hr: the reinstall succeeded, running the post phase'; "
+        f"{shlex.join(post)}; rc=$?; "
+        'if [ "$rc" -ne 0 ]; then echo "claude-hr: the post phase did not finish (exit code $rc)"; exit "$rc"; fi; '
+        "echo 'claude-hr: the post phase finished'"
     )
     return ["/bin/sh", "-c", script]
 
@@ -449,11 +562,20 @@ def _start_helper_task(shell: str, script_path) -> bool:
     return r.returncode == 0
 
 
-def _start_systemd_service(cmd: list[str], log) -> bool:
+def _systemd_words(cmd: list[str]) -> list[str]:
+    """`cmd` as systemd must be given it. systemd expands `${VAR}` / `$VAR` in the words of a unit's command line before
+    the program starts and turns `$$` into `$`, so a path or a script with a `$` in it is only correct with every `$`
+    doubled. `%` needs nothing: checked with systemd 249, a transient unit hands `%h` and `%%` to the program unchanged
+    (specifiers are expanded in unit files, not in what systemd-run passes), so doubling it would corrupt the word."""
+    return [w.replace("$", "$$") for w in cmd]
+
+
+def _start_systemd_service(cmd: list[str], log, cwd=None) -> bool:
     """Start `cmd` as a transient unit of the systemd USER manager. The daily update runs as a timer's oneshot service whose
     default KillMode=control-group kills every process of its cgroup (even a setsid child) the moment the job ends; a
     reinstall started as the job's last act would be killed half-way. A unit created through the manager lives in its own
-    cgroup and survives. Returns True if the unit was started."""
+    cgroup and survives, but what it started dies with it: the post phase therefore never starts the proxy from here (see
+    Updater.update_proxy). `cwd` is its working directory. Returns True if the unit was started."""
     if not (paths.IS_LINUX and resources.caps_available()):
         return False
     argv = [
@@ -467,14 +589,17 @@ def _start_systemd_service(cmd: list[str], log) -> bool:
         "-p",
         f"StandardError=append:{log}",
     ]
+    if cwd:
+        argv += ["-p", f"WorkingDirectory={cwd}"]
     env = {**_helper_env(os.environ), **_profile_env(os.environ)}
     argv += [f"--setenv={k}={v}" for k, v in sorted(env.items())]
-    argv += ["--", *cmd]
+    argv += ["--", *_systemd_words(cmd)]
     return procutil.run(argv, timeout=30).returncode == 0
 
 
-def _spawn_detached(cmd: list[str], log_path=None) -> None:
-    """Start `cmd` detached from this process (own session / no console); output goes to `log_path` if given.
+def _spawn_detached(cmd: list[str], log_path=None, cwd=None) -> None:
+    """Start `cmd` detached from this process (own session / no console); output goes to `log_path` if given; it runs in
+    `cwd` when that directory exists (the caller's own directory may be an untrusted repository).
 
     On Windows the child also tries to break away from any Job Object (this is only a best-effort fallback: uv's trampoline
     job usually refuses breakaway, which is why _start_helper_task exists)."""
@@ -491,6 +616,8 @@ def _spawn_detached(cmd: list[str], log_path=None) -> None:
         "stderr": subprocess.STDOUT if out is not subprocess.DEVNULL else subprocess.DEVNULL,
         "stdin": subprocess.DEVNULL,
     }
+    if cwd and os.path.isdir(cwd):
+        kwargs["cwd"] = str(cwd)
     try:
         if paths.IS_WINDOWS:
             flags = (
@@ -531,6 +658,7 @@ class Updater:
             None  # set by update_self, started by run() once everything else is done
         )
         self.header: list[str] = []  # report lines above the table
+        self.notes: list[str] = []  # INFO lines below it
         self.headroom_upgraded = False  # this run installed a new Headroom ...
         self.proxy_restarted = (
             False  # ... and (or) restarted the proxy, which then runs the current settings
@@ -539,9 +667,11 @@ class Updater:
         self._pypi: dict | None = None
 
     # ---- guards ---------------------------------------------------------------------------
-    def _busy(self) -> str:
+    def _busy(self, proxy: bool = False) -> str:
         """Why an upgrade must wait. On Windows replacing the tool env under a running launcher fails and can leave a
-        half-installed package, so this guards claude-hr's own update as well."""
+        half-installed package, so this guards claude-hr's own update as well. `proxy`: the step stops the Headroom
+        proxy, so a Claude Code that claude-hr did not start counts too when the configuration routes it through the
+        proxy (plain_claude_uses_proxy); for the Claude binary or claude-hr itself it never does."""
         if self.force:
             return ""
         n = len(resources.live_sessions())
@@ -553,6 +683,10 @@ class Updater:
             st = launcher._best_effort(launcher._daemon_status, self.claude) or {}
             if st.get("running") and st.get("workers", 0) != 0:
                 return "Claude background sessions are running"
+        if proxy and plain_claude_uses_proxy(self.hr):
+            n = len(unmanaged_claude_processes())
+            if n:
+                return f"{n} Claude Code process(es) not started by claude-hr use the proxy (ANTHROPIC_BASE_URL)"
         return ""
 
     # ---- claude ---------------------------------------------------------------------------
@@ -625,7 +759,8 @@ class Updater:
         if not self.is_native_install():
             res.state = "skipped"
             res.detail = (
-                "not the native build (npm/Homebrew/WinGet): update it with that package manager"
+                "not the native build (npm/Homebrew/WinGet): update it with that package manager, "
+                "or run `claude-hr update --claude-only`"
             )
             return res
         if vtuple(tgt) == vtuple(cur):
@@ -697,22 +832,48 @@ class Updater:
                 if cooldown > 0
                 else ""
             )
-            busy = self._busy()
+            if not self.restart and self.hr.health_patient().ok:
+                res.detail += (
+                    "; it would be skipped now: it restarts the proxy and --no-restart is set"
+                )
+                return res
+            busy = self._busy(proxy=True)
             if busy:
                 res.detail += f"; it would wait now: {busy}"
             return res
-        busy = self._busy()
+        was_running = self.hr.health_patient().ok
+        if was_running and not self.restart:
+            # the upgrade stops the proxy and starts it again: --no-restart means never, --force or not (--force is about
+            # waiting for sessions). Checked before anything is stopped.
+            res.action, res.detail = "deferred", "needs a proxy restart, skipped: --no-restart"
+            return res
+        busy = self._busy(proxy=True)
         if busy:
             res.action, res.detail, res.busy = "deferred", busy, True
             return res
-        was_running = self.hr.health_patient().ok
         self.hr.stop()
         # a new release may need a newer model revision: allow the network for this one start
-        online_h = {**self.hr.h, "offline_models": False}
-        self.hr.h, saved_h = online_h, self.hr.h
+        saved_h = self.hr.h
+        self.hr.h = {**saved_h, "offline_models": False}
         cutoff = None
         if cooldown > 0:  # cool the whole dependency tree, not just headroom-ai itself
             cutoff = (datetime.now(UTC) - timedelta(days=cooldown)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        try:
+            self._upgrade_headroom(res, cur, tgt, cutoff)
+        except Exception as exc:  # noqa: BLE001 - the proxy is stopped and a release is half-installed: put things back
+            res.action, res.detail = "failed", f"{type(exc).__name__}: {exc}"
+            if cur:
+                res.detail += self._restore_headroom(cur, cutoff)
+        finally:
+            self.hr.h = saved_h
+        if res.action == "updated":
+            self.headroom_upgraded = True
+        if was_running or res.action == "updated":
+            res.detail += self._restart_after_upgrade()
+        return res
+
+    def _upgrade_headroom(self, res: Result, cur: str, tgt: str, cutoff: str | None) -> None:
+        """Install `tgt`, smoke-test it, and put `cur` back when that fails. Sets res.action and res.detail."""
         inst = self.hr.install(tgt, exclude_newer=cutoff)
         ok = (
             inst.returncode == 0
@@ -723,26 +884,36 @@ class Updater:
             ok = self.smoke_headroom()
         if ok:
             res.action = "updated"
-        else:
-            res.action = "rolled-back" if cur else "failed"
-            res.detail = (inst.stderr or "smoke test failed").strip()[-160:]
-            if cur:
-                self.hr.stop()
-                # restore with the SAME dependency cutoff (an unconstrained reinstall would pull today's newest
-                # transitive packages - possibly the very breakage being rolled back) and prove it works again
-                back = self.hr.install(cur, exclude_newer=cutoff)
-                if back.returncode != 0 or not self.smoke_headroom():
-                    res.detail += " | WARNING: rollback could not be verified, run `claude-hr-ctl headroom bench`"
-        self.hr.h = saved_h
-        if res.action == "updated":
-            self.headroom_upgraded = True
-        if was_running or res.action == "updated":
-            self.hr.stop()  # restart so the next start uses the normal (possibly offline) settings
+            return
+        res.action = "rolled-back" if cur else "failed"
+        res.detail = (inst.stderr or "smoke test failed").strip()[-160:]
+        if cur:
+            res.detail += self._restore_headroom(cur, cutoff)
+
+    def _restore_headroom(self, cur: str, cutoff: str | None) -> str:
+        """Reinstall `cur` with the SAME dependency cutoff (an unconstrained reinstall would pull today's newest transitive
+        packages - possibly the very breakage being rolled back) and prove it works again. "" or a WARNING to append.
+        Never raises."""
+        warning = " | WARNING: rollback could not be verified, run `claude-hr-ctl headroom bench`"
+        try:
+            self.hr.stop()
+            back = self.hr.install(cur, exclude_newer=cutoff)
+            return "" if back.returncode == 0 and self.smoke_headroom() else warning
+        except Exception as exc:  # noqa: BLE001
+            return f" | WARNING: rollback failed ({type(exc).__name__}: {exc}), run `claude-hr-ctl headroom bench`"
+
+    def _restart_after_upgrade(self) -> str:
+        """Stop the smoke-test proxy and start one that uses the normal (possibly offline) settings. "" or a note to
+        append to the row. Never raises."""
+        try:
+            self.hr.stop()
             self.hr.ensure(wait_s=0)
-            self.proxy_restarted = (
-                True  # with the current settings: the proxy step has nothing left to do
-            )
-        return res
+        except Exception as exc:  # noqa: BLE001
+            return f" | the proxy could not be started again: {type(exc).__name__}: {exc}"
+        self.proxy_restarted = (
+            True  # with the current settings: the proxy step has nothing left to do
+        )
+        return ""
 
     def _pypi_headroom(self) -> dict | None:
         """PyPI's record of headroom-ai, fetched once per run; None when PyPI cannot be read."""
@@ -841,33 +1012,55 @@ class Updater:
             return res
         setup = ClaudeSetup(self.cfg, self.hr, self.claude)
         if self.dry:
+            # A preview cannot see plugin updates: `claude plugin list --available` names what can be installed, not what
+            # is newer, and it refreshes claude's catalog cache (a write). The update itself asks claude about each
+            # plugin, so the preview says that, and what is installed now.
+            res.state = "not previewed"
+            res.detail = "not previewed (the update asks Claude Code for each plugin)"
             try:
-                avail = setup.available_updates()
+                have = [p for p in setup._installed_plugins() if p.get("scope") == "user"]
             except Exception:  # noqa: BLE001 - a preview is never worth a traceback
-                avail = None
-            if avail is None:
-                res.state, res.detail = "not checked", "checked when you run update"
-            elif avail:
-                res.action = "available"
-                res.detail = "newer in the catalogs claude has: " + "; ".join(
-                    f"{pid} {have} -> {new}" for pid, have, new in avail
-                )
-            else:
-                res.detail = (
-                    "no newer version in the catalogs claude has now (update refreshes them first)"
-                )
+                have = []
+            if have:
+                shown = ", ".join(f"{p['id']} {p.get('version') or '?'}" for p in have[:12])
+                more = f" (+{len(have) - 12} more)" if len(have) > 12 else ""
+                res.detail += f"; installed, user scope: {shown}{more}"
             return res
-        before = {p["id"]: p.get("version") for p in setup._installed_plugins()}
+        before, why = setup._plugin_list()
+        if why:
+            res.action, res.detail = "failed", f"could not check plugins: {why}"
+            return res
         step = setup.update_marketplaces()
-        after = {p["id"]: p.get("version") for p in setup._installed_plugins()}
-        changed = [f"{k} {before.get(k)}->{v}" for k, v in after.items() if before.get(k) != v]
-        res.action = "updated" if changed else "none"
-        res.detail = "; ".join(changed) or (
-            "nothing was updated" if step.needs else "already current"
-        )
-        res.pending = "; ".join(step.needs)
         if not step.ok:
-            res.action, res.detail = "failed", "; ".join(step.lines)[-160:]
+            res.action = "failed"
+            res.detail = step.lines[-1] if step.lines else "could not check plugins"
+            return res
+        after, why = setup._plugin_list()
+        if why:
+            res.action, res.detail = "failed", f"could not check plugins: {why}"
+            return res
+        was = {p["id"]: p.get("version") for p in before}
+        now = {p["id"]: p.get("version") for p in after}
+        changed = [f"{k} {was.get(k)}->{v}" for k, v in now.items() if was.get(k) != v]
+        res.action = "updated" if changed else "none"
+        if changed:
+            res.detail = "; ".join(changed)
+        elif step.stale:
+            res.detail = f"marketplace refresh failed ({step.stale}); nothing new in the catalogs claude already had"
+        else:
+            res.detail = "nothing was updated" if step.needs else "already current"
+        res.pending = "; ".join(
+            [
+                *(
+                    [
+                        f"could not check plugins for newer versions: marketplace refresh failed ({step.stale})"
+                    ]
+                    if step.stale
+                    else []
+                ),
+                *step.needs,
+            ]
+        )
         return res
 
     # ---- baseline (what the new claude-hr release wants in settings.json and the CLAUDE.md block) ------------------------
@@ -940,11 +1133,40 @@ class Updater:
         return Result("baseline", current=applied_version("settings") or __version__)
 
     # ---- proxy (a restart, only when it matters and nobody is using it) ------------------------------------
+    def _unowned_proxy(self) -> str:
+        """ "" when the proxy that answers on the port is one claude-hr started and can identify, else why it is not: the
+        record of its start (state/headroom-proxy.json, which only stop() removes, so a crash or a reboot leaves it behind)
+        must name a live Headroom process that listens on the port or is the parent of the one that does (on Windows the
+        uv shim above the listener). Anything else may be somebody else's proxy; Headroom.stop() ends every Headroom
+        process on the port, so it must not be asked to."""
+        try:
+            pid = int((read_json(self.hr._state_file(), {}) or {}).get("pid") or 0)
+        except Exception:  # noqa: BLE001 - a record that cannot be read identifies nothing
+            return "the record of its start cannot be read"
+        if pid <= 0 or not sysinfo.pid_alive(pid):
+            return "the record of its start names a process that is no longer running"
+        if not self.hr._is_headroom_process(pid):
+            return "the recorded process is not a Headroom process"
+        listeners = self.hr._listener_pids()
+        if pid in listeners:
+            return ""
+        table = sysinfo.process_table()
+        for listener in listeners:
+            cur, hops = listener, 0
+            while cur and hops < 16:
+                cur, hops = table.get(cur, (0, ""))[0], hops + 1
+                if cur == pid:
+                    return ""
+        return f"the recorded process does not listen on port {self.hr.port}"
+
     def update_proxy(self) -> Result:
         """Restart the shared Headroom proxy when it runs other settings than the configuration asks for now (or this run
-        upgraded Headroom without restarting it), and only while no session runs. A proxy claude-hr has no record of
-        starting is not judged (Headroom.settings_state), and one that is not running has nothing to restart: its next start
-        uses the current settings. Plain `claude` processes do not use the proxy, so they are not a reason to wait."""
+        upgraded Headroom without restarting it), and only while nothing uses it: no claude-hr session, and no Claude Code
+        that the configuration routes through the proxy (plain_claude_uses_proxy). A proxy claude-hr cannot show it started
+        (no record of a start, or a record of a process that is gone or is not the listener: Headroom.settings_state,
+        _unowned_proxy) is not judged and never stopped, and one that is not running has nothing to restart: its next start
+        uses the current settings. Inside a systemd service it is stopped but not started again: what a unit starts dies
+        with it (the transient unit of the post phase), so the next claude-hr launch or the monitor job starts it fresh."""
         res = Result("proxy")
         mode = str(self.cfg.get("headroom.mode", "persistent"))
         if not self.cfg.flag("headroom.enabled", True) or mode == "off":
@@ -971,23 +1193,38 @@ class Updater:
         if not self.hr.health_patient().ok:
             res.detail = "not running; its next start uses the current settings"
             return res
+        foreign = self._unowned_proxy()
+        if foreign:
+            res.state, res.detail = "not judged", "left alone: claude-hr did not start this proxy"
+            self.notes.append(
+                f"the Headroom proxy on port {self.hr.port} is not one claude-hr started ({foreign}): "
+                "it was not judged, stopped or restarted"
+            )
+            return res
         if self.dry:
             res.action = "available"
             res.detail = f"would restart: {why}"
-            busy = self._busy() if self.restart else ""
+            busy = self._busy(proxy=True) if self.restart else ""
             if busy:
                 res.detail += f" (it would wait now: {busy})"
             return res
         if not self.restart:
             res.action, res.detail = "deferred", f"needs a restart ({why}), skipped: --no-restart"
             return res
-        busy = self._busy()
+        busy = self._busy(proxy=True)
         if busy:
             res.action, res.detail, res.busy = "deferred", f"needs a restart ({why}); {busy}", True
             return res
         self.hr.stop()
-        h = self.hr.ensure(wait_s=float(self.cfg.get("headroom.start_wait_s", 90)))
         self.proxy_restarted = True
+        if in_systemd_service():
+            res.action = "updated"
+            res.detail = (
+                f"stopped ({why}); it is not started from inside a systemd unit (it would die with the unit): "
+                "the next claude-hr launch or the monitor job starts it with the current settings"
+            )
+            return res
+        h = self.hr.ensure(wait_s=float(self.cfg.get("headroom.start_wait_s", 90)))
         if h.ok:
             res.action, res.detail = "updated", f"restarted ({why}); healthy v{h.version}"
         elif h.status in {"crashed", "port-busy", "not-installed"}:
@@ -1137,6 +1374,9 @@ class Updater:
             return
         self._pending_reinstall = None
         log = paths.logs_dir() / "self-update.log"
+        cwd = str(
+            paths.state_dir()
+        )  # never the directory a person typed `update` in: it may be an untrusted repository
         try:
             paths.ensure_dirs()  # the helper script lives in state/, its log in logs/
             if paths.IS_WINDOWS:
@@ -1145,7 +1385,7 @@ class Updater:
                     import base64
 
                     script = _windows_reinstall_script(
-                        cmd, os.getpid(), os.getppid(), log, post=post
+                        cmd, os.getpid(), os.getppid(), log, post=post, cwd=cwd
                     )
                     ps1 = paths.state_dir() / "self-update.ps1"
                     ps1.write_bytes(
@@ -1175,9 +1415,9 @@ class Updater:
                     ]
             if not paths.IS_WINDOWS and post:
                 cmd = _posix_chain(cmd, post)
-            if not paths.IS_WINDOWS and _start_systemd_service(cmd, log):
+            if not paths.IS_WINDOWS and _start_systemd_service(cmd, log, cwd=cwd):
                 return
-            _spawn_detached(cmd, log)
+            _spawn_detached(cmd, log, cwd=cwd)
         except OSError as exc:
             _log(
                 {
@@ -1190,8 +1430,10 @@ class Updater:
     # ---- orchestration --------------------------------------------------------------------
     def _post_command(self) -> list[str]:
         """`claude-hr-ctl update --post`, as the helper starts it after the reinstall (the interpreter of this tool
-        environment: the path survives the reinstall, and the new code is what it imports)."""
-        cmd = [_console_python(), "-m", "claude_hr.ctl", "update", "--post"]
+        environment: the path survives the reinstall, and the new code is what it imports). `-I` keeps the working
+        directory and PYTHON* variables out of the import path: `-m` would otherwise import a claude_hr, json or
+        types from whatever directory the person typed `update` in."""
+        cmd = [_console_python(), "-I", "-m", "claude_hr.ctl", "update", "--post"]
         if not self.restart:
             cmd.append("--no-restart")
         if self.force:
@@ -1242,20 +1484,33 @@ class Updater:
         }
 
     def _attach(self, report: Report) -> None:
-        """The lines around the table: what the components said (the channel), and one INFO line about Claude Code
-        processes claude-hr did not start (the session guard only sees sessions it registered, and a plain claude is a
-        reason to say so, not to wait: someone who keeps a session open for days would never be updated)."""
+        """The lines around the table: what the components said (the channel), and the INFO lines: what they noted, and one
+        about Claude Code processes claude-hr did not start (the session guard only sees sessions it registered, and a plain
+        claude is a reason to say so, not to wait - unless the configuration routes it through the proxy, which then waits
+        for it: someone who keeps a session open for days would otherwise never be updated)."""
         report.header = [*dict.fromkeys([*report.header, *self.header])]
+        report.notes = [*dict.fromkeys([*report.notes, *self.notes])]
         n = len(unmanaged_claude_processes())
         if n:
-            report.notes.append(
-                f"{n} Claude Code process(es) not started by claude-hr are running; they are unaffected by a proxy "
-                "restart (they do not use it) and the updated claude takes effect when they restart"
-            )
+            if plain_claude_uses_proxy(self.hr):
+                report.notes.append(
+                    f"{n} Claude Code process(es) not started by claude-hr are running and use the Headroom proxy "
+                    "(ANTHROPIC_BASE_URL points at it): a proxy restart waits for them, and the updated claude takes "
+                    "effect when they restart"
+                )
+            else:
+                report.notes.append(
+                    f"{n} Claude Code process(es) not started by claude-hr are running; they are unaffected by a proxy "
+                    "restart (they do not use it) and the updated claude takes effect when they restart"
+                )
 
-    def _save_last(self, report: Report, phase: str, post: dict | None = None) -> None:
+    def _save_last(
+        self, report: Report, phase: str, post: dict | None = None, post_only: bool = False
+    ) -> None:
         """state/update-last.json: what this run did. phase "pending" = the post steps are still to run (in the helper,
-        after the reinstall); "complete" = nothing is left. Fail open: a record that cannot be written is not an error."""
+        after the reinstall); "complete" = nothing is left. `post_only`: this is a post phase that continues no run (a second
+        `update --post`, or one typed by hand): it is added to the record of the run before it, under "post_only", and
+        leaves that run's rows alone. Fail open: a record that cannot be written is not an error."""
         from . import __version__
 
         # what is installed after this run; claude-hr is the code that wrote the record, so the NEW version once the
@@ -1278,7 +1533,24 @@ class Updater:
             rec["post"] = post
         try:
             paths.ensure_dirs()
-            write_json(paths.state_dir() / LAST_FILE, rec)
+            target = paths.state_dir() / LAST_FILE
+            if post_only:
+                prior = read_last()
+                if isinstance(prior.get("ts"), (int, float)) and _rows(prior):
+                    earlier = prior.get("post_only")
+                    earlier = (
+                        [e for e in earlier if isinstance(e, dict)]
+                        if isinstance(earlier, list)
+                        else []
+                    )
+                    entry = {
+                        "label": "post phase only: it continued no pending update, so the run above is untouched",
+                        **{k: rec[k] for k in ("ts", "exit_code", "results", "doctor")},
+                    }
+                    write_json(target, {**prior, "post_only": [*earlier, entry][-5:]})
+                    return
+                rec["label"] = "post phase only"
+            write_json(target, rec)
             if phase == "complete":
                 st = read_json(paths.state_dir() / "update-state.json", {}) or {}
                 st["last_run"], st["last_ok"] = rec["ts"], report.ok
@@ -1286,7 +1558,9 @@ class Updater:
         except Exception:  # noqa: BLE001
             pass
 
-    def _finish(self, report: Report, steps: list[str], doctor: bool) -> None:
+    def _finish(
+        self, report: Report, steps: list[str], doctor: bool, post_only: bool = False
+    ) -> None:
         """The post steps (they need the code of the release that is installed NOW), the doctor verdict and the record."""
         for name in steps:
             self._step(report, name)
@@ -1294,16 +1568,66 @@ class Updater:
             report.doctor = self._doctor_verdict()
         self._attach(report)
         if self.record:
-            self._save_last(report, "complete")
+            self._save_last(report, "complete", post_only=post_only)
+
+    @contextlib.contextmanager
+    def _exclusive(self, wait_s: float = 0.0):
+        """One update at a time: a run that writes (not a preview that leaves no trace) holds state/update.lock. A second
+        one raises UpdateInProgress after `wait_s`; a lock whose owner is gone is taken over (filelock.locked). A lock file
+        that cannot be made is no reason to skip the update: it runs unguarded."""
+        if self.dry and not self.record:
+            yield
+            return
+        lock = locked(
+            paths.state_dir() / UPDATE_LOCK, timeout=wait_s, stale_after=UPDATE_LOCK_STALE_S
+        )
+        try:
+            lock.__enter__()
+        except LockTimeout as exc:
+            raise UpdateInProgress("another update is running") from exc
+        except OSError:
+            yield
+            return
+        try:
+            yield
+        finally:
+            lock.__exit__(None, None, None)
+
+    def _cancel_reinstall(self, report: Report, busy: str) -> None:
+        """Sessions started while the other components ran: claude-hr's own reinstall must not replace the tool environment
+        under them (see _busy). The checkout stays on the new release; the next update finds the installed tool behind it and
+        reinstalls (the 15-minute `started` mark is removed, or that retry would wait for it)."""
+        self._pending_reinstall = None
+        try:
+            (paths.state_dir() / "self-update.json").unlink(missing_ok=True)
+        except OSError:
+            pass
+        for r in report.results:
+            if r.component == "self" and r.action == "updated":
+                r.action, r.busy = "deferred", True
+                r.detail = (
+                    f"{busy} (started while this ran); the new release is checked out and "
+                    "the next update reinstalls it"
+                )
 
     def run(self, components: list[str] | None = None) -> Report:
         """Update what `components` names (default: everything) in the order of COMPONENTS. Without a queued self-update the
-        post steps run here; with one they are chained behind its reinstall (see _launch_reinstall)."""
+        post steps run here; with one they are chained behind its reinstall (see _launch_reinstall). Raises UpdateInProgress
+        when another update holds the lock."""
+        with self._exclusive():
+            return self._run(components)
+
+    def _run(self, components: list[str] | None) -> Report:
         chosen = [c for c in COMPONENTS if components is None or c in components]
         report = Report(check=self.dry)
         for name in (c for c in chosen if c in PHASE_A):
             self._step(report, name)
         steps = [c for c in chosen if c in POST]
+        if self._pending_reinstall:
+            # the guard of update_self was taken minutes ago (a Claude Code install alone may run 15): ask again
+            busy = self._busy()
+            if busy:
+                self._cancel_reinstall(report, busy)
         if self._pending_reinstall:
             report.background = str(paths.logs_dir() / "self-update.log")
             self._attach(report)
@@ -1319,7 +1643,12 @@ class Updater:
 
     def run_post(self) -> Report:
         """`update --post`: the steps that needed the new code. Continues the run that queued the self-update (its rows, its
-        post steps) when that record is recent, else runs the full post phase. The helper calls this after the reinstall."""
+        post steps) when that record is recent, else runs the full post phase. The helper calls this after the reinstall.
+        Waits a while for a run that holds the lock, then raises UpdateInProgress."""
+        with self._exclusive(wait_s=POST_LOCK_WAIT_S):
+            return self._run_post()
+
+    def _run_post(self) -> Report:
         from . import __version__
 
         prior = read_last()
@@ -1327,19 +1656,22 @@ class Updater:
             age = time.time() - float(prior.get("ts") or 0)
         except (TypeError, ValueError):  # a record somebody edited by hand
             age = PENDING_MAX_AGE_S
-        fresh = prior.get("phase") == "pending" and age < PENDING_MAX_AGE_S
+        pending = prior.get("phase") == "pending"
+        fresh = pending and age < PENDING_MAX_AGE_S
         report = Report()
         steps, doctor = list(POST), True
         if fresh:
-            report.header = [str(x) for x in prior.get("header", [])]
-            report.results = [
-                _result_from(r) for r in prior.get("results", []) if isinstance(r, dict)
-            ]
+            header = prior.get("header")
+            report.header = [str(x) for x in header] if isinstance(header, list) else []
+            report.results = [_result_from(r) for r in _rows(prior)]
             post = prior.get("post") if isinstance(prior.get("post"), dict) else {}
-            steps = [s for s in post.get("steps", []) if s in POST]
+            listed = post.get("steps")
+            steps = [s for s in listed if s in POST] if isinstance(listed, list) else []
             doctor = bool(post.get("doctor"))
             for r in report.results:
                 if r.component == "self" and r.action == "updated":
                     r.detail = f"reinstalled: claude-hr {__version__} is running"
-        self._finish(report, steps, doctor)
+        # a post phase that continues no pending run (a second one, or one typed by hand) must not replace the rows of the
+        # run before it; an abandoned pending record (older than PENDING_MAX_AGE_S) is replaced
+        self._finish(report, steps, doctor, post_only=not pending)
         return report

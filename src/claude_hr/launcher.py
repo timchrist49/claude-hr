@@ -10,9 +10,11 @@ claude-hr-only switches (stripped before Claude sees the args):
     --hr-direct      skip Headroom for this launch      --hr-wrap      use `headroom wrap claude`
     --hr-force       ignore the RAM / session limits    --hr-no-limits no admission/limits
     --hr-dry-run     print the plan and exit            --hr-verbose   explain decisions on stderr
-    --hr-wait N      seconds to wait for a cold proxy
+    --hr-wait N      seconds to wait for a cold proxy   --hr-shim  (set by the `claude` shim script: "I was called claude")
 Management lives in `claude-hr ctl ...` (same as the `claude-hr-ctl` command). `claude-hr update` updates the whole setup (same
-as `claude-hr-ctl update`); `claude-hr update --claude-only` is Claude Code's own `claude update`.
+as `claude-hr-ctl update`); `claude-hr update --claude-only` is Claude Code's own `claude update`. Under the shim's name,
+`claude update` is the whole-setup update only for a person at a terminal and outside a claude-hr session: a script, an IDE, CI
+and everything Claude starts itself keep Claude Code's own updater.
 
 All claude-hr chatter goes to stderr so `-p --output-format json` pipelines stay clean. The one thing that ever asks a
 question is the one-time offer of the end-of-turn test gate (gate_offer.py): only for a plain interactive session with a
@@ -66,6 +68,27 @@ PASSTHROUGH_SUBCOMMANDS = {
     "help",
 }
 PASSTHROUGH_FLAGS = {"-v", "--version", "-h", "--help"}
+# Claude Code flags that take no value and do not make the next word a prompt: the only ones that may stand between the
+# command name and `update` (a value-taking flag such as --model would need the CLI's own flag table to be skipped right, and
+# -p makes the next word a prompt). `claude-hr --model opus update` stays Claude's own updater.
+PLAIN_FLAGS = frozenset(
+    {
+        "--verbose",
+        "--dangerously-skip-permissions",
+        "--allow-dangerously-skip-permissions",
+        "--bare",
+        "--brief",
+        "--chrome",
+        "--no-chrome",
+        "--continue",
+        "-c",
+        "--ide",
+        "--strict-mcp-config",
+        "--ax-screen-reader",
+        "--disable-slash-commands",
+        "--no-session-persistence",
+    }
+)
 HEADLESS_FLAGS = {"-p", "--print"}
 DAEMON_FLAGS = {"--bg", "--background"}
 NEST_LIMIT = 4
@@ -419,6 +442,44 @@ def _update_everything(rest: list[str], opts: dict) -> int:
         return 1
 
 
+def _update_at(args: list[str]) -> int | None:
+    """Index of the `update` / `upgrade` subcommand in `args`: the first argument, or the first one after plain flags only."""
+    for i, a in enumerate(args):
+        if a in ("update", "upgrade"):
+            return i
+        if a not in PLAIN_FLAGS:
+            return None
+    return None
+
+
+def _invoked_as_shim(opts: dict) -> bool:
+    """Was this launcher started under the name `claude` (the shim: a copy of the launcher named claude.exe on Windows; the
+    shell script of `claude-hr-ctl shim install` execs claude-hr, so it says so with --hr-shim) and not as `claude-hr`?"""
+    if opts.get("shim"):
+        return True
+    try:
+        return Path(sys.argv[0]).stem.lower() == "claude"
+    except (IndexError, TypeError, ValueError):
+        return False
+
+
+def _on_a_terminal() -> bool:
+    try:
+        return bool(sys.stdin.isatty() and sys.stdout.isatty())
+    except (AttributeError, ValueError, OSError):  # a closed or replaced stream is not a terminal
+        return False
+
+
+def _wants_update_everything(opts: dict) -> bool:
+    """`update` means the whole-setup update when a person typed `claude-hr update` (anywhere: inside a session it defers
+    while the session runs). Under the shim's name it means that only for a person at a terminal who is not inside a
+    claude-hr session: `claude update` from a script, an IDE, CI, or from Claude itself (hooks, plugin commands, its own
+    relaunch) is Claude Code's updater, as it always was."""
+    if not _invoked_as_shim(opts):
+        return True
+    return os.environ.get("CLAUDE_HR_SESSION") != "1" and _on_a_terminal()
+
+
 def main(argv: list[str] | None = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
     if argv and argv[0] == "ctl":
@@ -427,6 +488,15 @@ def main(argv: list[str] | None = None) -> int:
         return ctl.main(argv[1:])
 
     opts, args = _split_hr_flags(argv)
+
+    upd = _update_at(args)
+    if upd is not None:
+        # `claude-hr update` is "update everything" (claude-hr, Claude Code, Headroom, plugins ...), not Claude's own updater.
+        # `--claude-only` is the old meaning: Claude Code's `claude update`, without any claude-hr staging (and without the flag).
+        if "--claude-only" in args[upd + 1 :]:
+            args = [*args[: upd + 1], *(a for a in args[upd + 1 :] if a != "--claude-only")]
+        elif _wants_update_everything(opts):
+            return _update_everything(args[upd + 1 :], opts)
 
     nest = (
         int(os.environ.get("CLAUDE_HR_NEST", "0") or 0)
@@ -452,15 +522,6 @@ def main(argv: list[str] | None = None) -> int:
 
             return subprocess.call([str(real), *args])
         os.execv(str(real), [str(real), *args])
-
-    if args[:1] in (["update"], ["upgrade"]):
-        # `claude-hr update` is "update everything" (claude-hr, Claude Code, Headroom, plugins ...), not Claude's own updater.
-        # Only a command a person typed gets here: whatever Claude spawns itself (CLAUDE_HR_SESSION, above) passes straight
-        # through. `--claude-only` is the old meaning: Claude Code's `claude update`, without any claude-hr staging.
-        if "--claude-only" in args[1:]:
-            args = [args[0], *(a for a in args[1:] if a != "--claude-only")]
-        else:
-            return _update_everything(args[1:], opts)
 
     verbose = bool(opts.get("verbose")) or os.environ.get("CLAUDE_HR_VERBOSE") == "1"
     real = _absolute(procutil.find_claude(_configured_binary()))

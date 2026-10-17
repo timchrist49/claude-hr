@@ -629,6 +629,36 @@ def test_resolve_channel_survives_a_settings_file_it_cannot_read(sandbox, monkey
     assert claude_setup.resolve_channel(config.load()).user is None
 
 
+@pytest.mark.parametrize(
+    "raw",
+    [
+        # UTF-16 with a byte order mark: what Windows PowerShell 5.1 writes for `'{...}' > settings.json`
+        '{"autoUpdatesChannel": "latest"}'.encode("utf-16"),
+        b"\xff\xfe\x00\x01 not text",
+        b"\x80\x81\x82",  # not UTF-8 at all
+        b"\xef\xbb\xbf{ garbage",  # a UTF-8 byte order mark in front of something that is not JSON
+        b"\x00\x00\x00",
+    ],
+)
+def test_resolve_channel_survives_a_settings_file_that_is_not_text(sandbox, monkeypatch, raw):
+    """An unreadable settings.json is doctor's to report; it must not turn the Claude Code step into a failure (UnicodeDecodeError
+    is a ValueError, not an OSError) or stop the baseline from being built."""
+    paths.claude_settings().write_bytes(raw)
+    info = claude_setup.resolve_channel(config.load())
+    assert (info.effective, info.user, info.source) == ("stable", None, "default")
+    monkeypatch.setenv("CLAUDE_HR_CLAUDE__CHANNEL", "latest")
+    assert claude_setup.resolve_channel(config.load()).effective == "latest"
+    from claude_hr import baseline
+
+    doc, _ = baseline.build(config.load(), "claude-hr-ctl statusline")
+    assert doc["autoUpdatesChannel"] == "latest"
+
+
+def test_resolve_channel_reads_a_settings_file_with_a_utf8_byte_order_mark(sandbox):
+    paths.claude_settings().write_bytes(b"\xef\xbb\xbf" + b'{"autoUpdatesChannel": "latest"}')
+    assert claude_setup.resolve_channel(config.load()).effective == "latest"
+
+
 def test_the_channel_is_described_with_where_it_came_from(sandbox, monkeypatch):
     paths.claude_settings().write_text('{"autoUpdatesChannel": "latest"}', encoding="utf-8")
     assert claude_setup.resolve_channel(config.load()).describe() == (
@@ -693,18 +723,76 @@ def test_the_baseline_leaves_the_channel_alone_when_claude_hr_does_not_manage_up
     assert "autoUpdatesChannel" not in doc
 
 
-@pytest.mark.parametrize(
-    "offered,installed,newer",
-    [
-        ("1.1.0", "1.0.0", True),
-        ("1.0.0", "1.0.0", False),
-        ("1.0.0", "1.0.1", False),
-        ("6.4.2", "6.4.2-8ca22dba9a94", False),  # a build suffix is not a newer version
-        ("6.4.3", "6.4.2-8ca22dba9a94", True),
-        ("ea10b213686c", "ea10b213686c", False),  # a commit hash: equal is current
-        ("ea10b213686d", "ea10b213686c", True),
-        ("1.2.0", "ea10b213686c", True),
-    ],
-)
-def test_a_catalog_version_counts_as_newer_only_when_it_is(offered, installed, newer):
-    assert claude_setup._newer_version(offered, installed) is newer
+# ---- plugin updates: a failed list or a failed refresh is never "already current" -------------------------------------------
+class _Cli:
+    """A `claude plugin ...` whose answers a test sets: (returncode, stdout, stderr) per command prefix."""
+
+    def __init__(self, answers):
+        self.answers = answers
+        self.calls = []
+
+    def __call__(self, setup, *args, timeout=120):
+        self.calls.append(args)
+        for prefix in sorted(self.answers, key=len, reverse=True):
+            if args[: len(prefix)] == prefix:
+                rc, out, err = self.answers[prefix]
+                return subprocess.CompletedProcess(args, rc, out, err)
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+
+def _setup_with(monkeypatch, answers):
+    cfg = config.load()
+    cli = _Cli(answers)
+    monkeypatch.setattr(
+        claude_setup.ClaudeSetup, "_claude", lambda self, *a, timeout=120: cli(self, *a)
+    )
+    return claude_setup.ClaudeSetup(cfg, Headroom(cfg), Path("/fake/claude")), cli
+
+
+LIST = ("plugin", "list", "--json")
+REFRESH = ("plugin", "marketplace", "update")
+ONE = json.dumps([{"id": "a@m", "scope": "user", "version": "1.0.0"}])
+
+
+def test_a_plugin_list_that_failed_is_told_from_an_empty_one(sandbox, monkeypatch):
+    s, _ = _setup_with(monkeypatch, {LIST: (0, "[]", "")})
+    assert s._plugin_list() == ([], "")
+    s, _ = _setup_with(monkeypatch, {LIST: (1, "", "boom\nsecond line\n")})
+    assert s._plugin_list() == ([], "`claude plugin list` exited 1: second line")
+    s, _ = _setup_with(monkeypatch, {LIST: (0, "oops", "")})
+    assert s._plugin_list()[1] == "`claude plugin list --json` did not print JSON"
+    s, _ = _setup_with(monkeypatch, {LIST: (0, '"text"', "")})
+    assert s._plugin_list()[1] == "`claude plugin list --json` printed an unexpected shape"
+    s, _ = _setup_with(monkeypatch, {LIST: (0, json.dumps({"plugins": [{"id": "a@m"}, 5]}), "")})
+    assert s._plugin_list() == ([{"id": "a@m"}], "")
+    assert s._installed_plugins() == [{"id": "a@m"}]  # the old question keeps its old answer
+
+
+def test_update_marketplaces_remembers_why_a_refresh_failed(sandbox, monkeypatch):
+    s, cli = _setup_with(
+        monkeypatch,
+        {LIST: (0, ONE, ""), REFRESH: (1, "", "Error: getaddrinfo ENOTFOUND github.com\n")},
+    )
+    step = s.update_marketplaces()
+    assert step.ok and step.stale == "Error: getaddrinfo ENOTFOUND github.com"
+    assert step.lines[0] == "marketplace refresh failed: Error: getaddrinfo ENOTFOUND github.com"
+    assert (
+        "plugin",
+        "update",
+        "a@m",
+        "--scope",
+        "user",
+    ) in cli.calls  # the cached catalogs still update
+    ok, _ = _setup_with(monkeypatch, {LIST: (0, ONE, ""), REFRESH: (0, "refreshed", "")})
+    step = ok.update_marketplaces()
+    assert step.ok and step.stale == "" and step.lines == ["refreshed"]
+
+
+def test_update_marketplaces_fails_when_it_cannot_tell_what_is_installed(sandbox, monkeypatch):
+    s, cli = _setup_with(monkeypatch, {LIST: (1, "", "claude is broken")})
+    step = s.update_marketplaces()
+    assert not step.ok
+    assert (
+        step.lines[-1] == "could not check plugins: `claude plugin list` exited 1: claude is broken"
+    )
+    assert not [c for c in cli.calls if c[:2] == ("plugin", "update")]

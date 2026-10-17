@@ -19,6 +19,10 @@ def _hermetic_report(monkeypatch):
 
     monkeypatch.setattr(updater.sysinfo, "process_table", lambda: {})
     monkeypatch.setattr(doctor, "run", lambda cfg, cwd, deep=False: [])
+    # ... nor may the machine's routing decide a test: a shell inside a claude-hr session has ANTHROPIC_BASE_URL pointing at
+    # the proxy, a test run by a systemd unit has INVOCATION_ID
+    monkeypatch.delenv("ANTHROPIC_BASE_URL", raising=False)
+    monkeypatch.delenv("INVOCATION_ID", raising=False)
     # ... and no run may ask the machine's real claude whether its background service is busy
     from claude_hr import launcher
 
@@ -56,8 +60,9 @@ def test_dry_run_reports_available_without_acting(sandbox, monkeypatch):
     u = make(sandbox, monkeypatch, dry=True)
     res = u.update_claude()
     assert res.action == "available"
-    # the only thing a preview may ask claude is read-only (the daemon's state); nothing is installed
-    assert not [c for c in calls if "install" in c[0]]
+    # a preview asks claude nothing at all (the daemon probe is stubbed by the autouse fixture): not one command
+    # that could install, update or refresh anything
+    assert calls == []
     assert res.detail == "Claude Code 2.1.292 -> channel stable offers 2.1.300"
 
 
@@ -400,7 +405,9 @@ def test_update_self_only_queues_the_reinstall(managed_repo, monkeypatch):
     origin, work, managed = managed_repo
     _release_v020(work)
     spawned = []
-    monkeypatch.setattr(updater, "_spawn_detached", lambda cmd, log=None: spawned.append(cmd))
+    monkeypatch.setattr(
+        updater, "_spawn_detached", lambda cmd, log=None, cwd=None: spawned.append(cmd)
+    )
     u = updater.Updater(config.load())
     res = u.update_self()
     assert res.action == "updated" and res.target == "v0.2.0"
@@ -429,10 +436,10 @@ def test_run_starts_the_reinstall_after_plugins_were_updated(sandbox, monkeypatc
         updater.paths, "IS_WINDOWS", False
     )  # this test is about ordering, not the Windows helper
     monkeypatch.setattr(
-        updater, "_start_systemd_service", lambda cmd, log: False
+        updater, "_start_systemd_service", lambda cmd, log, cwd=None: False
     )  # fall through to the plain spawn
     monkeypatch.setattr(
-        updater, "_spawn_detached", lambda cmd, log=None: events.append("reinstall")
+        updater, "_spawn_detached", lambda cmd, log=None, cwd=None: events.append("reinstall")
     )
     u.run(["self", "plugins"])
     assert events == ["self", "plugins", "reinstall"]
@@ -466,7 +473,9 @@ def test_windows_reinstall_runs_from_a_scheduled_task_not_as_our_child(sandbox, 
     monkeypatch.setattr(
         updater, "_start_helper_task", lambda shell, script: started.append((shell, script)) or True
     )
-    monkeypatch.setattr(updater, "_spawn_detached", lambda cmd, log=None: spawned.append(cmd))
+    monkeypatch.setattr(
+        updater, "_spawn_detached", lambda cmd, log=None, cwd=None: spawned.append(cmd)
+    )
     u = _windows_updater(monkeypatch)
     u._launch_reinstall()
     assert spawned == []
@@ -490,7 +499,9 @@ def test_windows_reinstall_falls_back_to_a_direct_helper_if_the_scheduler_refuse
 
     spawned = []
     monkeypatch.setattr(updater, "_start_helper_task", lambda shell, script: False)
-    monkeypatch.setattr(updater, "_spawn_detached", lambda cmd, log=None: spawned.append(cmd))
+    monkeypatch.setattr(
+        updater, "_spawn_detached", lambda cmd, log=None, cwd=None: spawned.append(cmd)
+    )
     _windows_updater(monkeypatch)._launch_reinstall()
     cmd = spawned[0]
     assert cmd[0].endswith("powershell.exe") and "-EncodedCommand" in cmd
@@ -716,14 +727,16 @@ def test_posix_reinstall_prefers_a_systemd_unit_and_falls_back_to_a_plain_spawn(
     monkeypatch.setattr(updater.paths, "IS_WINDOWS", False)
     u = updater.Updater(config.load())
     monkeypatch.setattr(
-        updater, "_start_systemd_service", lambda cmd, log: events.append("unit") or True
+        updater, "_start_systemd_service", lambda cmd, log, cwd=None: events.append("unit") or True
     )
-    monkeypatch.setattr(updater, "_spawn_detached", lambda cmd, log=None: events.append("spawn"))
+    monkeypatch.setattr(
+        updater, "_spawn_detached", lambda cmd, log=None, cwd=None: events.append("spawn")
+    )
     u._pending_reinstall = ["uv", "tool", "install"]
     u._launch_reinstall()
     assert events == ["unit"]
     monkeypatch.setattr(
-        updater, "_start_systemd_service", lambda cmd, log: events.append("unit") or False
+        updater, "_start_systemd_service", lambda cmd, log, cwd=None: events.append("unit") or False
     )
     u._pending_reinstall = ["uv", "tool", "install"]
     u._launch_reinstall()
@@ -1051,7 +1064,7 @@ def test_a_failed_baseline_makes_the_update_run_fail_but_does_not_stop_it(
     assert not rep.ok and rep.exit_code() == updater.EXIT_FAILED
 
 
-def test_the_scheduled_update_job_reapplies_the_baseline_at_its_start(
+def test_the_scheduled_update_job_reapplies_the_baseline_after_the_components(
     upgraded_machine, monkeypatch
 ):
     from claude_hr import claude_setup, ctl, paths
@@ -1074,8 +1087,17 @@ def test_the_scheduled_update_job_reapplies_the_baseline_at_its_start(
     )
     paths.claude_settings().unlink()
     monkeypatch.setenv("CLAUDE_HR_UPDATES__AUTO_APPLY", "false")
-    assert ctl._run(["job", "update"]) in (0, 1)
+    assert ctl._run(["job", "update"]) == 0
     assert not paths.claude_settings().exists()
+    # ... and a report-only job whose check FAILED is a failed job, like the applying one (a nightly check that cannot
+    # read PyPI, git or claude must not show as a green last result)
+    monkeypatch.setattr(
+        updater.Updater,
+        "update_claude",
+        lambda self: updater.Result("claude", action="failed", detail="claude not installed"),
+    )
+    assert ctl._run(["job", "update"]) == 1
+    assert "claude" in (paths.logs_dir() / "job-update.log").read_text(encoding="utf-8")
 
 
 # ---- `update` is one command: its order, its report, its exit codes ---------------------------------------------------
@@ -1216,7 +1238,9 @@ def test_the_update_command_exits_0_ok_1_failed_75_deferred(sandbox, monkeypatch
     assert ctl._run(["update"]) == code
 
 
-def test_a_usage_error_exits_2_and_a_preview_always_exits_0(sandbox, monkeypatch, capsys):
+def test_a_usage_error_exits_2_and_a_preview_exits_0_unless_a_component_could_not_be_checked(
+    sandbox, monkeypatch, capsys
+):
     from claude_hr import ctl, paths
 
     assert ctl.update_main(["--bogus"]) == 2
@@ -1226,10 +1250,19 @@ def test_a_usage_error_exits_2_and_a_preview_always_exits_0(sandbox, monkeypatch
         ctl._run(["update", "--bogus"])
     assert exc.value.code == 2
     capsys.readouterr()
-    _patch_class(monkeypatch, {"claude": updater.Result("claude", action="failed", detail="boom")})
-    assert ctl._run(["update", "--check"]) == 0
-    assert "claude" in capsys.readouterr().out
-    # ... and it writes nothing of its own: no log line, no record of a run
+    available = updater.Result("claude", "1", "2", action="available", detail="Claude Code 1 -> 2")
+    _patch_class(monkeypatch, {"claude": available})
+    assert ctl._run(["update", "--check"]) == 0  # something to apply is no failure ...
+    out = capsys.readouterr().out
+    assert "Available:" in out and "Run `claude-hr update` to apply it." in out
+    _patch_class(
+        monkeypatch, {"claude": updater.Result("claude", action="failed", detail="not installed")}
+    )
+    assert ctl._run(["update", "--check"]) == 1  # ... something that could not be checked is
+    out = capsys.readouterr().out
+    assert "Could not check:" in out and "  claude: not installed" in out
+    assert "Available:" not in out and "Run `claude-hr update`" not in out
+    # ... and a preview writes nothing of its own: no log line, no record of a run
     assert not (paths.logs_dir() / "update.jsonl").exists()
     assert not (paths.state_dir() / "update-last.json").exists()
     assert not (paths.state_dir() / "update-state.json").exists()
@@ -1292,13 +1325,18 @@ def test_the_windows_helper_runs_the_post_phase_only_after_a_reinstall_that_exit
     lines = script.splitlines()
     rc = lines.index("$rc = $LASTEXITCODE")
     guard = lines.index("if ($rc -eq 0) {")
-    post = next(i for i, ln in enumerate(lines) if ln.startswith("  & ") and "'--post'" in ln)
+    post = next(i for i, ln in enumerate(lines) if ln.startswith("    & ") and "'--post'" in ln)
     assert next(i for i, ln in enumerate(lines) if "reinstall exit code" in ln) > rc
     assert rc < guard < post < next(i for i, ln in enumerate(lines) if ln.startswith("} else {"))
     # quoted as one literal per argument (a space in the path), and its output goes to the same log
     assert lines[post].startswith(
-        "  & 'C:\\Program Files\\tool env\\python.exe' '-m' 'claude_hr.ctl' 'update' '--post' 2>&1 | ForEach-Object"
+        "    & 'C:\\Program Files\\tool env\\python.exe' '-m' 'claude_hr.ctl' 'update' '--post' 2>&1 | ForEach-Object"
     )
+    # the reinstall's exit code must not pass for the post command's: it is cleared first, and a post command that could
+    # not be started is caught and logged
+    assert lines[post - 2] == "  $global:LASTEXITCODE = $null" and lines[post - 1] == "  try {"
+    assert any("could not start the post phase" in ln for ln in lines[post:])
+    assert any("$null -eq $LASTEXITCODE" in ln for ln in lines[post:])
     assert "Add-Content -LiteralPath $log" in lines[post]
     assert "the reinstall did not succeed: the post phase was not run" in script
     # without a post phase the script is what it always was
@@ -1346,16 +1384,30 @@ def test_the_post_phase_script_parses_with_the_real_powershell_parser(tmp_path):
 
 
 def test_the_posix_wrapper_quotes_every_argument_and_runs_post_second():
-    cmd = ["/opt/my tools/uv", "tool", "install", "/home/o'neil/.claude-hr/repo"]
+    cmd = ["/opt/my tools/uv", "tool", "install", "/home/o'neil/${HOME}/$$/.claude-hr/repo"]
     post = ["/usr/bin/python 3", "-m", "claude_hr.ctl", "update", "--post"]
     chained = updater._posix_chain(cmd, post)
     assert chained[:2] == ["/bin/sh", "-c"] and len(chained) == 3
     script = chained[2]
     assert shlex.join(cmd) in script and shlex.join(post) in script
     assert script.index(shlex.join(cmd)) < script.index(shlex.join(post))
-    assert (
-        "$" not in script and "%" not in script
-    )  # systemd would expand them in a unit's command line
+    # it says how each part ended and leaves with the code of the one that failed (the unit must not look clean)
+    assert 'exit "$rc"' in script and script.rstrip().endswith("the post phase finished'")
+    assert script.index("the post phase finished") > script.index("the post phase did not finish")
+
+
+def test_systemd_gets_every_dollar_doubled_and_every_percent_left_alone():
+    """systemd expands $VAR and ${VAR} in the words of a unit's command line and turns $$ into $; in what systemd-run passes
+    to a transient unit % is not special (checked on systemd 249: %h and %% reached the program unchanged), so it must not
+    be doubled."""
+    words = ["/bin/sh", "-c", 'x=$?; echo "$x" ${HOME} $$ 100%h %%', "/p/${HOME}/a$b"]
+    assert updater._systemd_words(words) == [
+        "/bin/sh",
+        "-c",
+        'x=$$?; echo "$$x" $${HOME} $$$$ 100%h %%',
+        "/p/$${HOME}/a$$b",
+    ]
+    assert updater._systemd_words(["plain"]) == ["plain"]
 
 
 @pytest.mark.skipif(os.name == "nt" or not os.path.exists("/bin/sh"), reason="needs a POSIX sh")
@@ -1364,7 +1416,7 @@ def test_the_posix_wrapper_really_runs_post_only_when_the_reinstall_succeeded(tm
     work.mkdir()
     out = work / "out.txt"
 
-    def run(code):
+    def run(code, post_code=0):
         out.unlink(missing_ok=True)
         reinstall = [
             sys.executable,
@@ -1376,17 +1428,27 @@ def test_the_posix_wrapper_really_runs_post_only_when_the_reinstall_succeeded(tm
         post = [
             sys.executable,
             "-c",
-            "import sys; open(sys.argv[1], 'a').write('post' + chr(10))",
+            "import sys; open(sys.argv[1], 'a').write('post' + chr(10)); sys.exit(int(sys.argv[2]))",
             str(out),
+            str(post_code),
         ]
         proc = subprocess.run(updater._posix_chain(reinstall, post), capture_output=True, text=True)
-        return proc.returncode, out.read_text(encoding="utf-8").split(chr(10))[:-1]
+        ran = out.read_text(encoding="utf-8").split(chr(10))[:-1]
+        return proc.returncode, ran, proc.stdout
 
-    assert run(0) == (0, ["reinstall 0", "post"])
-    rc, ran = run(3)
-    assert rc != 0 and ran == [
+    rc, ran, said = run(0)
+    assert (rc, ran) == (0, ["reinstall 0", "post"]) and "the post phase finished" in said
+    rc, ran, said = run(3)
+    assert rc == 3 and ran == [
         "reinstall 3"
     ]  # the post phase never ran, and the unit reports the failure
+    assert "the reinstall did not succeed (exit code 3)" in said and "finished" not in said
+    # a post phase that failed or deferred (75) is not a clean run: not "finished", not exit 0
+    for code in (1, 75):
+        rc, ran, said = run(0, code)
+        assert rc == code and ran == ["reinstall 0", "post"]
+        assert f"the post phase did not finish (exit code {code})" in said
+        assert "the post phase finished" not in said
 
 
 def test_the_reinstall_carries_the_post_phase_on_both_posix_routes_and_in_the_windows_script(
@@ -1394,18 +1456,27 @@ def test_the_reinstall_carries_the_post_phase_on_both_posix_routes_and_in_the_wi
 ):
     started, spawned = [], []
     monkeypatch.setattr(updater.paths, "IS_WINDOWS", False)
+    cwds = []
     monkeypatch.setattr(
-        updater, "_start_systemd_service", lambda cmd, log: started.append(cmd) or True
+        updater,
+        "_start_systemd_service",
+        lambda cmd, log, cwd=None: started.append(cmd) or cwds.append(cwd) or True,
     )
-    monkeypatch.setattr(updater, "_spawn_detached", lambda cmd, log=None: spawned.append(cmd))
+    monkeypatch.setattr(
+        updater,
+        "_spawn_detached",
+        lambda cmd, log=None, cwd=None: spawned.append(cmd) or cwds.append(cwd),
+    )
     u = updater.Updater(config.load())
     u._pending_reinstall = ["uv", "tool", "install"]
     u._launch_reinstall(post=POST)
     assert started == [updater._posix_chain(["uv", "tool", "install"], POST)] and spawned == []
-    monkeypatch.setattr(updater, "_start_systemd_service", lambda cmd, log: False)
+    monkeypatch.setattr(updater, "_start_systemd_service", lambda cmd, log, cwd=None: False)
     u._pending_reinstall = ["uv", "tool", "install"]
     u._launch_reinstall(post=POST)
     assert spawned == [updater._posix_chain(["uv", "tool", "install"], POST)]
+    # both routes start in the claude-hr state directory, never in the directory `update` was typed in
+    assert cwds == [str(updater.paths.state_dir())] * 2
     u._pending_reinstall = ["uv", "tool", "install"]
     u._launch_reinstall()  # no post phase asked for: the reinstall alone, as before
     assert spawned[-1] == ["uv", "tool", "install"]
@@ -1421,6 +1492,7 @@ def test_the_reinstall_carries_the_post_phase_on_both_posix_routes_and_in_the_wi
     u._pending_reinstall = ["uv", "tool", "install"]
     u._launch_reinstall(post=POST)
     assert "'--post'" in scripts[0] and scripts[0].index("$rc -eq 0") < scripts[0].index("'--post'")
+    assert f"Set-Location -LiteralPath '{updater.paths.state_dir()}'" in scripts[0].splitlines()
 
 
 def test_the_post_command_is_the_console_interpreter_of_this_env_and_carries_the_flags(
@@ -1428,7 +1500,9 @@ def test_the_post_command_is_the_console_interpreter_of_this_env_and_carries_the
 ):
     cfg = config.load()
     cmd = updater.Updater(cfg)._post_command()
-    assert cmd[1:] == ["-m", "claude_hr.ctl", "update", "--post"]
+    # -I: the working directory and the PYTHON* variables stay out of the import path (a claude_hr, json or types in the
+    # directory `update` was typed in must not be what the post phase imports)
+    assert cmd[1:] == ["-I", "-m", "claude_hr.ctl", "update", "--post"]
     cmd = updater.Updater(cfg, restart=False, force=True)._post_command()
     assert cmd[-2:] == ["--no-restart", "--force"]
     # the scheduled jobs run under pythonw.exe, whose output would vanish: the helper gets python.exe instead
@@ -1602,6 +1676,7 @@ def test_status_reads_the_record_of_the_last_run(sandbox, monkeypatch):
 class _ProxyWorld:
     state = "changed"
     running = True
+    unowned = ""  # why the proxy is not one claude-hr started ("" = it is: Updater._unowned_proxy has its own tests)
 
     def __init__(self):
         self.events = []
@@ -1630,6 +1705,7 @@ def proxy(sandbox, monkeypatch):
             w.events.append(f"ensure:{wait_s:g}") or Health(True, "healthy", "0.41.0")
         ),
     )
+    monkeypatch.setattr(updater.Updater, "_unowned_proxy", lambda self: w.unowned)
     return w
 
 
@@ -1870,71 +1946,75 @@ INSTALLED = [
     {"id": "d@m", "scope": "user", "version": "ea10b213686c"},
     {"id": "e@m", "scope": "user", "version": "6.4.2-8ca22dba9a94"},
 ]
-AVAILABLE = [
-    {"pluginId": "a@m", "version": "1.1.0"},
-    {"pluginId": "b@m", "version": "2.0.0"},
-    {"pluginId": "c@m", "version": "9.9.9"},
-    {"pluginId": "d@m", "version": "ea10b213686c"},
-    {"pluginId": "e@m", "version": "6.4.2"},
-    {"pluginId": "f@m", "version": "1.0.0"},
-]
 
 
-def _fake_plugin_cli(monkeypatch, installed=None, available=None, available_rc=0, update_rc=0):
+def _fake_plugin_cli(
+    monkeypatch, installed=None, update_rc=0, refresh_rc=0, list_rc=0, list_out=None
+):
+    """A fake `claude plugin ...`; every call is recorded. `installed` is what `plugin list --json` answers."""
     from claude_hr import claude_setup
 
     calls = []
 
     def fake(self, *args, timeout=120):
         calls.append(args)
-        if args == ("plugin", "list", "--json", "--available"):
-            body = json.dumps({"installed": installed or [], "available": available or []})
-            return subprocess.CompletedProcess(
-                args, available_rc, body if not available_rc else "", ""
-            )
         if args[:3] == ("plugin", "list", "--json"):
-            return subprocess.CompletedProcess(args, 0, json.dumps(installed or []), "")
+            body = json.dumps(installed or []) if list_out is None else list_out
+            return subprocess.CompletedProcess(args, list_rc, body, "list broke" if list_rc else "")
         if args[:2] == ("plugin", "update"):
             return subprocess.CompletedProcess(
                 args, update_rc, "", "needs confirmation" if update_rc else ""
             )
-        return subprocess.CompletedProcess(args, 0, "refreshed", "")
+        if args[:3] == ("plugin", "marketplace", "update"):
+            return subprocess.CompletedProcess(
+                args,
+                refresh_rc,
+                "refreshed" if not refresh_rc else "",
+                "getaddrinfo ENOTFOUND github.com" if refresh_rc else "",
+            )
+        return subprocess.CompletedProcess(args, 0, "", "")
 
     monkeypatch.setattr(claude_setup.ClaudeSetup, "_claude", fake)
     return calls
 
 
-def test_the_plugin_preview_lists_user_scope_plugins_the_catalogs_have_a_newer_version_of(
+def _plugins(monkeypatch, **kw):
+    dry = kw.pop("dry", False)
+    calls = _fake_plugin_cli(monkeypatch, **kw)
+    u = updater.Updater(config.load(), dry=dry)
+    u.claude = Path("/fake/claude")
+    return u, calls
+
+
+def test_the_plugin_preview_says_it_cannot_preview_and_lists_what_is_installed(
     sandbox, monkeypatch
 ):
-    calls = _fake_plugin_cli(monkeypatch, INSTALLED, AVAILABLE)
-    u = updater.Updater(config.load(), dry=True)
-    u.claude = Path("/fake/claude")
+    """`claude plugin list --available` names what can be installed, never what is newer, and it refreshes claude's
+    catalog cache: the preview must neither ask it nor claim "up to date" from it."""
+    u, calls = _plugins(monkeypatch, installed=INSTALLED, dry=True)
     res = u.update_plugins()
-    assert res.action == "available"
-    # a project-scope plugin, an equal version, a commit-hash version and a build suffix are not "newer"
-    assert res.detail == "newer in the catalogs claude has: a@m 1.0.0 -> 1.1.0"
-    assert calls == [
-        ("plugin", "list", "--json", "--available")
-    ]  # one read-only question, nothing else
+    assert res.action == "none" and res.state == "not previewed" and not res.pending
+    assert res.detail == (
+        "not previewed (the update asks Claude Code for each plugin); installed, user scope: "
+        "a@m 1.0.0, b@m 2.0.0, d@m ea10b213686c, e@m 6.4.2-8ca22dba9a94"
+    )
+    assert calls == [("plugin", "list", "--json")]  # no --available, no refresh, no update
+    text = "\n".join(updater.format_report(updater.Report(results=[res], check=True)))
+    assert "  plugins: not previewed (the update asks Claude Code for each plugin)" in text
+    assert "up to date" not in text  # not on the row, not in the closing line
 
 
-def test_the_plugin_preview_says_so_when_claude_cannot_tell(sandbox, monkeypatch):
-    calls = _fake_plugin_cli(monkeypatch, INSTALLED, AVAILABLE, available_rc=1)
-    u = updater.Updater(config.load(), dry=True)
-    u.claude = Path("/fake/claude")
+def test_the_plugin_preview_survives_a_claude_that_cannot_list(sandbox, monkeypatch):
+    u, _ = _plugins(monkeypatch, installed=INSTALLED, list_rc=1, dry=True)
     res = u.update_plugins()
-    assert res.action == "none" and res.state == "not checked"
-    assert res.detail == "checked when you run update"
-    assert all(c[:3] == ("plugin", "list", "--json") for c in calls)
+    assert res.state == "not previewed" and res.action == "none"
+    assert res.detail == "not previewed (the update asks Claude Code for each plugin)"
 
 
 def test_a_plugin_that_wants_a_confirmation_is_reported_for_the_person_not_answered(
     sandbox, monkeypatch
 ):
-    calls = _fake_plugin_cli(monkeypatch, INSTALLED[:1], update_rc=1)
-    u = updater.Updater(config.load())
-    u.claude = Path("/fake/claude")
+    u, calls = _plugins(monkeypatch, installed=INSTALLED[:1], update_rc=1)
     res = u.update_plugins()
     assert ("plugin", "update", "a@m", "--scope", "user") in calls
     assert all("-y" not in c and "--yes" not in c for c in calls)
@@ -1943,7 +2023,49 @@ def test_a_plugin_that_wants_a_confirmation_is_reported_for_the_person_not_answe
     rep = updater.Report(results=[res])
     text = "\n".join(updater.format_report(rep))
     assert "Pending:" in text and "  plugins: a@m was not updated (needs confirmation)" in text
+    assert "Everything is up to date." not in text
     assert rep.exit_code() == 0  # asking the person is not a failure
+    row = next(ln for ln in text.splitlines() if ln.startswith("plugins "))
+    assert "up to date" not in row  # a row with something left to do is not "up to date"
+
+
+def test_a_failed_marketplace_refresh_is_pending_never_up_to_date(sandbox, monkeypatch):
+    u, calls = _plugins(monkeypatch, installed=INSTALLED[:1], refresh_rc=1)
+    res = u.update_plugins()
+    assert res.action == "none" and ("plugin", "update", "a@m", "--scope", "user") in calls
+    assert "marketplace refresh failed (getaddrinfo ENOTFOUND github.com)" in res.detail
+    assert res.pending.startswith(
+        "could not check plugins for newer versions: marketplace refresh failed"
+    )
+    rep = updater.Report(results=[res])
+    text = "\n".join(updater.format_report(rep))
+    assert "Pending:" in text and "Everything is up to date." not in text
+    assert "up to date" not in next(ln for ln in text.splitlines() if ln.startswith("plugins "))
+    assert rep.exit_code() == 0
+    # what the refresh could not look for does not hide what an update did change
+    u, _ = _plugins(monkeypatch, installed=INSTALLED[:1], refresh_rc=1)
+    seq = iter([INSTALLED[:1], INSTALLED[:1], [{**INSTALLED[0], "version": "1.1.0"}]])
+    monkeypatch.setattr(
+        updater.ClaudeSetup, "_plugin_list", lambda self: (next(seq, INSTALLED[:1]), "")
+    )
+    res = u.update_plugins()
+    assert res.action == "updated" and res.detail == "a@m 1.0.0->1.1.0" and res.pending
+
+
+def test_a_plugin_list_that_failed_is_a_failure_not_an_empty_list(sandbox, monkeypatch):
+    for kw, why in (
+        ({"list_rc": 1}, "`claude plugin list` exited 1: list broke"),
+        ({"list_out": "not json at all"}, "did not print JSON"),
+        ({"list_out": '"just a string"'}, "unexpected shape"),
+    ):
+        u, calls = _plugins(monkeypatch, installed=INSTALLED[:1], **kw)
+        res = u.update_plugins()
+        assert res.action == "failed", kw
+        assert res.detail.startswith("could not check plugins: ") and why in res.detail
+        rep = updater.Report(results=[res])
+        text = "\n".join(updater.format_report(rep))
+        assert rep.exit_code() == updater.EXIT_FAILED and "up to date" not in text.lower()
+        assert not [c for c in calls if c[:2] == ("plugin", "update")]
 
 
 # ---- Claude Code processes claude-hr did not start --------------------------------------------------------------------
@@ -2032,9 +2154,9 @@ def test_a_real_self_update_queues_the_reinstall_with_the_post_phase_behind_it(
     _release_v020(work)
     _stub_uv(monkeypatch)
     started = []
-    monkeypatch.setattr(updater, "_start_systemd_service", lambda cmd, log: False)
+    monkeypatch.setattr(updater, "_start_systemd_service", lambda cmd, log, cwd=None: False)
     monkeypatch.setattr(
-        updater, "_spawn_detached", lambda cmd, log=None: started.append(" ".join(cmd))
+        updater, "_spawn_detached", lambda cmd, log=None, cwd=None: started.append(" ".join(cmd))
     )
     monkeypatch.setattr(
         updater,
@@ -2055,3 +2177,848 @@ def test_a_real_self_update_queues_the_reinstall_with_the_post_phase_behind_it(
     )  # the post phase comes after the reinstall
     assert "--post" in helper
     assert updater.read_last()["phase"] == "pending"
+
+
+# ---- --no-restart, an exception in the upgrade, the proxy that is not ours --------------------------------------------
+_REAL_UNOWNED_PROXY = updater.Updater._unowned_proxy  # before any test replaces it
+
+
+def _upgrade_world(monkeypatch, healthy=True, installed="0.40.0", newest="0.40.1"):
+    """A Headroom whose newest release is `newest`; every call that stops, installs or starts something is recorded."""
+    from claude_hr.headroom import Headroom, Health
+
+    events, state = [], {"v": installed}
+    monkeypatch.setattr(updater.procutil, "port_listening", lambda host, port: False)
+    monkeypatch.setattr(Headroom, "version", lambda self: state["v"])
+    monkeypatch.setattr(
+        Headroom,
+        "health",
+        lambda self, timeout=0.6: Health(healthy, "healthy" if healthy else "down", "0.40.0"),
+    )
+    monkeypatch.setattr(
+        Headroom, "latest_version", lambda self, timeout=15.0, cooldown_days=0.0: newest
+    )
+    monkeypatch.setattr(Headroom, "stop", lambda self: events.append("stop") or True)
+    monkeypatch.setattr(
+        Headroom,
+        "ensure",
+        lambda self, wait_s=0.0, announce=None: events.append("ensure") or Health(True),
+    )
+
+    def fake_install(self, version=None, upgrade=True, exclude_newer=None):
+        events.append(f"install:{version}")
+        state["v"] = version
+        return subprocess.CompletedProcess([], 0, "", "")
+
+    monkeypatch.setattr(Headroom, "install", fake_install)
+    monkeypatch.setattr(
+        updater.Updater,
+        "smoke_headroom",
+        lambda self, wait_s=150.0: events.append("smoke") or True,
+    )
+    return events, state
+
+
+@pytest.mark.parametrize("force", [False, True])
+def test_no_restart_defers_a_headroom_upgrade_before_anything_is_stopped(
+    sandbox, monkeypatch, force
+):
+    """The upgrade stops the proxy and starts it again; --no-restart means never, and --force is about waiting for
+    sessions, not about this."""
+    events, state = _upgrade_world(monkeypatch)
+    res = updater.Updater(config.load(), restart=False, force=force).update_headroom()
+    assert res.action == "deferred" and not res.busy
+    assert res.detail == "needs a proxy restart, skipped: --no-restart"
+    assert events == [] and state["v"] == "0.40.0"  # not stopped, not installed, not started
+    rep = updater.Report(results=[res])
+    assert rep.exit_code() == 0
+    assert "  headroom: needs a proxy restart, skipped: --no-restart" in updater.format_report(rep)
+
+
+def test_no_restart_holds_nothing_back_when_no_proxy_runs(sandbox, monkeypatch):
+    events, state = _upgrade_world(monkeypatch, healthy=False)
+    res = updater.Updater(config.load(), restart=False).update_headroom()
+    assert res.action == "updated" and state["v"] == "0.40.1"
+
+
+def test_a_headroom_preview_says_no_restart_would_skip_the_upgrade(sandbox, monkeypatch):
+    events, _ = _upgrade_world(monkeypatch)
+    res = updater.Updater(config.load(), dry=True, restart=False).update_headroom()
+    assert res.action == "available"
+    assert res.detail == (
+        "Headroom 0.40.0 -> 0.40.1 (newest release past the cooldown); "
+        "it would be skipped now: it restarts the proxy and --no-restart is set"
+    )
+    assert "skipped" not in updater.Updater(config.load(), dry=True).update_headroom().detail
+    assert events == []
+
+
+def test_an_exception_in_the_headroom_upgrade_puts_the_old_release_and_the_proxy_back(
+    sandbox, monkeypatch
+):
+    events, state = _upgrade_world(monkeypatch)
+    online = []
+
+    def smoke(self, wait_s=150.0):
+        online.append(self.hr.h.get("offline_models"))
+        events.append("smoke")
+        if (
+            len(online) == 1
+        ):  # the new release's smoke test: a full disk, an unwritable state directory ...
+            raise OSError(28, "No space left on device")
+        return True  # the rollback's
+
+    monkeypatch.setattr(updater.Updater, "smoke_headroom", smoke)
+    u = updater.Updater(config.load())
+    before = dict(u.hr.h)
+    res = u.update_headroom()
+    assert res.action == "failed" and "No space left on device" in res.detail
+    assert res.current == "0.40.0" and res.target == "0.40.1"
+    assert "WARNING" not in res.detail  # the rollback was verified
+    assert events == [
+        "stop",
+        "install:0.40.1",
+        "smoke",
+        "stop",
+        "install:0.40.0",
+        "smoke",
+        "stop",
+        "ensure",  # the proxy runs again
+    ]
+    assert state["v"] == "0.40.0"
+    assert (
+        online == [False, False] and u.hr.h == before
+    )  # allowed online while it ran, restored after
+    assert u.proxy_restarted and not u.headroom_upgraded
+    rep = updater.Report(results=[res])
+    assert rep.exit_code() == updater.EXIT_FAILED
+
+
+def test_an_exception_while_putting_the_old_release_back_is_a_warning_not_a_second_crash(
+    sandbox, monkeypatch
+):
+    from claude_hr.headroom import Headroom
+
+    events, state = _upgrade_world(monkeypatch)
+
+    def smoke(self, wait_s=150.0):
+        raise RuntimeError("smoke exploded")
+
+    def install(self, version=None, upgrade=True, exclude_newer=None):
+        events.append(f"install:{version}")
+        if version == "0.40.0":
+            raise OSError("uv vanished")
+        state["v"] = version
+        return subprocess.CompletedProcess([], 0, "", "")
+
+    monkeypatch.setattr(updater.Updater, "smoke_headroom", smoke)
+    monkeypatch.setattr(Headroom, "install", install)
+    res = updater.Updater(config.load()).update_headroom()
+    assert res.action == "failed" and "RuntimeError: smoke exploded" in res.detail
+    assert "WARNING: rollback failed (OSError: uv vanished)" in res.detail
+    assert events[-2:] == ["stop", "ensure"]  # the proxy is still put back
+
+
+def test_a_proxy_that_cannot_be_started_again_after_a_good_upgrade_is_a_note_not_a_failure(
+    sandbox, monkeypatch
+):
+    from claude_hr.headroom import Headroom
+
+    _upgrade_world(monkeypatch)
+
+    def ensure(self, wait_s=0.0, announce=None):
+        raise OSError("spawn failed")
+
+    monkeypatch.setattr(Headroom, "ensure", ensure)
+    u = updater.Updater(config.load())
+    res = u.update_headroom()
+    assert res.action == "updated"
+    assert "the proxy could not be started again: OSError: spawn failed" in res.detail
+    assert (
+        u.headroom_upgraded and not u.proxy_restarted
+    )  # the proxy step still has something to say
+
+
+def test_a_proxy_is_only_ours_when_its_record_names_a_live_headroom_process_that_listens(
+    sandbox, monkeypatch
+):
+    from claude_hr.headroom import Headroom
+
+    u = updater.Updater(config.load())
+    record = u.hr._state_file()
+    record.parent.mkdir(parents=True, exist_ok=True)
+    world = {"alive": True, "headroom": True, "listeners": {4242}, "table": {}}
+    monkeypatch.setattr(updater.sysinfo, "pid_alive", lambda pid: world["alive"])
+    monkeypatch.setattr(
+        Headroom, "_is_headroom_process", staticmethod(lambda pid: world["headroom"])
+    )
+    monkeypatch.setattr(Headroom, "_listener_pids", lambda self: world["listeners"])
+    monkeypatch.setattr(updater.sysinfo, "process_table", lambda: world["table"])
+    check = lambda: _REAL_UNOWNED_PROXY(u)  # noqa: E731
+    assert "no longer running" in check()  # no record at all
+    record.write_text(json.dumps({"pid": 4242, "port": 8787, "args": "abc"}), encoding="utf-8")
+    assert check() == ""  # alive, a Headroom process, and it listens
+    world["alive"] = False
+    assert "no longer running" in check()  # a crash or a reboot leaves the record behind
+    world.update(alive=True, headroom=False)
+    assert "not a Headroom process" in check()  # a reused pid
+    world.update(headroom=True, listeners={9999})
+    assert "does not listen on port" in check()  # somebody else's proxy answers on the port
+    world["table"] = {
+        9999: (4242, "python.exe")
+    }  # the uv shim above the listener is the recorded pid
+    assert check() == ""
+    world["table"] = {9999: (5000, "python.exe"), 5000: (4242, "headroom.exe")}
+    assert check() == ""
+    world.update(listeners=set(), table={})  # nothing can be shown to listen: not judged
+    assert "does not listen" in check()
+    for broken in ("[1,", json.dumps({"pid": "x"}), json.dumps([1, 2])):
+        record.write_text(broken, encoding="utf-8")
+        assert check()  # never raises, never "ours"
+
+
+def test_a_stale_record_never_gets_a_proxy_claude_hr_did_not_start_stopped(proxy, monkeypatch):
+    """After a reboot or a crash headroom-proxy.json is still there; if the person's own `headroom proxy` listens on the
+    port, Headroom.stop() would end it. Nothing is judged, stopped or restarted, and the report says so."""
+    monkeypatch.setattr(updater.Updater, "_unowned_proxy", _REAL_UNOWNED_PROXY)
+    monkeypatch.setattr(updater.sysinfo, "pid_alive", lambda pid: False)
+    proxy.state = "older"  # a record without `args` ...
+    u = updater.Updater(config.load())
+    u.hr._state_file().parent.mkdir(parents=True, exist_ok=True)
+    u.hr._state_file().write_text(json.dumps({"pid": 4242, "port": 8787}), encoding="utf-8")
+    for kw in ({}, {"dry": True}):
+        u = updater.Updater(config.load(), **kw)
+        res = u.update_proxy()
+        assert res.action == "none" and res.state == "not judged" and proxy.events == []
+        assert len(u.notes) == 1 and "is not one claude-hr started" in u.notes[0]
+        assert "no longer running" in u.notes[0]
+    rep = updater.Updater(config.load()).run(["proxy"])
+    text = "\n".join(updater.format_report(rep))
+    assert (
+        "INFO: the Headroom proxy on port " in text and "not judged, stopped or restarted" in text
+    )
+    assert rep.exit_code() == 0 and proxy.events == []
+    row = next(ln for ln in text.splitlines() if ln.startswith("proxy "))
+    assert row.endswith("not judged")
+
+
+def test_inside_a_systemd_service_the_proxy_is_stopped_but_not_started_again(proxy, monkeypatch):
+    """What a unit starts dies with it (the transient unit of the post phase): the next launch or the monitor job starts
+    the proxy, in a context that lasts."""
+    monkeypatch.setattr(updater, "in_systemd_service", lambda: True)
+    u = updater.Updater(config.load())
+    res = u.update_proxy()
+    assert proxy.events == ["stop"]  # an ensure() here would start a proxy that dies with the unit
+    assert res.action == "updated" and res.detail.startswith("stopped (it runs other settings")
+    assert "monitor job" in res.detail and "next claude-hr launch" in res.detail
+    assert u.proxy_restarted
+    proxy.events.clear()
+    monkeypatch.setattr(
+        updater, "in_systemd_service", lambda: False
+    )  # anywhere else: restart as designed
+    assert updater.Updater(config.load()).update_proxy().detail.startswith("restarted")
+    assert proxy.events == ["stop", "ensure:90"]
+
+
+@pytest.mark.parametrize(
+    "invocation,cgroup,expected",
+    [
+        (None, "0::/user.slice/user-1000.slice/user@1000.service/app.slice/x.service\n", False),
+        (
+            "abc",
+            "0::/user.slice/user-1000.slice/user@1000.service/app.slice/claude-hr-selfupdate-1.service\n",
+            True,
+        ),
+        (
+            "abc",
+            "0::/user.slice/user-1000.slice/session-3.scope\n",
+            False,
+        ),  # a shell that inherited it
+        (
+            "abc",
+            "0::/user.slice/user-1000.slice/user@1000.service/app.slice/vte-spawn-1.scope\n",
+            False,
+        ),
+        ("abc", "12:cpu:/x\n1:name=systemd:/system.slice/foo.service\n", True),  # cgroup v1
+        ("abc", "1:name=systemd:/user.slice/user-1000.slice/session-3.scope\n", False),
+        ("abc", None, True),  # the group cannot be read: the variable is all there is
+    ],
+)
+def test_a_systemd_service_is_told_from_a_shell_that_inherited_the_variable(
+    monkeypatch, invocation, cgroup, expected
+):
+    if invocation is None:
+        monkeypatch.delenv("INVOCATION_ID", raising=False)
+    else:
+        monkeypatch.setenv("INVOCATION_ID", invocation)
+    monkeypatch.setattr(updater, "_own_cgroup", lambda: cgroup)
+    assert updater.in_systemd_service() is expected
+
+
+# ---- Claude Code processes that the configuration routes through the proxy -------------------------------------------
+def _routed(sandbox, monkeypatch, how="settings", url=None):
+    from claude_hr import paths
+    from claude_hr.headroom import Headroom
+
+    url = url or Headroom(config.load()).url
+    if how == "settings":
+        paths.claude_settings().write_text(
+            json.dumps({"env": {"ANTHROPIC_BASE_URL": url}}), encoding="utf-8"
+        )
+    else:
+        monkeypatch.setenv("ANTHROPIC_BASE_URL", url)
+    monkeypatch.setattr(updater.sysinfo, "process_table", lambda: {8000: (1, "claude.exe")})
+
+
+def test_a_plain_claude_is_no_reason_to_wait_for_the_proxy_unless_it_is_routed_through_it(
+    proxy, sandbox, monkeypatch
+):
+    monkeypatch.setattr(updater.sysinfo, "process_table", lambda: {8000: (1, "claude.exe")})
+    res = updater.Updater(config.load()).update_proxy()
+    assert res.action == "updated" and proxy.events == [
+        "stop",
+        "ensure:90",
+    ]  # nobody routes it here
+    proxy.events.clear()
+    _routed(
+        sandbox, monkeypatch, "settings", url="http://127.0.0.1:6767"
+    )  # another proxy: not ours to wait for
+    assert updater.Updater(config.load()).update_proxy().action == "updated"
+
+
+@pytest.mark.parametrize("how", ["settings", "environment"])
+def test_a_plain_claude_routed_through_the_proxy_is_a_consumer_and_the_restart_waits(
+    proxy, sandbox, monkeypatch, how
+):
+    _routed(sandbox, monkeypatch, how)
+    u = updater.Updater(config.load())
+    res = u.update_proxy()
+    assert res.action == "deferred" and res.busy and proxy.events == []
+    assert "1 Claude Code process(es) not started by claude-hr use the proxy" in res.detail
+    assert updater.Report(results=[res]).exit_code() == updater.EXIT_DEFERRED
+    # a preview says it would wait, --force goes ahead
+    dry = updater.Updater(config.load(), dry=True).update_proxy()
+    assert (
+        dry.action == "available" and "it would wait now: 1 Claude Code process(es)" in dry.detail
+    )
+    assert updater.Updater(config.load(), force=True).update_proxy().action == "updated"
+    # ... but updating the Claude binary itself never waits for them: they keep the old build until they restart
+    assert u._busy() == ""
+    assert u._busy(proxy=True).startswith("1 Claude Code process(es)")
+
+
+def test_a_headroom_upgrade_stops_the_proxy_too_so_it_waits_for_the_same_consumers(
+    sandbox, monkeypatch
+):
+    events, state = _upgrade_world(monkeypatch)
+    _routed(sandbox, monkeypatch)
+    res = updater.Updater(config.load()).update_headroom()
+    assert res.action == "deferred" and res.busy and "use the proxy" in res.detail
+    assert events == [] and state["v"] == "0.40.0"
+
+
+def test_the_info_line_tells_whether_the_unmanaged_claude_uses_the_proxy(sandbox, monkeypatch):
+    monkeypatch.setattr(updater.sysinfo, "process_table", lambda: {8000: (1, "claude.exe")})
+    assert _spied(monkeypatch, []).run(["proxy"]).notes == [
+        "1 Claude Code process(es) not started by claude-hr are running; they are unaffected by a proxy restart "
+        "(they do not use it) and the updated claude takes effect when they restart"
+    ]
+    _routed(sandbox, monkeypatch)
+    assert _spied(monkeypatch, []).run(["proxy"]).notes == [
+        "1 Claude Code process(es) not started by claude-hr are running and use the Headroom proxy "
+        "(ANTHROPIC_BASE_URL points at it): a proxy restart waits for them, and the updated claude takes "
+        "effect when they restart"
+    ]
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        "\ufeff{ not json",
+        "[1, 2]",
+        '{"env": "oops"}',
+        '{"env": {"ANTHROPIC_BASE_URL": 5}}',
+        b'\xff\xfe{\x00"\x00e\x00n\x00v\x00"\x00:\x00{\x00}\x00}\x00',  # UTF-16 from a Windows PowerShell redirect
+    ],
+)
+def test_a_settings_file_that_cannot_be_read_never_breaks_the_routing_question(sandbox, content):
+    from claude_hr import paths
+    from claude_hr.headroom import Headroom
+
+    f = paths.claude_settings()
+    f.write_bytes(content if isinstance(content, bytes) else content.encode("utf-8"))
+    assert updater.plain_claude_uses_proxy(Headroom(config.load())) is False
+
+
+# ---- the Claude shim that started the update, and what this process started, are not "other" Claude Code ---------------
+def test_the_claude_shim_that_started_the_update_and_its_own_tree_are_not_unmanaged(
+    sandbox, monkeypatch
+):
+    me = os.getpid()
+    table = {
+        me: (5000, "python.exe"),
+        5000: (
+            4000,
+            "claude.exe",
+        ),  # the shim: a copy of the launcher named claude.exe, above this interpreter
+        4000: (3000, "cmd.exe"),
+        9100: (me, "claude.exe"),  # something this process started
+        8000: (1, "claude.exe"),  # a plain `claude` somebody typed
+    }
+    monkeypatch.setattr(updater.sysinfo, "process_table", lambda: table)
+    assert updater.unmanaged_claude_processes() == [8000]
+    # a real Claude Code higher up (the update was started from its Bash tool) is an unmanaged session: it stays counted
+    table = {me: (5000, "python.exe"), 5000: (4000, "bash.exe"), 4000: (1, "claude.exe")}
+    monkeypatch.setattr(updater.sysinfo, "process_table", lambda: table)
+    assert updater.unmanaged_claude_processes() == [4000]
+
+
+def test_the_skip_of_a_claude_code_a_package_manager_owns_names_the_way_to_update_it(
+    sandbox, monkeypatch
+):
+    u = updater.Updater(config.load())
+    u.claude = Path("/usr/lib/node_modules/@anthropic-ai/claude-code/cli.js")
+    monkeypatch.setattr(u, "claude_version", lambda: "2.1.292")
+    monkeypatch.setattr(u, "claude_target", lambda: "2.1.300")
+    res = u.update_claude()
+    assert res.action == "none" and res.state == "skipped"
+    assert "that package manager" in res.detail and "`claude-hr update --claude-only`" in res.detail
+
+
+# ---- the report never reads fine next to something that is not ----------------------------------------------------------
+def _text(*rows, check=False, background=""):
+    return "\n".join(
+        updater.format_report(updater.Report(list(rows), check=check, background=background))
+    )
+
+
+def test_the_report_does_not_say_nothing_is_broken_next_to_a_failure():
+    waiting = updater.Result(
+        "claude", action="deferred", busy=True, detail="1 claude-hr session(s) running"
+    )
+    failed = updater.Result("baseline", action="failed", detail="settings FAILED: unparsable")
+    text = _text(waiting, failed)
+    assert "Nothing is broken" not in text and "Everything is up to date." not in text
+    assert "Failed:\n  baseline: settings FAILED: unparsable" in text
+    assert "Pending:\n  claude: 1 claude-hr session(s) running" in text
+    assert (
+        "Close the claude-hr sessions and run `claude-hr update` again, or use `claude-hr update --force"
+        in text
+    )
+    assert "Nothing is broken. Close the claude-hr sessions" in _text(waiting)
+
+
+def test_the_report_does_not_say_everything_is_up_to_date_while_a_reinstall_waits():
+    waiting = updater.Result(
+        "self",
+        "v0.2.2",
+        "v0.2.2",
+        state="waiting",
+        detail="a reinstall was started in the last 15 minutes; waiting for it",
+    )
+    text = _text(waiting)
+    assert "Everything is up to date." not in text
+    assert (
+        "Pending:\n  self: a reinstall was started in the last 15 minutes; waiting for it" in text
+    )
+    assert "Everything is up to date." in _text(updater.Result("self", "v0.2.2", "v0.2.2"))
+    assert "Everything is up to date." not in _text(updater.Result("self"), background="/log")
+
+
+def test_a_preview_lists_failures_as_could_not_check_not_as_available():
+    failed = updater.Result("claude", action="failed", detail="could not read the release channel")
+    text = _text(failed, check=True)
+    assert "Could not check:\n  claude: could not read the release channel" in text
+    assert "Available:" not in text and "Run `claude-hr update`" not in text
+    both = _text(
+        failed,
+        updater.Result("headroom", "1", "2", action="available", detail="1 -> 2"),
+        check=True,
+    )
+    assert "Could not check:\n  claude: " in both and "Available:\n  headroom: 1 -> 2" in both
+    assert "Run `claude-hr update` to apply it." in both
+    assert "Pending:" not in both and "Failed:" not in both
+    # a real run calls the same rows Failed, not Could not check
+    assert "Failed:\n  claude: " in _text(failed) and "Could not check" not in _text(failed)
+
+
+def test_a_preview_that_cannot_see_plugins_does_not_claim_everything_is_up_to_date():
+    rows = [
+        updater.Result("claude", "2.1.1", "2.1.1"),
+        updater.Result(
+            "plugins",
+            state="not previewed",
+            detail="not previewed (the update asks Claude Code for each plugin)",
+        ),
+    ]
+    text = _text(*rows, check=True)
+    assert "Everything is up to date." not in text
+    assert "Nothing to update among what a preview can see." in text
+
+
+def test_the_hint_says_what_force_really_does_for_claude_hrs_own_reinstall(
+    managed_repo, monkeypatch
+):
+    """--force answers "" from the session guard for every component, claude-hr's own reinstall included: the hint says so
+    where claude-hr itself is among what waits, and the code behaves that way."""
+    self_wait = updater.Result(
+        "self", action="deferred", busy=True, detail="1 claude-hr session(s) running"
+    )
+    claude_wait = updater.Result(
+        "claude", action="deferred", busy=True, detail="1 claude-hr session(s) running"
+    )
+    text = _text(self_wait, claude_wait)
+    assert "or use `claude-hr update --force` to update now." in text
+    assert "--force also reinstalls claude-hr itself without waiting for the sessions" in text
+    assert "`claude-hr update --force --only claude headroom plugins`" in text
+    assert "--force also reinstalls" not in _text(claude_wait)
+    origin, work, managed = managed_repo
+    _release_v020(work)
+    _stub_uv(monkeypatch)
+    resources.register_session(os.getpid(), "/x")
+    try:
+        res = updater.Updater(config.load(), force=True).update_self()
+    finally:
+        resources.unregister_session(os.getpid())
+    assert (
+        res.action == "updated" and not res.busy
+    )  # it queues the reinstall with a session running
+
+
+# ---- one update at a time; sessions that start while a run goes on ---------------------------------------------------------
+def test_a_second_update_while_one_runs_exits_75_and_runs_nothing(sandbox, monkeypatch, capsys):
+    from claude_hr import ctl, filelock, paths
+
+    _patch_class(monkeypatch)
+    ran = []
+    monkeypatch.setattr(
+        updater.Updater,
+        "update_claude",
+        lambda self: ran.append("claude") or updater.Result("claude"),
+    )
+    with filelock.locked(paths.state_dir() / updater.UPDATE_LOCK, timeout=1):
+        assert ctl._run(["update"]) == 75
+        out = capsys.readouterr().out
+        assert "another update is running" in out and ran == []  # nothing ran
+        assert not (paths.state_dir() / "update-last.json").exists()
+        # the scheduled job is not a failure for it ...
+        assert ctl._run(["job", "update"]) == 0
+        assert "another update is running" in (paths.logs_dir() / "job-update.log").read_text(
+            encoding="utf-8"
+        )
+        # ... a preview leaves no trace and needs no lock ...
+        assert ctl._run(["update", "--check"]) == 0 and ran == ["claude"]
+        # ... and the post phase waits for it a while, then gives up the same way
+        monkeypatch.setattr(updater, "POST_LOCK_WAIT_S", 0.3)
+        assert ctl._run(["update", "--post"]) == 75
+    assert ctl._run(["update"]) == 0 and ran == ["claude", "claude"]  # released: the next one runs
+    assert not (paths.state_dir() / updater.UPDATE_LOCK).exists()  # ... and releases it again
+
+
+def test_a_lock_left_by_a_dead_update_is_taken_over(sandbox, monkeypatch):
+    from claude_hr import paths
+
+    _patch_class(monkeypatch)
+    lock = paths.state_dir() / updater.UPDATE_LOCK
+    lock.parent.mkdir(parents=True, exist_ok=True)
+    lock.write_text("999999\n", encoding="utf-8")
+    monkeypatch.setattr(updater.sysinfo, "pid_alive", lambda pid: False)
+    assert updater.Updater(config.load()).run(["claude"]).ok
+    assert not lock.exists()
+
+
+@pytest.mark.parametrize("forced", [False, True])
+def test_sessions_that_start_while_the_run_goes_on_cancel_claude_hrs_own_reinstall(
+    sandbox, monkeypatch, forced
+):
+    from claude_hr import paths
+
+    events, launched = [], []
+    u = updater.Updater(config.load(), force=forced)
+    for comp in ("claude", "headroom", "proxy"):
+        monkeypatch.setattr(
+            u, f"update_{comp}", lambda comp=comp: events.append(comp) or updater.Result(comp)
+        )
+    monkeypatch.setattr(u, "reapply_baseline", lambda: events.append("baseline"))
+
+    def queue():
+        u._pending_reinstall = ["uv", "tool", "install"]
+        updater.write_json(
+            paths.state_dir() / "self-update.json", {"ts": __import__("time").time()}
+        )
+        return updater.Result("self", "v0.2.2", "v0.2.3", action="updated")
+
+    def plugins():
+        resources.register_session(
+            os.getpid(), "/x"
+        )  # somebody starts claude-hr in another terminal
+        return updater.Result("plugins")
+
+    monkeypatch.setattr(u, "update_self", queue)
+    monkeypatch.setattr(u, "update_plugins", plugins)
+    monkeypatch.setattr(u, "_launch_reinstall", lambda post=None: launched.append(post))
+    try:
+        rep = u.run()
+    finally:
+        resources.unregister_session(os.getpid())
+    if forced:  # --force never waited for sessions
+        assert len(launched) == 1 and rep.background
+        return
+    assert launched == [] and u._pending_reinstall is None and rep.background == ""
+    row = rep.results[0]
+    assert row.action == "deferred" and row.busy
+    assert row.detail.startswith("1 claude-hr session(s) running (started while this ran)")
+    assert rep.exit_code() == updater.EXIT_DEFERRED
+    assert not (
+        paths.state_dir() / "self-update.json"
+    ).exists()  # the retry must not wait for its 15-minute mark
+    assert events == [
+        "claude",
+        "headroom",
+        "baseline",
+        "proxy",
+    ]  # the rest finished inline, on the code that runs now
+    assert updater.read_last()["phase"] == "complete"
+
+
+def test_a_second_post_phase_keeps_the_rows_of_the_run_before_it(sandbox, monkeypatch):
+    """`update --post` twice (a helper started twice, or the hidden flag typed by hand) must not replace the first run's
+    rows with its own two."""
+    events, launched = [], []
+    u = _spied(monkeypatch, events)
+    monkeypatch.setattr(
+        u,
+        "update_self",
+        lambda: (
+            setattr(u, "_pending_reinstall", ["uv"])
+            or updater.Result("self", "v0.2.2", "v0.2.3", action="updated")
+        ),
+    )
+    monkeypatch.setattr(u, "_launch_reinstall", lambda post=None: launched.append(post))
+    monkeypatch.setattr(
+        u, "update_claude", lambda: updater.Result("claude", "2.1.1", "2.1.2", action="updated")
+    )
+    u.run()
+    _spied(monkeypatch, []).run_post()  # the first one continues the pending record ...
+    first = updater.read_last()
+    assert first["phase"] == "complete" and "post_only" not in first
+    components = [r["component"] for r in first["results"]]
+    assert components == ["self", "claude", "headroom", "plugins", "baseline", "proxy"]
+    for n in (1, 2):  # ... a second, and a third, are labelled and appended
+        events2 = []
+        _spied(monkeypatch, events2).run_post()
+        assert events2 == ["baseline", "proxy"]
+        rec = updater.read_last()
+        assert {k: v for k, v in rec.items() if k != "post_only"} == first
+        assert len(rec["post_only"]) == n
+        assert rec["post_only"][-1]["label"].startswith("post phase only")
+        assert [r["component"] for r in rec["post_only"][-1]["results"]] == ["baseline", "proxy"]
+    assert "updated self v0.2.2 -> v0.2.3" in updater.last_update_summary()
+    assert "claude 2.1.1 -> 2.1.2" in updater.last_update_summary()
+
+
+def test_the_post_phase_continues_only_a_recent_pending_record(sandbox, monkeypatch):
+    """run_post's phase check: pending and recent = continue it; pending and abandoned = replace it; anything else (a
+    finished run, no record) = a post-only entry that leaves the run before it alone."""
+    import time
+
+    path = updater.paths.state_dir() / "update-last.json"
+    rows = [{"component": "self", "action": "updated", "current": "a", "target": "b"}]
+
+    def run_post(**record):
+        updater.paths.ensure_dirs()
+        if record:
+            updater.write_json(
+                path, {"post": {"steps": ["baseline"], "doctor": False}, "results": rows, **record}
+            )
+        else:
+            path.unlink(missing_ok=True)
+        rep = _spied(monkeypatch, []).run_post()
+        return [r.component for r in rep.results], updater.read_last()
+
+    now = time.time()
+    got, rec = run_post(phase="pending", ts=now)
+    assert got == ["self", "baseline"] and rec["phase"] == "complete" and "post_only" not in rec
+    got, rec = run_post(phase="pending", ts=now - updater.PENDING_MAX_AGE_S - 60)
+    assert got == ["baseline", "proxy"] and [r["component"] for r in rec["results"]] == [
+        "baseline",
+        "proxy",
+    ]
+    got, rec = run_post(phase="complete", ts=now - 60)
+    assert got == ["baseline", "proxy"]
+    assert [r["component"] for r in rec["results"]] == ["self"]  # the finished run is untouched ...
+    assert len(rec["post_only"]) == 1  # ... and the post phase is on record next to it
+    got, rec = run_post()  # no record at all
+    assert (
+        got == ["baseline", "proxy"]
+        and rec["label"] == "post phase only"
+        and "post_only" not in rec
+    )
+
+
+def test_a_post_phase_survives_a_pending_record_of_the_wrong_shape(sandbox, monkeypatch):
+    import time
+
+    updater.paths.ensure_dirs()
+    updater.write_json(
+        updater.paths.state_dir() / "update-last.json",
+        {
+            "phase": "pending",
+            "ts": time.time(),
+            "header": None,
+            "results": None,
+            "post": {"steps": None},
+        },
+    )
+    rep = _spied(monkeypatch, []).run_post()
+    assert [
+        r.component for r in rep.results
+    ] == []  # nothing to continue, no post steps listed: nothing crashed
+
+
+@pytest.mark.parametrize(
+    "rec",
+    [
+        {"ts": -1},
+        {"ts": 1e999},
+        {"ts": 1e300},
+        {"ts": float("nan")},
+        {"ts": True},
+        {"ts": "yesterday"},
+        {"ts": 1700000000, "results": None},
+        {"ts": 1700000000, "results": 5},
+        {"ts": 1700000000, "results": [1, "x", None, {"component": "a", "action": "updated"}]},
+        {"ts": 1700000000, "doctor": [1], "results": {}},
+        {"ts": 1700000000, "phase": "pending"},
+    ],
+)
+def test_status_never_dies_on_an_update_record_of_the_wrong_shape(sandbox, rec):
+    updater.paths.ensure_dirs()
+    (updater.paths.state_dir() / "update-last.json").write_text(json.dumps(rec), encoding="utf-8")
+    line = updater.last_update_summary()
+    assert line is None or isinstance(line, str)
+
+
+# ---- --claude-only is exclusive; the post phase starts where it can be trusted ----------------------------------------------
+@pytest.mark.parametrize(
+    "flags,named",
+    [
+        (["--check"], "--check"),
+        (["--only", "plugins"], "--only"),
+        (["--force"], "--force"),
+        (["--allow-downgrade"], "--allow-downgrade"),
+        (["--no-restart"], "--no-restart"),
+        (["--post"], "--post"),
+        (["--check", "--force"], "--check, --force"),
+    ],
+)
+def test_claude_only_takes_none_of_the_other_switches(sandbox, monkeypatch, capsys, flags, named):
+    from claude_hr import ctl
+
+    monkeypatch.setattr(ctl.procutil, "find_claude", lambda *a, **k: Path("/fake/claude"))
+    monkeypatch.setattr(ctl.subprocess, "call", lambda *a, **k: pytest.fail("claude must not run"))
+    monkeypatch.setattr(
+        updater.Updater, "run", lambda *a, **k: pytest.fail("claude-hr's own update must not run")
+    )
+    assert ctl._run(["update", "--claude-only", *flags]) == 2
+    out = capsys.readouterr().out.strip().splitlines()
+    assert len(out) == 1 and f"takes none of {named}:" in out[0]
+
+
+@pytest.mark.real_helpers
+def test_the_systemd_unit_starts_in_the_state_directory_and_gets_every_dollar_doubled(
+    sandbox, monkeypatch
+):
+    from claude_hr import resources
+
+    seen = {}
+    monkeypatch.setattr(updater.paths, "IS_LINUX", True)
+    monkeypatch.setattr(resources, "caps_available", lambda: True)
+    monkeypatch.setattr(
+        updater.procutil,
+        "run",
+        lambda cmd, **k: seen.update(cmd=cmd) or subprocess.CompletedProcess(cmd, 0, "", ""),
+    )
+    chain = updater._posix_chain(["/opt/${HOME}/uv", "tool", "install"], ["/p/$$/python", "-I"])
+    assert (
+        updater._start_systemd_service(chain, "/tmp/self-update.log", cwd="/srv/hr state") is True
+    )
+    cmd = seen["cmd"]
+    assert "WorkingDirectory=/srv/hr state" in cmd
+    words = cmd[cmd.index("--") + 1 :]
+    assert words[:2] == ["/bin/sh", "-c"] and len(words) == 3
+    script = words[2]
+    assert "$$" in script and "$${HOME}" in script  # the path's own ${HOME} and $$, doubled
+    assert script.replace("$$", "").count("$") == 0  # every `$` that reaches systemd is doubled
+    # what the shell sees after systemd has turned $$ back into $ is the original chain
+    assert script.replace("$$", "$") == chain[2]
+
+
+@pytest.mark.real_helpers
+def test_the_detached_helper_starts_in_the_given_directory_when_there_is_one(
+    sandbox, monkeypatch, tmp_path
+):
+    calls = []
+    monkeypatch.setattr(updater.paths, "IS_WINDOWS", False)
+    monkeypatch.setattr(subprocess, "Popen", lambda cmd, **kw: calls.append(kw))
+    updater._spawn_detached(["sh", "-c", "true"], tmp_path / "x.log", cwd=tmp_path)
+    updater._spawn_detached(["sh", "-c", "true"], tmp_path / "x.log", cwd=tmp_path / "missing")
+    updater._spawn_detached(["sh", "-c", "true"], None)
+    assert calls[0]["cwd"] == str(tmp_path)
+    assert (
+        "cwd" not in calls[1] and "cwd" not in calls[2]
+    )  # a directory that is not there must not stop the reinstall
+
+
+@pytest.mark.skipif(
+    __import__("shutil").which("powershell") is None and __import__("shutil").which("pwsh") is None,
+    reason="needs PowerShell",
+)
+def test_the_helper_logs_the_real_outcome_of_a_post_command_that_cannot_start(tmp_path):
+    """$LASTEXITCODE still held the reinstall's 0 after a post command that never ran: the log said 'exit code 0' and the
+    error went to a stream nobody reads. The generated script runs under the real shell (never the scheduler: the lines that
+    remove the script and unregister the task are cut)."""
+    if os.name != "nt":
+        pytest.skip("the commands below are Windows commands")
+    shell = __import__("shutil").which("powershell") or __import__("shutil").which("pwsh")
+    log = tmp_path / "self-update.log"
+    cmd_exe = os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32", "cmd.exe")
+
+    def run(post):
+        log.unlink(missing_ok=True)
+        script = updater._windows_reinstall_script(
+            [cmd_exe, "/c", "exit 0"], 999999, 999998, log, env={}, post=post, cwd=tmp_path
+        )
+        keep = [
+            ln
+            for ln in script.splitlines()
+            if not ln.startswith("Unregister-ScheduledTask") and "Remove-Item" not in ln
+        ]
+        ps1 = tmp_path / "helper.ps1"
+        ps1.write_bytes(b"\xef\xbb\xbf" + ("\n".join(keep) + "\n").encode("utf-8"))
+        subprocess.run(
+            [
+                shell,
+                "-NoProfile",
+                "-NonInteractive",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+                str(ps1),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        return log.read_text(encoding="utf-8-sig")
+
+    text = run(
+        [str(tmp_path / "no-such-dir" / "python.exe"), "-m", "claude_hr.ctl", "update", "--post"]
+    )
+    assert "reinstall exit code 0" in text
+    assert "could not start the post phase: " in text and "no-such-dir" in text
+    assert (
+        "post phase exit code 0" not in text and "the post phase did not run (no exit code)" in text
+    )
+    assert "post phase exit code 3" in run([cmd_exe, "/c", "exit 3"])
+    assert "post phase exit code 0" in run([cmd_exe, "/c", "exit 0"])

@@ -830,12 +830,155 @@ def test_update_help_is_claude_hrs_own_help_not_claudes(launch_recorder, capsys)
     assert launch_recorder.started == []  # Claude Code's own help was never asked for
 
 
-def test_a_session_spawned_by_claude_keeps_the_old_pass_through(update_world, monkeypatch):
-    """Hooks, plugin commands and agents run with CLAUDE_HR_SESSION=1: nothing Claude spawns may start an update of the setup."""
+def _as(monkeypatch, name):
+    """Run the launcher under the name `name` (sys.argv[0]): `claude.exe` is what the shim is on Windows."""
+    import sys
+
+    monkeypatch.setattr(sys, "argv", [name])
+
+
+def test_a_session_spawned_by_claude_through_the_shim_keeps_the_old_pass_through(
+    update_world, monkeypatch
+):
+    """Hooks, plugin commands, Claude's own relaunch run `claude` (the shim) with CLAUDE_HR_SESSION=1: nothing Claude
+    spawns may start an update of the setup, even where a person at a terminal would get one."""
     monkeypatch.setenv("CLAUDE_HR_SESSION", "1")
-    assert _main(["update"]) == 7
-    assert update_world.started == [[str(update_world.claude), "update"]]
+    monkeypatch.setattr(launcher, "_on_a_terminal", lambda: True)
+    for name in ("claude.exe", "claude", r"C:\Users\x\.claude-hr\bin\claude.exe"):
+        _as(monkeypatch, name)
+        assert _main(["update"]) == 7
+        assert update_world.started == [[str(update_world.claude), "update"]], name
+        update_world.started.clear()
     assert update_world.updates == []
+    # `--claude-only` is claude-hr's switch: Claude's own updater never sees it, in a session either
+    assert _main(["update", "--claude-only", "x"]) == 7
+    assert update_world.started == [[str(update_world.claude), "update", "x"]]
+
+
+def test_an_explicit_claude_hr_update_inside_a_session_is_the_whole_update_not_claudes(
+    update_world, monkeypatch
+):
+    """It will defer (a session runs: exit 75), but it is never Claude's updater, and --check / --only never reach
+    `claude update`, which would reject them."""
+    monkeypatch.setenv("CLAUDE_HR_SESSION", "1")
+    for name in ("claude-hr", "claude-hr.exe", "launcher.py"):
+        _as(monkeypatch, name)
+        assert _main(["update", "--check", "--only", "claude"]) == 5
+    assert update_world.updates == [(["--check", "--only", "claude"], "claude-hr update")] * 3
+    assert update_world.started == []
+
+
+@pytest.mark.parametrize("terminal,whole_update", [(True, True), (False, False)])
+def test_under_the_shims_name_update_is_the_whole_update_only_at_a_terminal(
+    update_world, monkeypatch, terminal, whole_update
+):
+    """A script, an IDE or CI that runs `claude update` through the shim wants Claude's updater, as it always got."""
+    monkeypatch.setattr(launcher, "_on_a_terminal", lambda: terminal)
+    for name in ("claude.exe", "claude"):
+        _as(monkeypatch, name)
+        update_world.started.clear()
+        update_world.updates.clear()
+        rc = _main(["update"])
+        if whole_update:
+            assert rc == 5 and update_world.updates == [([], "claude-hr update")]
+            assert update_world.started == []
+        else:
+            assert rc == 7 and update_world.started == [[str(update_world.claude), "update"]]
+            assert update_world.updates == []
+
+
+@pytest.mark.parametrize("terminal", [True, False])
+def test_the_shim_script_says_it_is_the_shim_with_a_switch_claude_never_sees(
+    update_world, monkeypatch, terminal
+):
+    """The POSIX shim is a shell script that execs claude-hr: the launcher cannot see the name `claude`, so it passes
+    --hr-shim."""
+    _as(monkeypatch, "claude-hr")
+    monkeypatch.setattr(launcher, "_on_a_terminal", lambda: terminal)
+    rc = _main(["--hr-shim", "update"])
+    if terminal:
+        assert rc == 5 and update_world.updates == [([], "claude-hr update")]
+    else:
+        assert rc == 7 and update_world.started == [[str(update_world.claude), "update"]]
+    update_world.started.clear()
+    assert _main(["--hr-shim", "mcp", "list"]) == 7
+    assert update_world.started == [[str(update_world.claude), "mcp", "list"]]  # never forwarded
+
+
+def test_a_person_who_typed_claude_hr_update_gets_the_whole_update_without_a_terminal_too(
+    update_world, monkeypatch
+):
+    _as(monkeypatch, "claude-hr")
+    monkeypatch.setattr(launcher, "_on_a_terminal", lambda: False)
+    assert _main(["update", "--check"]) == 5
+    assert update_world.updates == [(["--check"], "claude-hr update")]
+
+
+def test_a_terminal_means_both_ends_and_a_stream_that_cannot_say_is_not_one(monkeypatch):
+    import sys
+
+    class Stream:
+        def __init__(self, tty):
+            self.tty = tty
+
+        def isatty(self):
+            if self.tty is None:
+                raise ValueError("I/O operation on closed file")
+            return self.tty
+
+    for stdin, stdout, expected in (
+        (True, True, True),
+        (True, False, False),
+        (False, True, False),
+        (None, True, False),
+    ):
+        monkeypatch.setattr(sys, "stdin", Stream(stdin))
+        monkeypatch.setattr(sys, "stdout", Stream(stdout))
+        assert launcher._on_a_terminal() is expected
+    monkeypatch.setattr(sys, "stdin", None)
+    assert launcher._on_a_terminal() is False
+
+
+@pytest.mark.parametrize(
+    "argv,rest",
+    [
+        (["--verbose", "update"], []),
+        (["--dangerously-skip-permissions", "--verbose", "upgrade", "--check"], ["--check"]),
+        (["--hr-direct", "--bare", "update", "--force"], ["--force"]),
+    ],
+)
+def test_plain_flags_before_update_still_reach_the_update_command(update_world, argv, rest):
+    assert _main(argv) == 5
+    assert update_world.updates == [(rest, "claude-hr update")]
+    assert update_world.started == []
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        [
+            "--model",
+            "opus",
+            "update",
+        ],  # a value-taking flag: the word after it is its value, not ours to guess
+        ["-p", "update"],  # a prompt
+        ["--resume", "update"],
+        ["--", "update"],
+        ["x", "update"],
+        [],
+    ],
+)
+def test_other_flags_before_update_keep_it_claudes(update_world, capsys, argv):
+    assert launcher._update_at(argv) is None
+    assert launcher.main(["--hr-dry-run", *argv]) == 0
+    assert "plan: kind=update" not in capsys.readouterr().err
+    assert update_world.updates == [] and update_world.started == []
+
+
+def test_update_is_found_after_plain_flags_only():
+    assert launcher._update_at(["update"]) == 0
+    assert launcher._update_at(["--verbose", "-c", "upgrade", "--check"]) == 2
+    assert launcher._update_at(["--verbose", "--model", "opus", "update"]) is None
 
 
 def test_update_with_a_dry_run_prints_the_plan_and_runs_nothing(update_world, capsys):

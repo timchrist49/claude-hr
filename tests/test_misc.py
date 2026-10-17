@@ -343,6 +343,23 @@ def test_windows_shim_passes_arguments_through_exactly(sandbox, tmp_path, monkey
     assert not (tmp_path / "b.txt").exists()
 
 
+def test_the_posix_shim_script_tells_the_launcher_it_is_the_shim(sandbox, monkeypatch):
+    """The script execs claude-hr, so the launcher never sees the name `claude`: `claude update` through the shim is
+    Claude's updater for a script or an IDE (launcher._wants_update_everything), and only the launcher can tell if it is
+    told. --hr-shim is stripped before Claude sees the arguments."""
+    from claude_hr import ctl, launcher, procutil
+
+    monkeypatch.setattr(ctl.paths, "IS_WINDOWS", False)
+    monkeypatch.setattr(procutil, "which_all", lambda name, path=None: [])
+    ns = type("A", (), {"action": "install"})()
+    assert ctl.cmd_shim(ns, config.load()) == 0
+    script = (paths.bin_dir() / "claude").read_text(encoding="utf-8")
+    assert script == '#!/bin/sh\nexec "claude-hr" --hr-shim "$@"\n'
+    assert procutil._is_shim(paths.bin_dir() / "claude")
+    opts, rest = launcher._split_hr_flags(["--hr-shim", "update", "--check"])
+    assert opts == {"shim": True} and rest == ["update", "--check"]
+
+
 def test_doctor_says_so_when_linux_memory_caps_are_inactive(sandbox, monkeypatch):
     """The caps silently do nothing without a systemd user bus (minimal VMs, stock WSL); doctor must not hide that."""
     from pathlib import Path

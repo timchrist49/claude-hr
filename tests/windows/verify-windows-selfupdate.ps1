@@ -111,6 +111,7 @@ function Verify-PostPhase($label, $v) {
   Check "$label : the record names the self update and the plugins step" ((@($rec.results | Where-Object { $_.component -eq 'self' -and $_.action -eq 'updated' }).Count -eq 1) -and (@($rec.results | Where-Object { $_.component -eq 'plugins' }).Count -eq 1)) (($rec.results | ConvertTo-Json -Compress -Depth 4))
   $helperLog = Get-Content "$sb\h\.claude-hr\logs\self-update.log" -Raw -ErrorAction SilentlyContinue
   Check "$label : the helper log shows the reinstall succeeded and the post phase exited 0" (($helperLog -match 'reinstall exit code 0') -and ($helperLog -match 'post phase exit code 0')) $helperLog
+  Check "$label : the post phase ran isolated (python -I, so nothing from the directory update was typed in is imported)" ($helperLog -match 'running the post phase: .* -I -m claude_hr\.ctl update --post') $helperLog
   $st = Run "claude-hr-ctl status"
   Check "$label : claude-hr-ctl status shows the last update" ($st -match 'Last update: ') $st
 }
