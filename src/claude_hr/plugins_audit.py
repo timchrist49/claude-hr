@@ -60,6 +60,15 @@ def plugin_cost(claude: Path, plugin_id: str) -> PluginRow:
     return row
 
 
+class AuditRows(list):
+    """The rows of `audit_plugins`, plus what the usage scan behind their `uses` column could and could not read."""
+
+    partial = False  # the transcript scan ran out of time: `uses` are lower bounds
+    unreadable = 0  # transcript files (or folders) that could not be read and are in no count
+    measured = False  # `uses` were counted at all
+    days = 30  # the usage window
+
+
 def count_uses(row: PluginRow, counts: dict[str, int]) -> int:
     """Attribute usage counts to a plugin by skill/agent name, `plugin:` prefix, or plugin MCP server name."""
     name = row.id.split("@")[0]
@@ -77,19 +86,23 @@ def count_uses(row: PluginRow, counts: dict[str, int]) -> int:
 
 def audit_plugins(
     cfg: Config, claude: Path | None, cwd: Path | None = None, usage_days: int = 30
-) -> list[PluginRow]:
+) -> AuditRows:
+    result = AuditRows()
+    result.days = usage_days
     if not claude:
-        return []
+        return result
     from . import usage as usage_mod
 
     counts = usage_mod.collect_tool_use(usage_days)
     measured = bool(counts) or usage_mod.has_transcripts()
+    result.measured = measured
+    result.partial = bool(getattr(counts, "partial", False))
+    result.unreadable = int(getattr(counts, "unreadable", 0) or 0)
     setup = ClaudeSetup(cfg, None, claude)  # type: ignore[arg-type]
     with (paths.package_data_dir() / "plugins.toml").open("rb") as fh:
         plan = tomllib.load(fh)
     redundant = {k.split("@")[0]: v for k, v in plan.get("redundant", {}).items()}
     projects = {k.split("@")[0]: v for k, v in plan.get("project_scoped", {}).items()}
-    rows: list[PluginRow] = []
     sources: dict[str, set[str]] = {}  # plugin name -> distinct marketplaces it is installed from
     by_key: dict[tuple[str, str], PluginRow] = {}
     for p in setup._installed_plugins():
@@ -120,7 +133,8 @@ def audit_plugins(
             row.uses = count_uses(row, counts)
             if (
                 row.uses == 0
-                and not getattr(counts, "partial", False)  # a scan cut short cannot say "unused"
+                and not result.partial  # a scan cut short, or one that missed files, cannot say "unused"
+                and not result.unreadable
                 and row.enabled
                 and row.always_on_tokens >= 100
                 and not row.id.startswith("hr-core@")
@@ -128,18 +142,20 @@ def audit_plugins(
                 row.notes.append(
                     f"not used in the last {usage_days} days: disabling would save ~{row.always_on_tokens} tokens/session"
                 )
-        rows.append(row)
-    for row in rows:
+        result.append(row)
+    for row in result:
         if len(sources.get(row.id.split("@")[0], ())) > 1:
             row.notes.append(
                 "same plugin name installed from several marketplaces (duplicate skills)"
             )
         if row.installs > 1:
             row.notes.append(f"enabled in {row.installs} projects")
-    return rows
+    return result
 
 
 def format_plugins(rows: list[PluginRow]) -> str:
+    partial = bool(getattr(rows, "partial", False))
+    unreadable = int(getattr(rows, "unreadable", 0) or 0)
     out = [
         f"{'plugin':<52} {'scope':<8} {'always-on':>10} {'skills':>6} {'agents':>6} {'mcp':>4} {'uses':>6}"
     ]
@@ -147,7 +163,7 @@ def format_plugins(rows: list[PluginRow]) -> str:
     total = 0
     for r in sorted(rows, key=lambda r: -r.always_on_tokens):
         key = (r.id, r.scope)
-        uses = "-" if r.uses is None else str(r.uses)
+        uses = "-" if r.uses is None else (f">={r.uses}" if partial else str(r.uses))
         out.append(
             f"{r.id:<52} {r.scope:<8} {('~' + str(r.always_on_tokens)):>10} {r.skills:>6} {r.agents:>6} {r.mcp_servers:>4} {uses:>6}"
         )
@@ -159,6 +175,22 @@ def format_plugins(rows: list[PluginRow]) -> str:
     out.append(
         f"\nEstimated always-on cost of enabled plugins: ~{total:,} tokens added to every session"
     )
+    if any(r.uses is not None for r in rows):
+        days = getattr(rows, "days", 30)
+        out.append(
+            f"uses = skill, subagent and MCP calls found in the transcript files modified in the last {days} days: "
+            "the window is by file modification time, not by when each call was made."
+        )
+    if partial:
+        out.append(
+            "PARTIAL: the transcript scan stopped early; the uses column is a lower bound "
+            "and no plugin is called unused."
+        )
+    if unreadable:
+        out.append(
+            f"{unreadable} transcript file(s) could not be read; the uses column leaves them out "
+            "and no plugin is called unused."
+        )
     return "\n".join(out)
 
 

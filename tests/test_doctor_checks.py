@@ -263,6 +263,24 @@ def test_an_unparsable_claude_json_is_a_failed_check_not_a_crash(sandbox, fake_c
     )  # the credential scan reads the same file: reported as skipped, not raised
 
 
+def test_the_credentials_line_says_when_the_scan_did_not_cover_every_project(
+    sandbox, fake_claude, monkeypatch
+):
+    """'none' from a scan that stopped at its project cap is not the same as none."""
+    from claude_hr import creds
+
+    monkeypatch.setattr(creds, "MAX_PROJECT_DIRS", 1)
+    paths.claude_global_json().write_text(
+        json.dumps({"projects": {str(sandbox / "a"): {}, str(sandbox / "b"): {}}}),
+        encoding="utf-8",
+    )
+    got = checks()["MCP literal secrets"]
+    assert got.status == "info"
+    assert got.detail.startswith(
+        "none (not everything was scanned: scan stopped after 1 of 2 projects"
+    )
+
+
 def test_an_unparsable_settings_merge_record_is_a_failed_check_not_a_crash(sandbox, fake_claude):
     f = paths.state_dir() / "settings-merge.json"
     f.parent.mkdir(parents=True, exist_ok=True)
