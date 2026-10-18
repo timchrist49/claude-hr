@@ -100,7 +100,7 @@ check "bash guard is quiet when a message only mentions --no-verify" git_guard_q
 echo "== 6b. development loop: end-of-turn gate, trust, audit, scaffolding, footprint =="
 PY_TOOL="$HOME/.local/share/uv/tools/claude-hr/bin/python"
 check "hr-gates plugin installed (standard profile)" bash -c "claude plugin list --json | grep -q hr-gates"
-check "footprint is within the standard budget"      bash -c "claude-hr-ctl footprint | grep -q ': OK'"
+check "footprint measures the always-on tokens (no cap)" bash -c "claude-hr-ctl footprint | grep -q 'Estimated always-on' && ! claude-hr-ctl footprint | grep -q 'OVER'"
 GP=/tmp/gateproj; rm -rf "$GP"; mkdir -p "$GP/.claude"; git -C "$GP" init -q
 git -C "$GP" config user.email t@example.com; git -C "$GP" config user.name t
 cat > "$GP/.claude/hr-verify.toml" <<'TOML'

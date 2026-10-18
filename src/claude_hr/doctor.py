@@ -131,26 +131,29 @@ def state_inside_warning() -> str:
 
 
 def _footprint_check(cfg: Config, listing: list[dict]) -> Check | None:
-    """Estimated always-on tokens of the installed plugins against footprint.budget_standard_tokens (standard profile only).
+    """Estimated always-on tokens of the installed plugins, for every profile. There is no cap unless the user sets one
+    (footprint.budget_standard_tokens > 0, standard profile only): then OVER is a WARN.
 
     Costs nothing extra: it reuses the `claude plugin list --json` data the plugins check already fetched, and reads only the
     plugin files `claude-hr-ctl footprint` would. None (no check) when there is nothing to measure or anything goes wrong."""
-    if str(cfg.get("plugins.profile", "standard")) != "standard" or not listing:
+    if not listing:
         return None
     try:
         from . import footprint
 
         fps = footprint.scan_installed(listing)
         tokens = footprint.always_on_tokens(fps)
-        budget = int(cfg.get("footprint.budget_standard_tokens", 1500))
+        cap = int(cfg.get("footprint.budget_standard_tokens", 0) or 0)
     except Exception:  # noqa: BLE001 - an optional estimate must never break doctor
         return None
-    over = tokens > budget
+    shown = f"~{tokens:,} always-on tokens from {len(fps)} plugin(s)"
+    if cap <= 0 or str(cfg.get("plugins.profile", "standard")) != "standard":
+        return Check("footprint", OK, shown + " (measured; no cap set)")
+    over = tokens > cap
     return Check(
         "footprint",
         WARN if over else OK,
-        f"~{tokens:,} always-on tokens from {len(fps)} plugin(s); budget {budget:,}"
-        + (f": OVER by {tokens - budget:,}" if over else ""),
+        f"{shown}; cap {cap:,}" + (f": OVER by {tokens - cap:,}" if over else ""),
         "claude-hr-ctl footprint   (per-plugin table; `claude-hr-ctl plugins audit` shows what to disable)"
         if over
         else "",

@@ -269,9 +269,7 @@ def test_plugins_audit_flags_an_installed_ecc_as_reviewed_and_rejected(sandbox, 
     rows = {r.id: r for r in plugins_audit.audit_plugins(config.load(), Path("claude"))}
     for plugin_id in ("ecc@ecc", "everything-claude-code@some-market"):
         notes = [n for n in rows[plugin_id].notes if n.startswith("redundant: ")]
-        assert notes and "Reviewed and rejected" in notes[0] and "docs/ADDONS.md" in notes[0], (
-            plugin_id
-        )
+        assert notes and "not adopted" in notes[0] and "docs/ADDONS.md" in notes[0], plugin_id
     assert not [n for n in rows["hr-core@claude-hr"].notes if n.startswith("redundant: ")]
 
 

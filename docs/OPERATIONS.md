@@ -28,7 +28,7 @@ claude-hr-ctl verify trust             # in a normal terminal, never inside Clau
 claude-hr-ctl trail --tail 20          # what the end-of-turn gate did (metadata only)
 claude-hr-ctl audit [--strict]         # read-only repository audit, zero tokens
 claude-hr-ctl init-repo [--apply]      # scaffold CI, Dependabot, issue/PR templates, docs/plans + decisions, REVIEW.md, .editorconfig, .gitattributes
-claude-hr-ctl footprint                # always-on token cost of the plugins, against footprint.budget_standard_tokens
+claude-hr-ctl footprint                # always-on token cost of the plugins (measured; no cap unless footprint.budget_standard_tokens is set)
 ```
 The gate runs once per turn, only for a git repository, and not at all in plan mode or for subagents. It skips a working
 tree that did not change since it last passed. A failing trusted check blocks the turn's end at most `verify.gate_max_blocks`
@@ -73,13 +73,13 @@ All keys live in `~/.claude-hr/config.toml` (or `/etc/claude-hr/config.toml`, or
 | `audit.tools`, `audit.timeout_s` | true, 60 | `audit --tools` may run installed scanners, per-scanner limit |
 | `github.readonly_allow` | true | the baseline pre-approves read-only `gh` calls |
 | `security.stop_review` | "off" | `off` (also false, 0, no, disabled) sets `ENABLE_STOP_REVIEW=0`; `plugin-default` (also on, true, 1, yes, enabled) leaves security-guidance's per-turn Opus review on |
-| `footprint.budget_standard_tokens` | 1500 | `footprint --strict` and `doctor` compare the standard profile's always-on estimate with it |
+| `footprint.budget_standard_tokens` | 0 | 0 = no cap (the default): `footprint` and `doctor` show the always-on estimate and nothing is refused or warned about. A number above 0 makes `doctor` warn, and `footprint --strict` exit 1, above it (standard profile only) |
 | `skills.max_description_chars` | 400 | `skills` and `plugins audit` flag longer listed descriptions |
 
 `doctor` reports, among the existing checks: the recipe state of the current repository (from any subdirectory), a missing `claude-hr-hook` on PATH, a foreign proxy or Headroom
 Desktop, `security-guidance` reviews that were skipped for lack of API credentials, `managed settings` (WARN when the baseline was applied by another claude-hr version or
-`setup --only settings` would still change something; FAIL on an unparsable `state/settings-merge.json`), `footprint` (the always-on token estimate against
-`footprint.budget_standard_tokens`, standard profile only), an unparsable `~/.claude.json` and an unrecognised `security.stop_review` value.
+`setup --only settings` would still change something; FAIL on an unparsable `state/settings-merge.json`), `footprint` (the always-on token estimate for every profile; a WARN only if a cap is set with
+`footprint.budget_standard_tokens`), an unparsable `~/.claude.json` and an unrecognised `security.stop_review` value.
 
 ## Updates
 ```

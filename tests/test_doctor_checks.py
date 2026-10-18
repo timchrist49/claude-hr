@@ -474,23 +474,34 @@ def test_footprint_budget_is_checked_from_the_plugin_list_doctor_already_fetched
     )
     monkeypatch.setattr(footprint, "scan_installed", lambda listing: ["fp"])
     monkeypatch.setattr(footprint, "always_on_tokens", lambda fps: 2600)
+    # no cap by default: the estimate is shown, never warned about, however large it is
+    got = checks()["footprint"]
+    assert (
+        got.status == "ok"
+        and "~2,600 always-on tokens" in got.detail
+        and "no cap set" in got.detail
+    )
+    assert asked == [
+        1
+    ]  # one `claude plugin list` call serves both the plugins check and the estimate
+    # a cap is opt-in: then OVER is a WARN with the fix
+    monkeypatch.setenv("CLAUDE_HR_FOOTPRINT__BUDGET_STANDARD_TOKENS", "1500")
     got = checks()["footprint"]
     assert (
         got.status == "warn"
         and "OVER by 1,100" in got.detail
         and "claude-hr-ctl footprint" in got.fix
     )
-    assert asked == [
-        1
-    ]  # one `claude plugin list` call serves both the plugins check and the budget
     monkeypatch.setattr(footprint, "always_on_tokens", lambda fps: 900)
     assert checks()["footprint"].status == "ok"
     monkeypatch.setenv("CLAUDE_HR_FOOTPRINT__BUDGET_STANDARD_TOKENS", "500")
-    assert checks()["footprint"].status == "warn"  # the budget is configurable
-    monkeypatch.delenv("CLAUDE_HR_FOOTPRINT__BUDGET_STANDARD_TOKENS")
+    assert checks()["footprint"].status == "warn"  # the cap is configurable
+    # other profiles add plugins on purpose: the estimate is shown, the cap does not apply
     monkeypatch.setenv("CLAUDE_HR_PLUGINS__PROFILE", "full")
-    assert "footprint" not in checks()  # other profiles add plugins on purpose: no budget
+    got = checks()["footprint"]
+    assert got.status == "ok" and "no cap set" in got.detail
     monkeypatch.delenv("CLAUDE_HR_PLUGINS__PROFILE")
+    monkeypatch.delenv("CLAUDE_HR_FOOTPRINT__BUDGET_STANDARD_TOKENS")
     monkeypatch.setattr(ClaudeSetup, "_installed_plugins", lambda self: [])
     assert "footprint" not in checks()  # nothing was measured: no verdict either way
 
