@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.3.3
+No token cap by default, and ECC, Ponytail and Chisle were tested head to head instead of judged on paper.
+- **`footprint.budget_standard_tokens` is now 0 = no cap.** It was 1500 and made `doctor` warn and `footprint --strict` fail above
+  it (standard profile only). A cap limits what the setup can do without making the model any smarter, so `footprint` and
+  `doctor` now measure and show the always-on estimate for every profile and refuse nothing. A number above 0 still turns the
+  warning and `--strict` on. docs/ADDONS.md admission rule 5 says the same: measure the cost and justify it, no fixed cap.
+- **Measured, not estimated** (docs/ADDONS.md): each add-on loaded for one headless session with `--plugin-dir`, nothing
+  installed, own login, Sonnet at medium effort, five small Python tasks with hidden checks (47 runs, about $4.60 in total).
+  ECC adds 13,635 tokens to the first request, doubles the cost of a run ($0.137 against $0.069) and adds about 13 s, was never
+  asked to invoke a skill or agent, and its hooks write a log of every Bash command into `~/.claude`; hidden checks passed
+  9 of 9 against 8 of 9 without it, and the one miss did not recur in four repeats. Ponytail adds 1,591 tokens, cuts output by
+  about 27% and costs the same per run. Chisle adds 1,920 tokens, cuts output by about 21% and costs 5% more per run; its tool-output
+  trimming removed the decisive line from the middle of a long log in 3 of 3 runs, and the model found it again only because it
+  noticed the marker. None of the three is enabled by default. Small samples: they say what the extra listing bought on small
+  tasks, not what it would do on a long planning task.
+
 ## 0.3.2
 Cost visibility: the plan meter is shown as cash, and the usage ledger's prices are corrected. From an audit of where tokens and
 money go: a full 7-day window quietly turns further use into extra-usage charges, and nothing here said so.
