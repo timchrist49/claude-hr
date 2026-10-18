@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.3.2
+Cost visibility: the plan meter is shown as cash, and the usage ledger's prices are corrected. From an audit of where tokens and
+money go: a full 7-day window quietly turns further use into extra-usage charges, and nothing here said so.
+- **`status`, `doctor` and the status line show the plan meter.** Once the 7-day window is full, extra usage is billed at API
+  prices. Headroom already polled the meter; nothing showed it. `claude-hr-ctl status` now prints the extra-usage dollars and a
+  warning when the window is full and extra usage is on (or at 80% of its monthly limit); `doctor` has a `plan meter` check
+  (WARN in those cases, INFO when the window is nearly full); the status line adds `7d` from 80% and the extra dollars when the
+  window is full. No network: it reads the poll Headroom keeps in `headroom/subscription_state.json`, and a poll older than 30
+  minutes is shown with its time.
+- **`usage` prices are corrected.** Sonnet 5.5 cache hits were priced at $0.20 per million tokens; the pricing page lists $0.10
+  (0.05x the input price, as for Opus 5.5), which inflated the weekly estimate by about 28%. Fast mode was ignored: a message
+  whose usage says speed `fast` on Opus 5.5, 5 or 4.8 now costs twice the price in every class. The report footnote says what is
+  and is not modelled.
+- **The `~/.claude is large` alert is honest.** It says "at least N GB" when the size scan ran out of time, and that finished
+  workflow scratch under `~/.claude/jobs` is only removed after `maintenance.jobs_retention_days`, so `cleanup` may free little
+  today (it used to ask for a cleanup that could reclaim nothing).
+- **The managed CLAUDE.md gets one line:** before a workflow or a fan-out of more than ~10 agents, check the plan meter; with the
+  7-day window above 90% or extra usage being spent, use fewer agents, Sonnet for mechanical stages, or defer.
+
 ## 0.3.1
 The git guard now asks about more ways of skipping hooks, and Everything Claude Code (ECC) was reviewed and rejected.
 - **The bash guard reads git commands as words, and keeps the old pattern as a backstop.** It now asks before `git commit -n`
