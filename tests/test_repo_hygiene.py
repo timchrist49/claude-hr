@@ -64,6 +64,34 @@ def test_versions_agree():
     assert all(e["version"] == version for e in own)
 
 
+def test_ecc_is_not_wired_into_any_profile_or_the_marketplace():
+    """Everything Claude Code (affaan-m/ECC) was reviewed and rejected (docs/ADDONS.md). This keeps a later edit from adding
+    it without a decision: relax the test only together with a reviewed change to the admission rules (rule 6). It looks at
+    the plugins of every profile, [project_scoped], the marketplaces the plan adds, and every marketplace.json entry. The
+    [redundant] table is deliberately excluded: that is where an installed ECC gets flagged."""
+    import tomllib
+
+    plan = tomllib.loads(
+        (ROOT / "src" / "claude_hr" / "data" / "plugins.toml").read_text(encoding="utf-8")
+    )
+    ids = [
+        pid for profile in plan.get("profiles", {}).values() for pid in profile.get("plugins", [])
+    ]
+    ids += list(plan.get("project_scoped", {}))
+    mk = json.loads((ROOT / ".claude-plugin" / "marketplace.json").read_text(encoding="utf-8"))
+    texts = [pid.lower() for pid in ids] + [json.dumps(entry).lower() for entry in mk["plugins"]]
+    # a marketplace the plan adds (name and source) is how a plugin from it would be installed
+    sources = plan.get("marketplaces", {})
+    texts += [json.dumps({name: spec}).lower() for name, spec in sources.items()]
+    assert len(ids) >= 5 and mk["plugins"] and sources  # the parse found something to look at
+    banned = re.compile(r"(?<![a-z0-9])ecc(?![a-z0-9])|everything-claude-code|affaan-m")
+    hits = [t[:80] for t in texts if banned.search(t)]
+    assert not hits, (
+        f"ECC appears in a profile or the marketplace: {hits}. It was reviewed and rejected; change this only through a "
+        "deliberate, reviewed decision (docs/ADDONS.md, admission rule 6)."
+    )
+
+
 def test_every_skill_and_agent_has_frontmatter_description():
     for md in list((ROOT / "plugins").rglob("SKILL.md")) + list(
         (ROOT / "plugins").glob("*/agents/*.md")

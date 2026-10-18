@@ -60,8 +60,11 @@ ALLOW = [
 ]
 
 
-def run_guard(monkeypatch, cmd):
-    monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps({"tool_input": {"command": cmd}})))
+def run_guard(monkeypatch, cmd, tool=None):
+    payload = {"tool_input": {"command": cmd}}
+    if tool is not None:
+        payload["tool_name"] = tool
+    monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(payload)))
     return hooks.bash_guard()
 
 
@@ -380,6 +383,60 @@ ASK = [
     "git checkout -- .",
     "git checkout .",
     "git restore .",
+    # Hook bypasses judged on words (hooks._hook_bypass). Several of the command strings below come from affaan-m/ECC
+    # tests/hooks/block-no-verify.test.js at c05b2d6614f62f6db0047669aa4eefb223d478f9 (MIT, Copyright (c) 2026
+    # Affaan Mustafa): short shell commands, re-typed here; no ECC code is copied.
+    "git commit -n -m x",
+    "git commit -an -m x",
+    "git commit -sn -m x",
+    "git commit -vn -m x",
+    "git commit -nu -m x",
+    "git commit -m x -n",
+    "git commit -u -n",
+    "git commit -S -n",
+    "git -c core.hooksPath=/dev/null commit -m x",
+    'git -c "core.hooksPath=/dev/null" commit -m x',
+    "git -c core.hookspath=/dev/null commit -m x",
+    "git -c CORE.HOOKSPATH=/dev/null commit -m x",
+    "git --config-env core.hooksPath=HOOKS commit -m x",
+    "git --config-env=core.hooksPath=HOOKS commit -m x",
+    'git commit "--no-verify" -m x',
+    "git commit --no-veri -m x",
+    "git push --no-verif origin feature",
+    "git -C repo commit --no-verify -m x",
+    "FOO=1 git commit -n -m x",
+    "git status && git commit -n -m x",
+    'git commit -m "" -n',
+    "git.exe commit --no-verify -m x",
+    "GIT commit --no-verify -m x",
+    "sudo git commit -n -m x",
+    "git commit -m $(date +%F) --no-verify",
+    "git push origin $(git branch --show-current) --no-verify",
+    'out="$(git commit --no-verify -m x 2>&1)"',
+    'echo "$(git commit --no-verify -m x)"',
+    'x="$(git commit -n -m x)"',
+    'echo "`git commit -n -m x`"',
+    "sh -c 'cd repo && git commit --no-verify -m x'",
+    "bash -c 'git commit -n -m x'",
+    'bash -lc "git -c core.hooksPath=/dev/null commit -m x"',
+    "eval git commit -n -m x",
+    "git add -A && git commit -m x \\\n  --no-verify",
+    "git commit \\\n  -n -m x",
+    'git commit -m ";" -n',
+    'git commit -m "|" -n',
+    'git commit -m "&&" --no-verify',
+    "git commit -m \\; -n",
+    "if git commit -n -m x; then echo ok; fi",
+    "exec git commit -n -m x",
+    "env GIT_TRACE=1 git commit -n -m x",
+    "{ git commit -n -m x; }",
+    "/usr/bin/git commit -n -m x",
+    "git commit -n -m x && git push origin feature",
+    "git commit --no-verify -m x; git status",
+    "git commit -n -m x | cat",
+    "git add -A\ngit commit -n -m x",
+    "echo start\ngit -c core.hooksPath=/dev/null commit -m x",
+    "git commit -m \"$(cat <<'EOF'\nfix: x\nEOF\n)\" --no-verify",
 ]
 NO_ASK = [
     "git status",
@@ -396,11 +453,40 @@ NO_ASK = [
     "git restore file.txt",
     "git log --oneline -n 5",
     "echo git reset --hard is dangerous",
+    # a commit message that merely mentions the flag, and flags that look like -n but are not
+    'git commit -m "fix: --no-verify edge case"',
+    "git commit -m 'fix: --no-verify edge case'",
+    'git commit -m "doc: explain git push --no-verify risk"',
+    'git commit -m "fix -n"',
+    'git commit -m "-n fix"',
+    'git commit --message "-n fix"',
+    "git commit -mnote",
+    "git commit -tn -m x",
+    "git commit --no-verbose -m x",
+    "git commit --no-ver -m x",
+    "git commit -- -n",
+    "git push -n origin feature",
+    "git merge -n feature",
+    "git log -n 5 && git commit -m x",
+    "echo --no-verify && git commit -m x",
+    "echo git commit -n",
+    "git commit -m x",
+    'git commit -am "fix: --no-verify edge case"',
+    'git commit --message="fix: --no-verify edge case"',
+    'git commit -m "x" -m "also mentions --no-verify"',
+    "git commit -m \"$(cat <<'EOF'\nfix: handle git commit --no-verify edge\nEOF\n)\"",
+    "git status; echo done",
+    "ls -n && git status",
+    "git log -n 5\ngit status",
+    "echo '--no-verify' && git commit -m x",
+    # -u and -S take an optional value attached to the flag (untracked-files mode, a signing key): the n in it is not -n
+    "git commit -uno -m x",
+    "git commit -Snick@example.com -m x",
 ]
 
 
-def guard_output(monkeypatch, capsys, cmd):
-    rc = run_guard(monkeypatch, cmd)
+def guard_output(monkeypatch, capsys, cmd, tool=None):
+    rc = run_guard(monkeypatch, cmd, tool)
     out = capsys.readouterr().out
     return rc, (json.loads(out) if out else None)
 
@@ -435,6 +521,238 @@ def test_git_guard_modes(monkeypatch, capsys):
 def test_secret_rules_still_win_over_git_asks(monkeypatch, capsys):
     monkeypatch.delenv("CLAUDE_HR_GIT_GUARD", raising=False)
     assert run_guard(monkeypatch, "git reset --hard && cat .env") == 2
+    assert run_guard(monkeypatch, "git commit -n && cat .env") == 2
+
+
+def decision(out):
+    return out["hookSpecificOutput"]["permissionDecision"] if out else None
+
+
+def test_hook_bypass_reasons_name_what_was_found(monkeypatch, capsys):
+    monkeypatch.delenv("CLAUDE_HR_GIT_GUARD", raising=False)
+    for cmd, word in (
+        ("git commit -an -m x", "git commit -n"),
+        ("git commit --no-veri -m x", "--no-verify"),
+        ("git -c core.hooksPath=/dev/null commit -m x", "core.hooksPath"),
+    ):
+        reason = guard_output(monkeypatch, capsys, cmd)[1]["hookSpecificOutput"][
+            "permissionDecisionReason"
+        ]
+        assert (
+            reason.startswith("claude-hr: this command ")
+            and word in reason
+            and reason.endswith(".")
+        )
+
+
+def test_the_old_pattern_still_backs_up_the_word_based_check(monkeypatch, capsys):
+    """Whatever the tokeniser misses or cannot parse, the old pattern (with quoted commit messages cut out) still asks."""
+    monkeypatch.delenv("CLAUDE_HR_GIT_GUARD", raising=False)
+    old_shapes = (
+        "git commit -m $(date +%F) --no-verify",
+        "git push origin $(git branch --show-current) --no-verify",
+        "sh -c 'cd repo && git commit --no-verify -m x'",
+        'out="$(git commit --no-verify -m x 2>&1)"',
+        "git push --no-verify origin feature",
+    )
+
+    def boom(command, depth=0):
+        raise ValueError("No closing quotation")
+
+    for tokeniser in (lambda command, depth=0: None, boom):
+        monkeypatch.setattr(hooks, "_hook_bypass", tokeniser)
+        for cmd in old_shapes:
+            assert decision(guard_output(monkeypatch, capsys, cmd)[1]) == "ask", cmd
+        # a quoted commit message that mentions the flag is not a request, whatever the tokeniser says
+        assert guard_output(monkeypatch, capsys, 'git commit -m "fix: --no-verify edge case"') == (
+            0,
+            None,
+        )
+        assert guard_output(monkeypatch, capsys, "git commit --message='fix: --no-verify'") == (
+            0,
+            None,
+        )
+
+
+def test_the_hook_bypass_check_falls_back_to_the_pattern_on_what_it_cannot_parse(
+    monkeypatch, capsys
+):
+    monkeypatch.delenv("CLAUDE_HR_GIT_GUARD", raising=False)
+    # an unbalanced quote: the tokeniser raises, the pattern still sees --no-verify
+    assert (
+        decision(guard_output(monkeypatch, capsys, 'git commit --no-verify "unterminated')[1])
+        == "ask"
+    )
+    # ... and a command the pattern does not flag stays silent, with nothing raised and the exit code 0
+    assert guard_output(monkeypatch, capsys, 'git commit -m "unterminated') == (0, None)
+
+
+def test_the_powershell_tool_uses_the_pattern_only(monkeypatch, capsys):
+    monkeypatch.delenv("CLAUDE_HR_GIT_GUARD", raising=False)
+    assert (
+        decision(guard_output(monkeypatch, capsys, "git commit --no-verify -m x", "PowerShell")[1])
+        == "ask"
+    )
+    # the documented gap: the new shapes are covered in the Bash tool only (PowerShell quoting differs)
+    assert guard_output(monkeypatch, capsys, "git commit -n -m x", "PowerShell") == (0, None)
+    assert decision(guard_output(monkeypatch, capsys, "git commit -n -m x", "Bash")[1]) == "ask"
+    # a payload without tool_name (older Claude Code, every pre-existing test) takes the word-based path
+    assert decision(guard_output(monkeypatch, capsys, "git commit -n -m x")[1]) == "ask"
+    # a quoted message that mentions the flag is not a request in PowerShell either
+    assert guard_output(
+        monkeypatch, capsys, 'git commit -m "fix: --no-verify edge case"', "PowerShell"
+    ) == (0, None)
+
+
+def test_a_command_over_the_tokeniser_limit_is_judged_by_the_pattern(monkeypatch, capsys):
+    monkeypatch.delenv("CLAUDE_HR_GIT_GUARD", raising=False)
+    pad = "a " * (hooks._TOKEN_MAX // 2 + 10)
+    assert len(pad) > hooks._TOKEN_MAX
+    assert (
+        decision(guard_output(monkeypatch, capsys, "git commit -m x --no-verify " + pad)[1])
+        == "ask"
+    )
+    # the pattern does not know -n: above the limit only the long flag is judged (stated in SECURITY.md)
+    assert guard_output(monkeypatch, capsys, "git commit -n -m x " + pad) == (0, None)
+
+
+@pytest.mark.parametrize(
+    "shape",
+    [
+        lambda n: "git commit -m x " + "a" * n,  # one huge word: the worst case for shlex
+        lambda n: "git commit -m x " + "'a b' " * (n // 6),
+        lambda n: "git commit -m x " + "(" * n,  # a run of punctuation
+    ],
+    ids=["one-word", "quoted-words", "punctuation-run"],
+)
+def test_the_tokeniser_is_bounded_at_its_limit(monkeypatch, capsys, shape):
+    import time
+
+    monkeypatch.delenv("CLAUDE_HR_GIT_GUARD", raising=False)
+    cmd = shape(hooks._TOKEN_MAX - 200)
+    assert len(cmd) <= hooks._TOKEN_MAX
+    started = time.perf_counter()
+    guard_output(monkeypatch, capsys, cmd)
+    guard_output(monkeypatch, capsys, cmd + " -n")
+    # the hook's own timeout is 10 s: a quadratic blow-up at this size would run into it (measured: about 0.2 s)
+    assert time.perf_counter() - started < 10
+
+
+def test_nothing_the_old_pattern_asked_about_is_lost_except_quoted_messages():
+    prefixes = [
+        "",
+        "cd r && ",
+        "FOO=1 ",
+        "sudo ",
+        "time ",
+        "nohup ",
+        "(",
+        "a; ",
+        "x | ",
+        "$(",
+        'echo "$(',
+        "sh -c 'cd r && ",
+    ]
+    commands = [
+        f"{prefix}git {sub} {flags}"
+        for prefix in prefixes
+        for sub in ("commit", "push", "merge", "rebase", "cherry-pick", "am", "tag")
+        for flags in ("--no-verify", "-m x --no-verify", "--no-verify -m x", "-C repo --no-verify")
+    ]
+    assert len(commands) >= 100
+    for command in commands:
+        if hooks._NO_VERIFY_RE.search(command):
+            assert hooks.git_risk(command, "Bash"), command
+
+
+def test_the_guard_never_raises_on_odd_input_and_the_backstop_holds_on_quote_free_commands():
+    """A seeded fuzz: any mix of git words, flags, separators, quotes, backslashes and newlines gives a str or None, never an
+    exception; and on commands without quotes the new guard asks wherever the old pattern did."""
+    import random
+
+    rng = random.Random(20261018)
+    words = [
+        "git",
+        "commit",
+        "push",
+        "-n",
+        "-an",
+        "-m",
+        "msg",
+        "--no-verify",
+        "--no-veri",
+        "-c",
+        "core.hooksPath=x",
+        "&&",
+        ";",
+        "|",
+        "(",
+        ")",
+        "$(",
+        "`",
+        "'",
+        '"',
+        "\\",
+        "\n",
+        "sh",
+        "-c",
+        "echo",
+        "#",
+        "<<EOF",
+        "EOF",
+        "--",
+    ]
+    for _ in range(3000):
+        command = " ".join(rng.choice(words) for _ in range(rng.randint(1, 14)))
+        result = hooks.git_risk(command, "Bash")
+        assert result is None or isinstance(result, str)
+        if "'" not in command and '"' not in command and hooks._NO_VERIFY_RE.search(command):
+            assert result, command
+
+
+def test_shells_inside_shells_are_followed_three_levels_deep_and_never_further(monkeypatch, capsys):
+    import shlex
+
+    monkeypatch.delenv("CLAUDE_HR_GIT_GUARD", raising=False)
+
+    def nest(command, levels):
+        for _ in range(levels):
+            command = "sh -c " + shlex.quote(command)
+        return command
+
+    for levels in (1, 2, 3):
+        cmd = nest("git commit -n -m x", levels)
+        assert decision(guard_output(monkeypatch, capsys, cmd)[1]) == "ask", cmd
+    # the depth is bounded (a stated limit): a deeper stack is not followed, and it neither raises nor fails the hook
+    for levels in (4, 12):
+        assert guard_output(monkeypatch, capsys, nest("git commit -n -m x", levels)) == (0, None)
+
+
+def test_git_commit_n_follows_the_guard_mode(monkeypatch, capsys):
+    monkeypatch.setenv("CLAUDE_HR_GIT_GUARD", "deny")
+    assert decision(guard_output(monkeypatch, capsys, "git commit -n -m x")[1]) == "deny"
+    monkeypatch.setenv("CLAUDE_HR_GIT_GUARD", "off")
+    assert guard_output(monkeypatch, capsys, "git commit -n -m x") == (0, None)
+
+
+def test_hooks_module_loads_shlex_only_for_a_git_command():
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    code = (
+        "import sys, claude_hr.hooks as h\n"
+        "assert 'shlex' not in sys.modules\n"
+        "assert h.git_risk('ls -la', 'Bash') is None\n"
+        "assert 'shlex' not in sys.modules\n"
+        "assert h.git_risk('git commit -n -m x', 'Bash')\n"
+        "assert 'shlex' in sys.modules\n"
+    )
+    env = {
+        **__import__("os").environ,
+        "PYTHONPATH": str(Path(__file__).resolve().parents[1] / "src"),
+    }
+    assert subprocess.run([sys.executable, "-c", code], env=env).returncode == 0
 
 
 TRUST_BLOCK = [

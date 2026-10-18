@@ -65,7 +65,9 @@ plugins = [
 "vercel@claude-plugins-official" = { markers = ["vercel.json", ".vercel", "next.config.js", "next.config.mjs", "next.config.ts"], why = "35 skills + 200+ MCP tools (~4k tokens always-on, far more without tool search)" }
 "frontend-design@claude-plugins-official" = { markers = ["tailwind.config.js", "tailwind.config.ts", "components.json"], why = "UI design guidance" }
 
-# Known to overlap with something Claude Code already bundles; flagged by `plugins audit`.
+# Known to overlap with something Claude Code already bundles, or reviewed and rejected; flagged by `plugins audit`.
 [redundant]
 "code-review@claude-plugins-official" = "Claude Code bundles /code-review; two copies compete for the same prompts."
 "code-simplifier@claude-plugins-official" = "Claude Code bundles /simplify (4 parallel agents); the plugin adds listing tokens for the same job."
+"ecc@ecc" = "Everything Claude Code (affaan-m/ECC) overlaps hr-core, hr-gates and the bundled /code-review and /security-review, cannot be subset (293 skills, 68 agents, 94 commands, 24 hook entries that start 2-3 node processes each even when off) and is far over the 1,500-token budget. Reviewed and rejected: docs/ADDONS.md."
+"everything-claude-code@everything-claude-code" = "Everything Claude Code (affaan-m/ECC) overlaps hr-core, hr-gates and the bundled /code-review and /security-review, cannot be subset (293 skills, 68 agents, 94 commands, 24 hook entries that start 2-3 node processes each even when off) and is far over the 1,500-token budget. Reviewed and rejected: docs/ADDONS.md."

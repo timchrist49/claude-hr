@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.3.1
+The git guard now asks about more ways of skipping hooks, and Everything Claude Code (ECC) was reviewed and rejected.
+- **The bash guard reads git commands as words, and keeps the old pattern as a backstop.** It now asks before `git commit -n`
+  (also inside a cluster such as `-an`), abbreviations of `--no-verify` from `--no-veri` on, and `git -c core.hooksPath=` (also
+  `--config-env`), and it follows `$(...)`, backticks, `sh -c '...'` and `eval`, line continuations, `if`/`then`/`exec`/`env`
+  in front of git, and quoted separators. It no longer asks when a quoted commit message only mentions `--no-verify`. The old
+  pattern still runs (with quoted `-m` / `--message` values cut out), so nothing it asked about before is lost except such
+  messages. Measured on the test commands (tests/test_hooks.py): of 51 that skip or redirect hooks the old pattern asked on 9
+  and the new guard asks on all 51; of 25 harmless ones (commit messages that mention the flag, `git push -n`, `--no-verbose`...)
+  the old pattern asked wrongly on 6 and the new guard on none. The decision is still an ask (a refusal under
+  `security.profile = "strict"`), an error falls back to the old pattern, and no hook, process or token is added. The PowerShell
+  tool, commands over 64 KiB and unbalanced quotes use the old pattern alone (documented in SECURITY.md). The test inputs are
+  short command strings taken from ECC's `block-no-verify` tests (MIT, credited in tests/test_hooks.py); no ECC code is copied.
+- **`plugins audit` flags ECC** (`ecc`, `everything-claude-code`) if it is installed, and a test keeps it out of every profile
+  and the marketplace.
+- **Docs:** the ECC review in `docs/ADDONS.md` (what was found, which figures are measured and which inferred, why it was not
+  adopted, when to revisit) and a vetting checklist for third-party code (admission rule 6); the e2e scripts check the new
+  guard cases.
+
 ## 0.3.0
 `claude-hr update` now updates everything, and the token ledger sees the subagent work that is most of the volume.
 - **`claude-hr update` (and `claude-hr-ctl update`, and the daily job) updates the whole setup:** claude-hr itself, Claude Code,

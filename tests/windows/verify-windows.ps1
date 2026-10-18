@@ -69,6 +69,11 @@ Check "request was counted by the proxy" ($stats.summary.api_requests -ge 1)
 Check "bash guard blocks cat .env (exit 2)" ($LASTEXITCODE -eq 2)
 '{"tool_input":{"command":"cp .env.example .env"}}' | claude-hr-hook bash-guard 2>&1 | Out-Null
 Check "bash guard allows cp .env.example .env" ($LASTEXITCODE -eq 0)
+# the git guard reads commands as words: `git commit -n` skips hooks (ask); a message that only mentions the flag does not
+$askOut = '{"tool_input":{"command":"git commit -n -m x"}}' | claude-hr-hook bash-guard 2>&1 | Out-String
+Check "bash guard asks before git commit -n" ($askOut -match '"permissionDecision": "ask"') $askOut
+$quietOut = '{"tool_input":{"command":"git commit -m ''fix: --no-verify edge case''"}}' | claude-hr-hook bash-guard 2>&1 | Out-String
+Check "bash guard is quiet when a message only mentions --no-verify" ($quietOut.Trim() -eq '') $quietOut
 
 "== 4b. end-of-turn gate in a REAL session (format + trusted check + audit trail) =="
 $py = (Get-ChildItem "$sb\tooldir\claude-hr\Scripts\python.exe").FullName

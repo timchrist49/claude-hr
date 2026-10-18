@@ -68,16 +68,18 @@ RULES: list[tuple[re.Pattern, str]] = [
 
 # Git operations that are hard to undo or that skip safety checks. The user is ASKED (permissionDecision "ask"), not
 # blocked: these are legitimate when intended. Under security.profile = strict the baseline sets CLAUDE_HR_GIT_GUARD=deny.
-# A regex is not a security boundary (`git -C . push`, `sh -c ...` get past it): server-side branch protection is.
+# A regex or a tokeniser is not a security boundary (`git -C . push` gets past the regex; aliases, variables and
+# `$(...)`-built arguments get past both): server-side branch protection is.
 # `git` must be in command position (start of a command segment, optionally after VAR=x / sudo / time), so that
 # `echo git reset --hard` or a commit message that mentions it is not mistaken for the command itself.
+# Hook bypasses (--no-verify and its relatives) are judged by _hook_bypass() and by the pattern below, together.
 _GIT = r"(?:^|[;&|(])\s*(?:\w+=\S+\s+)*(?:(?:sudo|command|time|nohup)\s+)*git\b[^\n;&|]*?"
 _PROTECTED = r"(?:main|master|trunk|release[\w./-]*|production|prod)"
+_NO_VERIFY_RE = re.compile(rf"(?ism){_GIT}\s--no-verify\b")
+_NO_VERIFY_WHY = "skips the repository's git hooks (--no-verify)"
+_COMMIT_N_WHY = "skips the repository's git hooks (git commit -n)"
+_HOOKS_PATH_WHY = "redirects the repository's git hooks (core.hooksPath)"
 GIT_RISKS: list[tuple[re.Pattern, str]] = [
-    (
-        re.compile(rf"(?ism){_GIT}\s--no-verify\b"),
-        "skips the repository's git hooks (--no-verify)",
-    ),
     (
         re.compile(
             rf"(?ism){_GIT}\bpush\b[^\n;&|]*(?:\s--force\b|\s-f\b|\s\+[\w./-]+)[^\n;&|]*\b{_PROTECTED}\b|"
@@ -140,12 +142,228 @@ def trust_attempt(command: str) -> bool:
     return _scan(command)
 
 
-def git_risk(command: str) -> str | None:
-    """Why `command` deserves a confirmation (see GIT_RISKS), or None."""
+# Hook bypasses are judged twice and the answers are ORed.
+# (1) On words (_hook_bypass): shlex splits the command the way a shell does, so `git commit -n` (short for --no-verify), an
+#     abbreviated `--no-veri`, `git -c core.hooksPath=...` and a quoted "--no-verify" are seen. shlex is imported when first
+#     needed, so that this module stays light.
+# (2) By the old pattern, on the command with the values of -m / --message cut out: a commit message that merely mentions
+#     --no-verify is not a request to skip hooks, but every other place the pattern matched before (`$(...)`, a command
+#     that does not parse, the PowerShell tool) still asks.
+# A longer command is not tokenised: shlex builds each word by repeated concatenation, so its time grows faster than
+# linearly on long words (about 0.1 to 0.2 s at this size, 1.7 s at 260 KB).
+_TOKEN_MAX = 65_536
+_DEPTH = 3  # how deep `$(...)`, `sh -c '...'` and eval are followed
+_SEGMENT_END = frozenset(";&|()")
+_SEPARATORS = ";&|()"
+_MASK = str.maketrans(dict(zip(_SEPARATORS, "", strict=True)))
+_UNMASK = str.maketrans(dict(zip("", _SEPARATORS, strict=True)))
+# a backslash that ends a line (not an escaped one) joins the next line to this one
+_CONTINUATION = re.compile(r"(?<!\\)((?:\\\\)*)\\\r?\n")
+# words that may stand in front of the command and do not change what it is
+_COMMAND_PREFIX = frozenset(
+    {
+        "sudo",
+        "command",
+        "time",
+        "nohup",
+        "exec",
+        "env",
+        "then",
+        "do",
+        "else",
+        "elif",
+        "if",
+        "while",
+        "until",
+        "{",
+        "!",
+    }
+)
+_SHELLS = frozenset({"sh", "bash", "zsh", "dash", "ksh", "ash"})
+_ENV_ASSIGN = re.compile(r"\w+=")
+_GIT_NAMES = frozenset({"git", "git.exe"})
+_GIT_VALUE_OPTIONS = frozenset({"-C", "--git-dir", "--work-tree", "--namespace", "--super-prefix"})
+# `git commit` options whose value is the NEXT word (`-m "-n fix"` is a message, not the -n flag)
+_COMMIT_VALUE_OPTIONS = frozenset(
+    {
+        "--message",
+        "--file",
+        "--author",
+        "--date",
+        "--reuse-message",
+        "--reedit-message",
+        "--fixup",
+        "--squash",
+        "--template",
+        "--cleanup",
+        "--trailer",
+        "--pathspec-from-file",
+    }
+)
+_NO_VERIFY = "--no-verify"
+# `-m "..."`, `-am '...'`, `--message="..."`: a commit message in quotes
+_MESSAGE_VALUE = re.compile(
+    r"""(?<!\S)(?:-[A-Za-z]*m|--message)(?:=|\s+)(?:"(?:[^"\\]|\\.)*"|'[^']*')""", re.S
+)
+
+
+def _mask_quoted(text: str) -> str:
+    """`text` with the separator characters that sit inside quotes (or are escaped) replaced by private-use characters, so
+    that shlex does not take `-m ";"` or `\\;` for a command separator."""
+    out: list[str] = []
+    quote = ""
+    i, n = 0, len(text)
+    while i < n:
+        ch = text[i]
+        if ch == "\\" and quote != "'" and i + 1 < n:
+            out.append(ch + text[i + 1].translate(_MASK))
+            i += 2
+            continue
+        if quote:
+            if ch == quote:
+                quote = ""
+                out.append(ch)
+            else:
+                out.append(ch.translate(_MASK))
+        else:
+            if ch in "'\"":
+                quote = ch
+            out.append(ch)
+        i += 1
+    return "".join(out)
+
+
+def _hook_bypass(command: str, depth: int = 0) -> str | None:
+    """Why `command` skips or redirects the repository's git hooks, judged on words; raises ValueError for an unbalanced quote."""
+    import shlex
+
+    text = _mask_quoted(_CONTINUATION.sub(r"\1 ", command)).replace("\n", " ; ")
+    lexer = shlex.shlex(text, posix=True, punctuation_chars=True)
+    lexer.whitespace_split = True
+    lexer.commenters = ""
+    segment: list[str] = []
+    for token in lexer:
+        # '' is a quoted empty word, not a separator
+        if token and _SEGMENT_END.issuperset(token):
+            why = _segment_bypass(segment, depth)
+            if why:
+                return why
+            segment = []
+        else:
+            segment.append(token)
+    return _segment_bypass(segment, depth)
+
+
+def _nested_commands(words: list[str], start: int) -> list[str]:
+    """Command text hidden inside the words of a segment: `$(...)` and backtick substitutions in any word, the script of
+    `sh -c '...'` / `bash -lc '...'`, and what `eval` is given."""
+    found: list[str] = []
+    for word in words:
+        text = word.translate(_UNMASK)
+        if "$(" in text or "`" in text:
+            found += text.split("$(")[1:] + text.split("`")[1::2]
+    if start < len(words):
+        name = words[start].lower().rsplit("/", 1)[-1].removesuffix(".exe")
+        if name == "eval":
+            found.append(" ".join(words[start + 1 :]).translate(_UNMASK))
+        elif name in _SHELLS:
+            for j in range(start + 1, len(words) - 1):
+                option = words[j]
+                # `-c`, `-lc`, `-ec`: a cluster of short options with c in it; its script is the next word
+                if option.startswith("-") and not option.startswith("--") and "c" in option[1:]:
+                    found.append(words[j + 1].translate(_UNMASK))
+                    break
+    return found
+
+
+def _segment_bypass(words: list[str], depth: int = 0) -> str | None:
+    i = 0
+    while i < len(words) and (_ENV_ASSIGN.match(words[i]) or words[i].lower() in _COMMAND_PREFIX):
+        i += 1
+    if depth < _DEPTH:
+        for inner in _nested_commands(words, i):
+            try:
+                why = _hook_bypass(inner, depth + 1)
+            except Exception:  # noqa: BLE001 - a fragment that does not parse is not evidence of anything
+                why = None
+            if why:
+                return why
+    if i >= len(words) or words[i].lower().rsplit("/", 1)[-1] not in _GIT_NAMES:
+        return None
+    j = i + 1
+    # git's own options come before the subcommand
+    while j < len(words):
+        option = words[j]
+        if option in ("-c", "--config-env"):
+            # `-c core.hooksPath=X`, `--config-env core.hooksPath=VAR`
+            if j + 1 < len(words) and words[j + 1].lower().startswith("core.hookspath="):
+                return _HOOKS_PATH_WHY
+            j += 2
+        elif option.lower().startswith("--config-env=core.hookspath="):
+            return _HOOKS_PATH_WHY
+        elif option in _GIT_VALUE_OPTIONS:
+            j += 2
+        elif option.startswith("-"):
+            j += 1
+        else:
+            break
+    if j >= len(words):
+        return None
+    commit = words[j] == "commit"
+    args = words[j + 1 :]
+    k = 0
+    while k < len(args):
+        arg = args[k]
+        if arg == "--":
+            break
+        if arg.startswith("--"):
+            name = arg.partition("=")[0]
+            # an abbreviation is only unambiguous from `--no-veri` on (`--no-v...` could be --no-verbose: git rejects those)
+            if name == _NO_VERIFY or (len(name) >= 9 and _NO_VERIFY.startswith(name)):
+                return _NO_VERIFY_WHY
+            if commit and arg in _COMMIT_VALUE_OPTIONS:
+                k += 1
+        elif commit and len(arg) > 1 and arg[0] == "-":
+            # a cluster of short flags: -an, -sn, -vn, -nu
+            for pos, letter in enumerate(arg[1:], 1):
+                if letter == "n":
+                    return _COMMIT_N_WHY
+                # these take a value: attached (-mfix) or, last in the cluster, the next word
+                if letter in "mFCct":
+                    if pos == len(arg) - 1:
+                        k += 1
+                    break
+                # an optional value, attached only (-umode, -SKEYID), ends the cluster
+                if letter in "uS":
+                    break
+        k += 1
+    return None
+
+
+def git_risk(command: str, tool: str = "") -> str | None:
+    """Why `command` deserves a confirmation (see GIT_RISKS and _hook_bypass), or None. `tool` is Claude Code's tool name
+    ("Bash", "PowerShell"): PowerShell quotes differently, so the word-based check is not used for it."""
+    why = _no_verify_risk(command, tool)
+    if why:
+        return why
     for pattern, why in GIT_RISKS:
         if pattern.search(command):
             return why
     return None
+
+
+def _no_verify_risk(command: str, tool: str) -> str | None:
+    # every pattern here needs the word git
+    if "git" not in command.lower():
+        return None
+    if tool != "PowerShell" and len(command) <= _TOKEN_MAX:
+        try:
+            why = _hook_bypass(command)
+        except Exception:  # noqa: BLE001 - an unbalanced quote or anything unforeseen: the pattern below still judges
+            why = None
+        if why:
+            return why
+    return _NO_VERIFY_WHY if _NO_VERIFY_RE.search(_MESSAGE_VALUE.sub(" -m X", command)) else None
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -189,12 +407,12 @@ def bash_guard() -> int:
     try:
         payload = read_stdin_json()
         command = str(payload.get("tool_input", {}).get("command", ""))
-        return _judge(command) if command else 0
+        return _judge(command, str(payload.get("tool_name", ""))) if command else 0
     except Exception:
         return 0  # a guard must never break the session: an error of its own lets the command through, silently
 
 
-def _judge(command: str) -> int:
+def _judge(command: str, tool: str = "") -> int:
     # The trust check goes first: it is the one with a ceiling on its time (see _VERIFY_TRUST, a few hundredths of a second
     # for any command), so padding aimed at the slower patterns below cannot keep it from running before the hook is killed.
     if trust_attempt(command):
@@ -214,7 +432,7 @@ def _judge(command: str) -> int:
             return 2
     mode = os.environ.get("CLAUDE_HR_GIT_GUARD", "ask").strip().lower()
     if mode != "off":
-        why = git_risk(command)
+        why = git_risk(command, tool)
         if why:
             decision = "deny" if mode == "deny" else "ask"
             sys.stdout.write(
