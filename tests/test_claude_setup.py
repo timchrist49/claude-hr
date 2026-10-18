@@ -238,6 +238,41 @@ def test_profiles_are_lean_and_resolve(setup):
     assert set(process) < full and "skill-creator@claude-plugins-official" in full
     assert "ponytail@claude-hr" not in full  # third-party behaviour layer stays a deliberate choice
     assert "code-simplifier@claude-plugins-official" in plan["redundant"]
+    # Everything Claude Code was reviewed and rejected (docs/ADDONS.md): an install under either name is flagged
+    assert {"ecc@ecc", "everything-claude-code@everything-claude-code"} <= set(plan["redundant"])
+
+
+def test_plugins_audit_flags_an_installed_ecc_as_reviewed_and_rejected(sandbox, monkeypatch):
+    from pathlib import Path
+
+    from claude_hr import plugins_audit
+
+    class FakeSetup:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def _installed_plugins(self):
+            return [
+                {"id": "ecc@ecc", "scope": "user", "enabled": True},
+                {"id": "everything-claude-code@some-market", "scope": "user", "enabled": True},
+                {"id": "hr-core@claude-hr", "scope": "user", "enabled": True},
+            ]
+
+    monkeypatch.setattr(plugins_audit, "ClaudeSetup", FakeSetup)
+    monkeypatch.setattr(
+        plugins_audit,
+        "plugin_cost",
+        lambda claude, plugin_id: plugins_audit.PluginRow(
+            plugin_id, "", True, always_on_tokens=500
+        ),
+    )
+    rows = {r.id: r for r in plugins_audit.audit_plugins(config.load(), Path("claude"))}
+    for plugin_id in ("ecc@ecc", "everything-claude-code@some-market"):
+        notes = [n for n in rows[plugin_id].notes if n.startswith("redundant: ")]
+        assert notes and "Reviewed and rejected" in notes[0] and "docs/ADDONS.md" in notes[0], (
+            plugin_id
+        )
+    assert not [n for n in rows["hr-core@claude-hr"].notes if n.startswith("redundant: ")]
 
 
 # ---- wiring review: permission rules follow the claude-hr home, setup records what it applied -------------------------
