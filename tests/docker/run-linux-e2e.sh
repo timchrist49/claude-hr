@@ -84,6 +84,18 @@ check "claude-hr update --check exits 0 and prints the channel line"  update_pre
 check "claude-hr update --help is claude-hr's own help"                bash -c "claude-hr update --help | grep -q -e '--claude-only' && ! claude-hr update --help | grep -q 'Check for updates and install if available'"
 check "claude-hr update --claude-only is Claude Code's own updater"    bash -c "claude-hr --hr-dry-run update --claude-only 2>&1 | grep -q 'kind=passthrough'"
 check "bash guard blocks .env"      bash -c "echo '{\"tool_input\":{\"command\":\"cat .env\"}}' | claude-hr-ctl hook bash-guard; test \$? -eq 2"
+# the git guard reads commands as words: `git commit -n` skips hooks (ask); a message that only mentions the flag does not
+git_guard_asks_on_commit_n() { local out; out="$(echo '{"tool_input":{"command":"git commit -n -m x"}}' | claude-hr-hook bash-guard)"; echo "$out" | grep -q '"permissionDecision": "ask"'; }
+git_guard_quiet_on_a_message() {
+  local out
+  out="$(claude-hr-hook bash-guard <<'JSON'
+{"tool_input":{"command":"git commit -m 'fix: --no-verify edge case'"}}
+JSON
+)"
+  [ -z "$out" ]
+}
+check "bash guard asks before git commit -n"                       git_guard_asks_on_commit_n
+check "bash guard is quiet when a message only mentions --no-verify" git_guard_quiet_on_a_message
 
 echo "== 6b. development loop: end-of-turn gate, trust, audit, scaffolding, footprint =="
 PY_TOOL="$HOME/.local/share/uv/tools/claude-hr/bin/python"
