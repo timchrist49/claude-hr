@@ -479,6 +479,9 @@ NO_ASK = [
     "ls -n && git status",
     "git log -n 5\ngit status",
     "echo '--no-verify' && git commit -m x",
+    # -u and -S take an optional value attached to the flag (untracked-files mode, a signing key): the n in it is not -n
+    "git commit -uno -m x",
+    "git commit -Snick@example.com -m x",
 ]
 
 
@@ -705,6 +708,24 @@ def test_the_guard_never_raises_on_odd_input_and_the_backstop_holds_on_quote_fre
         assert result is None or isinstance(result, str)
         if "'" not in command and '"' not in command and hooks._NO_VERIFY_RE.search(command):
             assert result, command
+
+
+def test_shells_inside_shells_are_followed_three_levels_deep_and_never_further(monkeypatch, capsys):
+    import shlex
+
+    monkeypatch.delenv("CLAUDE_HR_GIT_GUARD", raising=False)
+
+    def nest(command, levels):
+        for _ in range(levels):
+            command = "sh -c " + shlex.quote(command)
+        return command
+
+    for levels in (1, 2, 3):
+        cmd = nest("git commit -n -m x", levels)
+        assert decision(guard_output(monkeypatch, capsys, cmd)[1]) == "ask", cmd
+    # the depth is bounded (a stated limit): a deeper stack is not followed, and it neither raises nor fails the hook
+    for levels in (4, 12):
+        assert guard_output(monkeypatch, capsys, nest("git commit -n -m x", levels)) == (0, None)
 
 
 def test_git_commit_n_follows_the_guard_mode(monkeypatch, capsys):
