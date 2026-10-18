@@ -218,6 +218,26 @@ def _unrouted_claude_check(cfg: Config) -> Check | None:
     )
 
 
+def _plan_meter_check() -> Check | None:
+    """The plan meter from Headroom's last poll: a WARN when the 7-day window is full and extra usage (billed at API prices)
+    is on or nearly used up, an INFO when the window is nearly full, otherwise one OK line. None without a poll."""
+    from . import planmeter
+
+    meter = planmeter.read_local()
+    if not meter:
+        return None
+    flag = planmeter.warning(meter)
+    if flag is None:
+        return Check("plan meter", OK, planmeter.line(meter))
+    level, text = flag
+    return Check(
+        "plan meter",
+        WARN if level == "warn" else INFO,
+        f"{planmeter.line(meter)}\n         {text}",
+        "defer heavy workflows until the window resets, or use fewer agents and Sonnet; `claude-hr-ctl status` shows the meter",
+    )
+
+
 REAPPLY = "claude-hr-ctl setup --only settings claude-md plugins"
 
 
@@ -607,6 +627,9 @@ def run(cfg: Config, cwd: Path, deep: bool = False) -> list[Check]:
     unrouted = _unrouted_claude_check(cfg)
     if unrouted:
         out.append(unrouted)
+    plan = _plan_meter_check()
+    if plan:
+        out.append(plan)
     if paths.IS_LINUX:
         cap, _ = resources.memory_limits_gb(cfg)
         if cap > 0 and resources.caps_available():

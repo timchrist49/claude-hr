@@ -2,7 +2,7 @@
 
 ## Daily checks
 ```
-claude-hr-ctl status            # proxy, savings, plan usage, sessions, RAM, last-24h tokens, CLAUDE.md size
+claude-hr-ctl status            # proxy, savings, plan usage, extra-usage dollars, sessions, RAM, last-24h tokens, CLAUDE.md size
 claude-hr-ctl doctor            # every check with the exact fix; exit 1 if anything is FAIL
 claude-hr-ctl doctor --deep     # also measures ~/.claude size (time-boxed)
 ```
@@ -153,7 +153,7 @@ CPU quotas on Linux need the `cpu` controller delegated to user managers (one-ti
 | `[claude-hr] … continuing WITHOUT compression` | Proxy not healthy. `claude-hr-ctl headroom status`, `claude-hr-ctl headroom logs`, `claude-hr-ctl headroom start --wait 180`. First start after install downloads models. |
 | Claude says it cannot reach the API | A stale `ANTHROPIC_BASE_URL` in your shell or settings. `claude-hr-ctl doctor` names it. |
 | Background sessions not compressed | The Claude daemon was started by a plain `claude`. `claude-hr-ctl daemon status`; `claude-hr-ctl daemon restart` when idle. |
-| Subscription limit burning faster than expected | `ANTHROPIC_API_KEY` exported (overrides login — `creds doctor`), or many parallel sessions: lower `resources.max_sessions`. `claude-hr-ctl usage --by project`. |
+| Subscription limit burning faster than expected | `ANTHROPIC_API_KEY` exported (overrides login — `creds doctor`), or many parallel sessions: lower `resources.max_sessions`. `claude-hr-ctl usage --by project`. Once the 7-day window is full, extra usage is billed at API prices: `claude-hr-ctl status` and `doctor` show the window and the extra-usage dollars (from Headroom's poll, so the proxy must have run), and the status line adds `7d` at 80% and the extra dollars when the window is full. Fast mode (`/fast`) doubles Opus prices; `fastModePerSessionOptIn` in settings.json keeps it from persisting across sessions. |
 | `/rc` (Remote Control) unavailable | Disabled by Claude Code behind any custom base URL. `claude-hr --hr-direct`. |
 | High RAM | Proxy ~1.2 GB + ~0.3–0.7 GB per session. `footprint = "lite"`, fewer sessions. |
 | `~/.claude` huge | `claude-hr-ctl cleanup` (dry-run) then `--apply`. |

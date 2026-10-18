@@ -214,7 +214,7 @@ They change routing and limits only, not the managed settings or plugins. `claud
 | `headroom start\|stop\|restart\|status\|logs\|bench\|upgrade` | the shared proxy (`bench` is a compression smoke test; `upgrade` is a plain reinstall of the newest release without cooldown or rollback: prefer `update --only headroom`) |
 | `plugins sync\|audit\|update\|suggest\|list` , `skills` | plugin and skill management |
 | `claudemd lint\|learn` | CLAUDE.md hygiene / read-only learned-pattern suggestions |
-| `usage [--days N] [--by day\|model\|project] [--no-subagents]` | local token ledger (cache hit rate included) for main sessions AND subagent/workflow transcripts, with an estimated list-price cost, a main-vs-subagent split and a note when subagents dominate (they are often most of the volume) |
+| `usage [--days N] [--by day\|model\|project] [--no-subagents]` | local token ledger (cache hit rate included) for main sessions AND subagent/workflow transcripts, with an estimated list-price cost, a main-vs-subagent split and a note when subagents dominate (they are often most of the volume); fast mode is priced at 2x on Opus |
 | `update [--check] [--only claude headroom plugins self]` | staged upgrades |
 | `schedule install\|remove\|status`, `monitor tick\|show` | scheduled jobs / health snapshot |
 | `cleanup [--apply]` | reclaim `~/.claude` scratch, MCP logs, oversized daemon log |

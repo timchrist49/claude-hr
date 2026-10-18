@@ -1,7 +1,7 @@
 {
   "name": "hr-core",
   "displayName": "claude-hr Core",
-  "version": "0.3.1",
+  "version": "0.3.2",
   "description": "Lean defaults for claude-hr: three read-only subagents, seven skills (six manual-only: plan, done, gh, audit, status, worktrees), and a secret-leak and git-safety guard hook.",
   "author": {
     "name": "timchrist49"
