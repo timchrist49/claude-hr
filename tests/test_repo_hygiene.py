@@ -386,8 +386,10 @@ def test_hr_gates_is_one_silent_stop_hook_and_nothing_else():
     assert 60 <= hook["timeout"] <= 180
 
 
-def test_our_plugins_stay_inside_the_always_on_token_budget():
-    """The admission rule in docs/ADDONS.md, measured with the same estimator `claude-hr-ctl footprint` uses."""
+def test_our_hooks_add_no_context_and_hr_gates_costs_nothing():
+    """Admission rule 4 in docs/ADDONS.md, measured with the same estimator `claude-hr-ctl footprint` uses. There is no cap on
+    how many tokens hr-core's skills may use (rule 5: measure, and justify what they add); a hook that injects text on every
+    turn or start, and a gate that is not silent, would be a design change, so those stay pinned."""
     from claude_hr import footprint
 
     entries = [
@@ -397,7 +399,6 @@ def test_our_plugins_stay_inside_the_always_on_token_budget():
     ]
     fps = {f.name.split("@")[0]: f for f in footprint.scan_installed(entries)}
     assert fps["hr-gates"].always_on_tokens_est == 0
-    assert fps["hr-core"].always_on_tokens_est <= 250
     assert not any(f.injects_context for f in fps.values()), "our hooks must not add context"
 
 

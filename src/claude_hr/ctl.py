@@ -1372,12 +1372,9 @@ def cmd_footprint(a, cfg) -> int:
     if isinstance(listing, dict):
         listing = listing.get("plugins", [])
     fps = footprint.scan_installed(listing if isinstance(listing, list) else [])
-    # the budget is for the standard profile; other profiles add plugins on purpose
-    budget = (
-        int(cfg.get("footprint.budget_standard_tokens", 1500))
-        if str(cfg.get("plugins.profile", "standard")) == "standard"
-        else None
-    )
+    # no cap unless one is set: the numbers are for choosing, not for refusing
+    cap = int(cfg.get("footprint.budget_standard_tokens", 0) or 0)
+    budget = cap if cap > 0 else None
     out(footprint.render(fps, budget))
     over = budget is not None and footprint.always_on_tokens(fps) > budget
     if a.probe:
@@ -1616,7 +1613,7 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument(
         "--strict",
         action="store_true",
-        help="exit 1 when over footprint.budget_standard_tokens (standard profile only)",
+        help="exit 1 when over footprint.budget_standard_tokens (only when a cap > 0 is set; the default is no cap)",
     )
     s.set_defaults(fn=cmd_footprint)
 

@@ -174,4 +174,4 @@ timeout_s = 60               # per scanner (gitleaks / pip-audit / npm audit / o
 readonly_allow = true        # settings baseline pre-approves read-only gh calls (issue/pr view+list, pr diff/checks, run list/view); false = no allow rules written
 
 [footprint]
-budget_standard_tokens = 1500  # `claude-hr-ctl footprint` (exit 1 with --strict) and doctor warn when the standard profile's estimated always-on tokens exceed this
+budget_standard_tokens = 0     # 0 = no cap (the default): `footprint` and doctor MEASURE and show the always-on tokens, nothing is refused or warned about. A number > 0 makes doctor warn (and `footprint --strict` exit 1) above it

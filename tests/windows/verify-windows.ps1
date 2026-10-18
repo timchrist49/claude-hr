@@ -129,7 +129,7 @@ git -C "$sb\proj" init -q 2>&1 | Out-Null
 $wf = claude-hr-ctl workflows install --dir "$sb\proj" 2>&1 | Out-String
 Check "workflows install (both workflows)" ((Test-Path "$sb\proj\.claude\workflows\hr-review-changes.js") -and (Test-Path "$sb\proj\.claude\workflows\hr-plan-execute.js")) $wf
 $fp = claude-hr-ctl footprint 2>&1 | Out-String
-Check "footprint is within the standard budget" (($fp -match 'Estimated always-on') -and ($fp -match ': OK')) $fp
+Check "footprint measures the always-on tokens (no cap)" (($fp -match 'Estimated always-on') -and ($fp -notmatch 'OVER')) $fp
 Push-Location "$sb\proj"
 [IO.File]::WriteAllText("$sb\proj\pyproject.toml", "[project]`nname = `"x`"`nversion = `"0`"`n")
 $ir = claude-hr-ctl init-repo --only docs,editor 2>&1 | Out-String
