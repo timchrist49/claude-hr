@@ -211,3 +211,63 @@ def test_status_prints_the_cash_line_and_the_warning(sandbox, monkeypatch, capsy
     out = capsys.readouterr().out
     assert "Extra usage: $687.10 of $1,000 (69%) this month" in out
     assert "WARNING" in out and "7-day window is full" in out
+
+
+def test_extra_usage_that_is_switched_off_is_never_shown_as_cash():
+    off = meter(
+        extra_usage={"is_enabled": False, "monthly_limit_usd": 1000, "used_credits_usd": 50}
+    )
+    assert planmeter.extra_text(off) == ""
+    assert "extra usage" not in planmeter.line(off)
+
+
+def test_doctor_reports_a_nearly_full_window_as_info_not_warn(sandbox, monkeypatch):
+    nearly = meter(seven_day={"utilization_pct": 94}, extra_usage={"is_enabled": False})
+    monkeypatch.setattr(planmeter, "read_local", lambda: nearly)
+    check = doctor._plan_meter_check()
+    assert check.status == "info" and "94%" in check.detail
+
+
+def test_status_stays_calm_for_a_nearly_full_window(sandbox, monkeypatch, capsys):
+    from claude_hr import ctl
+
+    nearly = meter(seven_day={"utilization_pct": 94}, extra_usage={"is_enabled": False})
+    monkeypatch.setattr(ctl.planmeter, "read_local", lambda: nearly)
+    monkeypatch.setattr(
+        ctl.Headroom,
+        "health_patient",
+        lambda self: type("H", (), {"ok": False, "status": "down", "version": ""})(),
+    )
+    monkeypatch.setattr(ctl.usage, "collect", lambda *a, **k: ctl.usage.Ledger(1))
+    ctl.cmd_status(None, config.load())
+    out = capsys.readouterr().out
+    assert "WARNING" not in out and "Extra usage" not in out
+
+
+@pytest.mark.parametrize(
+    ("seven", "extra", "shows_window", "shows_cash"),
+    [
+        (79, 500.0, False, False),
+        (80, 500.0, True, False),
+        (99, 500.0, True, False),  # extra usage is only cash once the window is full
+        (100, 500.0, True, True),
+        (100, None, True, False),
+        (100, 0, True, False),
+    ],
+)
+def test_the_status_line_thresholds(monkeypatch, seven, extra, shows_window, shows_cash):
+    monkeypatch.setenv("ANTHROPIC_BASE_URL", "http://127.0.0.1:8787")
+    summary = {"saved": 0, "five_hour": 3.0, "seven_day": float(seven), "extra_used": extra}
+    monkeypatch.setattr(hooks, "_headroom_summary", lambda port, named=(): summary)
+    parts: list[str] = []
+    hooks._statusline_parts({}, parts)
+    assert any(p.startswith("7d") for p in parts) is shows_window
+    assert any(p.startswith("extra") for p in parts) is shows_cash
+
+
+def test_the_reset_time_is_shown_only_when_the_window_is_nearly_full():
+    reset = {"resets_at": "2026-10-21T01:00:00Z"}
+    off = {"is_enabled": False}
+    low = planmeter.line(meter(seven_day={**reset, "utilization_pct": 89.9}, extra_usage=off))
+    high = planmeter.line(meter(seven_day={**reset, "utilization_pct": 90}, extra_usage=off))
+    assert "resets" not in low and "(resets 2026-10-21 01:00 UTC)" in high
