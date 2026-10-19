@@ -1,6 +1,6 @@
 # Windows end-to-end verification of claude-hr from a clean, isolated sandbox (Windows PowerShell 5.1 or 7):
 #   powershell -NoProfile -ExecutionPolicy Bypass -File tests\windows\verify-windows.ps1
-# Installs into %TEMP%\esb3 (own uv tool dir, Claude config dir and claude-hr home), runs ~30 checks incl. the real Headroom
+# Installs into %TEMP%\esb3 (own uv tool dir, Claude config dir and claude-hr home), runs 45 checks incl. the real Headroom
 # install and TWO tiny `claude -p` calls (haiku) with your real login, then uninstalls and deletes the sandbox. It never writes
 # to your real ~/.claude or ~/.claude-hr, and it verifies that afterwards. Takes ~3-5 minutes (about 0.5 GB download, 2 GB on disk).
 $ErrorActionPreference = 'Continue'
