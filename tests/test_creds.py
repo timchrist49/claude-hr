@@ -80,7 +80,7 @@ def aws_env(**extra):
 
 
 def project_with(servers) -> dict:
-    return {"mcpServers": {}, "projects": {"C:/work/HalfCourt - AWS": {"mcpServers": servers}}}
+    return {"mcpServers": {}, "projects": {"C:/work/Acme - AWS": {"mcpServers": servers}}}
 
 
 def check(name: str):
@@ -97,15 +97,15 @@ def test_temporary_aws_credentials_in_a_project_scoped_server_are_found_and_mask
     )
     found = creds.scan_config_secrets()
     assert [(f.project, f.server, f.field, f.name, f.kind) for f in found] == [
-        ("C:/work/HalfCourt - AWS", "aws-api", "env", "AWS_ACCESS_KEY_ID", "AWS access key id"),
+        ("C:/work/Acme - AWS", "aws-api", "env", "AWS_ACCESS_KEY_ID", "AWS access key id"),
         (
-            "C:/work/HalfCourt - AWS",
+            "C:/work/Acme - AWS",
             "aws-api",
             "env",
             "AWS_SECRET_ACCESS_KEY",
             "AWS secret access key",
         ),
-        ("C:/work/HalfCourt - AWS", "aws-api", "env", "AWS_SESSION_TOKEN", "AWS session token"),
+        ("C:/work/Acme - AWS", "aws-api", "env", "AWS_SESSION_TOKEN", "AWS session token"),
     ]  # AWS_REGION is not a secret
     assert all(f.temporary for f in found)
     for f, raw in zip(found, (AWS_TEMP_ID, AWS_SECRET, AWS_SESSION), strict=True):
@@ -315,7 +315,7 @@ def test_doctors_line_counts_the_secrets_and_names_the_first_two_places():
     wheres = [f.where for f in creds.scan_config_secrets()]
     assert c.status == WARN
     assert c.detail == f"3 literal secret(s) found: {wheres[0]}; {wheres[1]}; +1 more"
-    assert "HalfCourt - AWS" in c.detail and "aws-api" in c.detail
+    assert "Acme - AWS" in c.detail and "aws-api" in c.detail
     assert (
         "AWS_ACCESS_KEY_ID" in c.detail and "AWS_SESSION_TOKEN" not in c.detail
     )  # only the first two
@@ -340,8 +340,8 @@ def test_creds_doctor_prints_each_finding_masked_with_its_fix(capsys, caplog):
     text = captured.out
     assert rc == 0  # a warning is not a failure
     assert "3 literal secret(s) in Claude's configuration (values are never printed):" in text
-    assert "1. .claude.json [project C:/work/HalfCourt - AWS] aws-api env.AWS_ACCESS_KEY_ID" in text
-    assert "project: C:/work/HalfCourt - AWS" in text
+    assert "1. .claude.json [project C:/work/Acme - AWS] aws-api env.AWS_ACCESS_KEY_ID" in text
+    assert "project: C:/work/Acme - AWS" in text
     assert "kind: AWS session token (temporary)" in text and "value: IQoJ…(304 chars)" in text
     assert "probably expired" in text and "delete" in text
     no_raw(text, captured.err, caplog.text)
