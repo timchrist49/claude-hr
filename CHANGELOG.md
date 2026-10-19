@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.3.4
+The managed CLAUDE.md block now nudges security-sensitive changes to the security reviewer that `hr-core` already ships.
+- **One new baseline line** (Security section): if the change touches authentication, file paths built from untrusted input,
+  subprocesses, SQL, deserialization, secrets or crypto, call `hr-core:security-reviewer` before the final answer and fix what
+  it confirms; a trivial edit, docs or a test-only change needs none of it; it applies only if that agent is listed. The reviewer
+  is read-only and pinned to Opus, so a trigger costs more on that step. Run `claude-hr update` to re-apply the baseline.
+- **Measured** (headless, Sonnet at medium effort, own login, rule delivered with `--append-system-prompt`): on a path-traversal
+  hardening task the reviewer ran in 3 of 3 runs with the rule and in 0 of 1 without it (run cost $0.22-0.24 with the review
+  against $0.14 without; all runs passed the hidden checks, 18 of 18). On controls it ran in 0 of 4 runs (a trivial fix twice, a
+  feature task twice). Small n, one task of this kind, Sonnet medium rather than a long Opus session: a rule is a nudge, not a
+  guarantee. A rule of the same kind for a planner and a code reviewer (vendored ECC agents, an earlier experiment) routed
+  poorly (planner 0 of 8 qualifying runs, code reviewer about 1 of 8), so only the security line ships and no ECC code is included.
+
 ## 0.3.3
 No token cap by default, and ECC, Ponytail and Chisle were tested head to head instead of judged on paper.
 - **`footprint.budget_standard_tokens` is now 0 = no cap.** It was 1500 and made `doctor` warn and `footprint --strict` fail above
