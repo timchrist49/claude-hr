@@ -10,8 +10,8 @@ The managed CLAUDE.md block now nudges security-sensitive changes to the securit
   hardening task the reviewer ran in 3 of 3 runs with the rule and in 0 of 1 without it (run cost $0.22-0.24 with the review
   against $0.14 without; all runs passed the hidden checks, 18 of 18). On controls it ran in 0 of 4 runs (a trivial fix twice, a
   feature task twice). Small n, one task of this kind, Sonnet medium rather than a long Opus session: a rule is a nudge, not a
-  guarantee. A rule of the same kind for a planner and a code reviewer (vendored ECC agents, an earlier experiment) did not route
-  reliably, so only the security line ships and no ECC code is included.
+  guarantee. A rule of the same kind for a planner and a code reviewer (vendored ECC agents, an earlier experiment) routed
+  poorly (planner 0 of 8 qualifying runs, code reviewer about 1 of 8), so only the security line ships and no ECC code is included.
 
 ## 0.3.3
 No token cap by default, and ECC, Ponytail and Chisle were tested head to head instead of judged on paper.
