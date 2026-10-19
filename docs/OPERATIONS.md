@@ -142,7 +142,12 @@ memory_max_gb = 8           # per session tree; 0 disables hard caps
 low_priority = true         # below-normal CPU priority
 [headroom]
 footprint = "lite"          # skip ML/memory extras (≈ 600 MB less RAM, far smaller download)
+extra_proxy_args = []       # extra flags for `headroom proxy`, e.g. ["--lossless"]
 ```
+`headroom.extra_proxy_args` is passed to `headroom proxy` when claude-hr starts it, so a change applies the next time the proxy
+starts (restart it only when no session is using it). `--lossless` is Headroom's no-CCR mode: it compresses tool output with
+format-native lossless compaction and never emits a retrieval marker, so no `headroom_retrieve` call is needed; see
+`headroom proxy --help` for the other flags.
 CPU quotas on Linux need the `cpu` controller delegated to user managers (one-time, root):
 `/etc/systemd/system/user@.service.d/delegate.conf` → `[Service]\nDelegate=cpu cpuset io memory pids`, then
 `systemctl daemon-reload` and re-login; then set `resources.cpu_quota_pct`.
