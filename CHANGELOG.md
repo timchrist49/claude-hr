@@ -1,5 +1,39 @@
 # Changelog
 
+## 0.3.6
+`claude-hr update` shows what it is doing, a run that ends early no longer locks out its own retry, and the background reinstall no
+longer risks a half-deleted installation. From a Windows PC where `claude-hr update` moved the checkout to the new release and
+then ended before launching the reinstall (cause not found: no crash, no stale lock, nothing in the event log): the installed tool
+stayed on the old version, a retry answered "a reinstall was started in the last 15 minutes; waiting for it", and the command had
+printed nothing for the whole minute, so it looked as if it had done nothing.
+- **Progress lines.** At a terminal, `update` lists each component on stderr as it starts (`updating Claude Code (a new version
+  takes about a minute) ...`). The report still comes at the end. The scheduled job and pipes get no progress lines.
+- **The retry mark is written when the reinstall helper is launched, not when the checkout moves.** `state/self-update.json` made
+  the next run wait 15 minutes for a reinstall; it was written before anything was launched, so a run that ended in between left a
+  mark for a reinstall that never started. Now a run that ends early can be retried at once, a launch that fails or is interrupted
+  (Ctrl-C, a closed console) clears the mark, and a reinstall that was launched still makes a second run wait. A mark that cannot
+  be written (an antivirus scanner holding the file) no longer stops the launch. `logs/update.jsonl` gets a `self` row with action
+  `launched` (and how: task scheduler, systemd unit or detached process) when the helper was started, so a missing launch shows.
+- **The Windows helper does not reinstall over a tool environment that is in use.** It waits up to 2 minutes for the updater to
+  exit and up to 2 more for every running `claude-hr` program. If one still runs from the tool environment when the wait ends (a
+  session started right after `update`), the attempt used to go ahead, fail with `Access is denied` and could leave the
+  environment half-deleted until a retry worked. It now logs `NOT reinstalling` and leaves claude-hr as it is; the checkout is
+  already on the new release, so the next `claude-hr update` finishes the job once no claude-hr session runs (while one does, a
+  plain `update` answers `deferred`). On Windows a reinstall that did not happen (this, or three failed attempts) clears the retry
+  mark; on Linux and macOS a failed reinstall leaves it until its 15 minutes pass.
+- **`update --force` under a running session says what will happen.** On Windows it queues the reinstall as before, but the helper
+  skips it while a session runs; the report now says so (an `INFO:` line), and the `--force` help and the deferral hint no
+  longer promise otherwise.
+- **Tests.** Two updater tests and the helper tests no longer depend on whether a `claude-hr` session is running on the machine
+  (they failed whenever one was); the sandboxed Windows self-update test waits long enough for a helper that has to wait for another
+  session. New tests pin the order of the progress lines against the component runs, the mark on the Windows routes, the systemd
+  route, a mark that cannot be written, an interrupted launch, and the helper's path comparison (case, a sibling folder) under
+  real PowerShell.
+- **Found by an independent review of this change** (fixed before release): a mark-write failure aborting the launch, the
+  `--force` silence above, documentation that promised more than the code, and the test gaps in the previous bullet.
+- **Documented** (OPERATIONS.md, Updates): the progress lines, "do not open `claude-hr` again until `claude-hr-ctl --version`
+  shows the new version", how to tell whether the helper was launched, and the last-resort command.
+
 ## 0.3.5
 The caps on Claude's background sessions now follow the machine as it grows, and `doctor` and the monitor show what the kernel really
 gave them. From a Linux VM that froze twice while three background (`claude agents`) sessions ran an unbounded `jest` suite: the wrapper

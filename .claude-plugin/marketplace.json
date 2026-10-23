@@ -10,7 +10,7 @@
       "name": "hr-core",
       "source": "./plugins/hr-core",
       "description": "Three read-only subagents (explorer, log-triage, security-reviewer), seven skills (six manual-only), and a Bash secret-leak and git-safety guard.",
-      "version": "0.3.5",
+      "version": "0.3.6",
       "category": "productivity",
       "keywords": [
         "claude-hr",
@@ -22,7 +22,7 @@
       "name": "hr-gates",
       "source": "./plugins/hr-gates",
       "description": "One end-of-turn hook: format changed files with the repo's own formatter, run the repo's trusted fast checks, metadata-only audit trail. Zero context cost.",
-      "version": "0.3.5",
+      "version": "0.3.6",
       "category": "productivity",
       "keywords": [
         "claude-hr",

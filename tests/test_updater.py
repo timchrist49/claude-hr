@@ -482,6 +482,9 @@ def test_windows_reinstall_runs_from_a_scheduled_task_not_as_our_child(sandbox, 
     u = _windows_updater(monkeypatch)
     u._launch_reinstall()
     assert spawned == []
+    assert (
+        updater.paths.state_dir() / "self-update.json"
+    ).exists()  # a second update must wait for this helper
     shell, script_path = started[0]
     assert shell.endswith("powershell.exe") and script_path.name == "self-update.ps1"
     raw = script_path.read_bytes()
@@ -506,6 +509,7 @@ def test_windows_reinstall_falls_back_to_a_direct_helper_if_the_scheduler_refuse
         updater, "_spawn_detached", lambda cmd, log=None, cwd=None: spawned.append(cmd)
     )
     _windows_updater(monkeypatch)._launch_reinstall()
+    assert (updater.paths.state_dir() / "self-update.json").exists()
     cmd = spawned[0]
     assert cmd[0].endswith("powershell.exe") and "-EncodedCommand" in cmd
     assert "Wait-Process" in base64.b64decode(cmd[-1]).decode("utf-16-le")
@@ -1344,7 +1348,9 @@ def test_the_windows_helper_runs_the_post_phase_only_after_a_reinstall_that_exit
     assert "the reinstall did not succeed: the post phase was not run" in script
     # without a post phase the script is what it always was
     plain = updater._windows_reinstall_script(["uv", "tool", "install"], 1, 2, "log.txt", env={})
-    assert "--post" not in plain and "if ($rc" not in plain
+    assert "--post" not in plain and "if ($rc -eq 0)" not in plain
+    # ... except that a reinstall that did not happen always clears the retry mark, with or without a post phase
+    assert "if ($rc -ne 0) { Remove-Item" in plain and "if ($rc -ne 0) { Remove-Item" in script
 
 
 def test_the_post_phase_of_the_helper_works_on_the_profile_the_update_resolved():
@@ -2746,9 +2752,6 @@ def test_sessions_that_start_while_the_run_goes_on_cancel_claude_hrs_own_reinsta
 
     def queue():
         u._pending_reinstall = ["uv", "tool", "install"]
-        updater.write_json(
-            paths.state_dir() / "self-update.json", {"ts": __import__("time").time()}
-        )
         return updater.Result("self", "v0.2.2", "v0.2.3", action="updated")
 
     def plugins():
@@ -2774,7 +2777,7 @@ def test_sessions_that_start_while_the_run_goes_on_cancel_claude_hrs_own_reinsta
     assert rep.exit_code() == updater.EXIT_DEFERRED
     assert not (
         paths.state_dir() / "self-update.json"
-    ).exists()  # the retry must not wait for its 15-minute mark
+    ).exists()  # nothing was launched, so the retry has no 15-minute mark to wait for
     assert events == [
         "claude",
         "headroom",
@@ -2989,8 +2992,10 @@ def test_the_helper_logs_the_real_outcome_of_a_post_command_that_cannot_start(tm
 
     def run(post):
         log.unlink(missing_ok=True)
-        script = updater._windows_reinstall_script(
-            [cmd_exe, "/c", "exit 0"], 999999, 999998, log, env={}, post=post, cwd=tmp_path
+        script = _isolated(
+            updater._windows_reinstall_script(
+                [cmd_exe, "/c", "exit 0"], 999999, 999998, log, env={}, post=post, cwd=tmp_path
+            )
         )
         keep = [
             ln
@@ -3050,18 +3055,38 @@ def test_the_helper_script_waits_for_the_tool_environment_to_be_free_and_retries
     assert "Log ('reinstall exit code ' + $rc)" in script
 
 
-def _run_helper(tmp_path, cmd, tool_env, post=None):
+_NAMES = "$exeNames = @('claude-hr.exe', 'claude-hr-ctl.exe', 'claude-hr-hook.exe')"
+
+
+def _isolated(script, fast=False):
+    """The helper script as a test may run it: it looks for programs by name on the whole machine (a claude-hr session of the
+    person running the tests would hold it for minutes), so those names are swapped for one that never runs; `fast` skips the
+    pauses between attempts."""
+    assert _NAMES in script, "the helper's program-name list changed: update this test helper"
+    script = script.replace(_NAMES, "$exeNames = @('no-such-program.exe')")
+    if not fast:
+        return script
+    assert "Start-Sleep -Seconds 10" in script, (
+        "the helper's pause between attempts changed: update this test helper"
+    )
+    return script.replace("Start-Sleep -Seconds 10", "Start-Sleep -Seconds 0")
+
+
+def _run_helper(tmp_path, cmd, tool_env, post=None, fast=False):
     """The generated helper under the real shell (the lines that remove the script and unregister the task are cut)."""
     shell = __import__("shutil").which("powershell") or __import__("shutil").which("pwsh")
     log = tmp_path / "self-update.log"
     log.unlink(missing_ok=True)
-    script = updater._windows_reinstall_script(
-        cmd, 999999, 999998, log, env={}, post=post, cwd=tmp_path
+    script = _isolated(
+        updater._windows_reinstall_script(
+            cmd, 999999, 999998, log, env={}, post=post, cwd=tmp_path
+        ),
+        fast,
     )
     keep = [
         ln
         for ln in script.splitlines()
-        if not ln.startswith("Unregister-ScheduledTask") and "Remove-Item" not in ln
+        if not ln.startswith("Unregister-ScheduledTask") and "$PSCommandPath" not in ln
     ]
     ps1 = tmp_path / "helper.ps1"
     ps1.write_bytes(b"\xef\xbb\xbf" + ("\n".join(keep) + "\n").encode("utf-8"))
@@ -3123,3 +3148,429 @@ def test_the_real_helper_waits_for_a_process_that_still_runs_from_the_tool_envir
         holder.kill()
     assert stamp.exists() and "reinstall exit code 0" in text
     assert time.monotonic() - t0 >= 5, "the helper did not wait for the holder"
+
+
+# ---- 0.3.6: a run that ends before the helper starts must not lock out its own retry; the run says what it is doing ---------
+def _spawn_stubs(monkeypatch):
+    """Launching goes down the plain POSIX route and records the command instead of running it."""
+    spawned = []
+    monkeypatch.setattr(updater.paths, "IS_WINDOWS", False)
+    monkeypatch.setattr(updater, "_start_systemd_service", lambda cmd, log, cwd=None: False)
+    monkeypatch.setattr(
+        updater, "_spawn_detached", lambda cmd, log=None, cwd=None: spawned.append(cmd)
+    )
+    return spawned
+
+
+def test_queueing_a_reinstall_leaves_no_mark_but_launching_it_does(managed_repo, monkeypatch):
+    origin, work, managed = managed_repo
+    _release_v020(work)
+    _stub_uv(monkeypatch)
+    mark = updater.paths.state_dir() / "self-update.json"
+    u = updater.Updater(config.load())
+    assert u.update_self().action == "updated"
+    assert not mark.exists(), "update_self marked a reinstall that has not been launched"
+    spawned = _spawn_stubs(monkeypatch)
+    u._launch_reinstall()
+    data = json.loads(mark.read_text(encoding="utf-8"))
+    assert spawned and data["ts"] > 0
+    assert data["from"] != data["to"] and len(data["to"]) == 40  # the commits it moves between
+
+
+def test_a_run_that_ends_before_launching_can_be_retried_at_once(managed_repo, monkeypatch):
+    """The incident: the checkout moved to the new release, the process ended before it launched the reinstall, and the next
+    update then waited 15 minutes for a reinstall that had never started."""
+    origin, work, managed = managed_repo
+    _release_v020(work)
+    _stub_uv(monkeypatch)
+    monkeypatch.setattr("claude_hr.__version__", "0.1.0")
+    first = updater.Updater(config.load())
+    assert (
+        first.update_self().action == "updated"
+    )  # ... and the process ends here: nothing launched
+    _fake_checkout_version(managed, "0.2.0")
+    second = updater.Updater(config.load())
+    res = second.update_self()
+    assert res.action == "updated" and "retrying" in res.detail
+    assert second._pending_reinstall and second._pending_reinstall[1:3] == ["tool", "install"]
+
+
+def test_a_reinstall_that_was_launched_still_makes_the_next_run_wait(managed_repo, monkeypatch):
+    origin, work, managed = managed_repo
+    _release_v020(work)
+    _stub_uv(monkeypatch)
+    monkeypatch.setattr("claude_hr.__version__", "0.1.0")
+    first = updater.Updater(config.load())
+    first.update_self()
+    real_os = updater.paths.IS_WINDOWS
+    _spawn_stubs(monkeypatch)
+    first._launch_reinstall()  # the helper is on its way
+    monkeypatch.setattr(
+        updater.paths, "IS_WINDOWS", real_os
+    )  # `git` is only found with the host's own rules
+    _fake_checkout_version(managed, "0.2.0")
+    res = updater.Updater(config.load()).update_self()
+    assert res.state == "waiting" and "15 minutes" in res.detail, (res.state, res.detail)
+
+
+def test_launching_that_fails_leaves_no_mark_behind(managed_repo, monkeypatch):
+    origin, work, managed = managed_repo
+    _release_v020(work)
+    _stub_uv(monkeypatch)
+    u = updater.Updater(config.load())
+    u.update_self()
+    monkeypatch.setattr(updater.paths, "IS_WINDOWS", False)
+    monkeypatch.setattr(updater, "_start_systemd_service", lambda cmd, log, cwd=None: False)
+
+    def cannot_start(cmd, log=None, cwd=None):
+        raise OSError("no such program")
+
+    monkeypatch.setattr(updater, "_spawn_detached", cannot_start)
+    u._launch_reinstall()
+    assert not (updater.paths.state_dir() / "self-update.json").exists()
+    rows = _update_rows()
+    assert rows[-1]["action"] == "failed" and "could not start the reinstall" in rows[-1]["detail"]
+
+
+def _update_rows():
+    f = updater.paths.logs_dir() / "update.jsonl"
+    return [json.loads(ln) for ln in f.read_text(encoding="utf-8").splitlines() if ln.strip()]
+
+
+def test_the_log_says_when_the_helper_was_launched_and_how(managed_repo, monkeypatch):
+    origin, work, managed = managed_repo
+    _release_v020(work)
+    _stub_uv(monkeypatch)
+    u = updater.Updater(config.load())
+    u.update_self()
+    _spawn_stubs(monkeypatch)
+    u._launch_reinstall()
+    row = _update_rows()[-1]
+    assert (row["component"], row["action"]) == ("self", "launched")
+    assert "detached process" in row["detail"] and "self-update.log" in row["detail"]
+    # the Windows route: the scheduler started it
+    monkeypatch.setattr(updater.paths, "IS_WINDOWS", True)
+    monkeypatch.setattr(updater.procutil, "which_all", lambda name: [r"C:\Windows\powershell.exe"])
+    monkeypatch.setattr(updater, "_start_helper_task", lambda shell, script: True)
+    u2 = updater.Updater(config.load())
+    u2._pending_reinstall = ["uv", "tool", "install"]
+    u2._launch_reinstall()
+    assert "task scheduler" in _update_rows()[-1]["detail"]
+
+
+def test_each_component_is_announced_before_it_runs(sandbox, monkeypatch):
+    events = []
+    u = _spied(monkeypatch, events)
+    u.progress = events.append  # one list: the order of announcing and running is what is compared
+    u.run(["claude", "headroom"])
+    assert events == [
+        "  updating Claude Code (a new version takes about a minute) ...",
+        "claude",
+        "  updating Headroom ...",
+        "headroom",
+    ]
+
+
+def test_a_preview_says_checking_and_every_component_has_a_label(sandbox, monkeypatch):
+    said = []
+    u = updater.Updater(config.load(), dry=True)
+    u.progress = said.append
+    monkeypatch.setattr(u, "update_proxy", lambda: updater.Result("proxy"))
+    u._step(updater.Report(check=True), "proxy")
+    assert said == ["  checking the Headroom proxy ..."]
+    assert set(updater.STEP_LABELS) == set(updater.COMPONENTS)
+
+
+def test_a_progress_printer_that_fails_never_stops_the_update(sandbox, monkeypatch):
+    events = []
+    u = _spied(monkeypatch, events)
+
+    def closed_terminal(line):
+        raise ValueError("I/O operation on closed file")
+
+    u.progress = closed_terminal
+    u.run(["claude", "headroom"])
+    assert (
+        events == ["claude", "headroom"] and u.progress is None
+    )  # silenced after the first failure
+
+
+def test_nothing_is_announced_unless_asked_for(sandbox, monkeypatch):
+    events = []
+    u = _spied(monkeypatch, events)
+    assert u.progress is None
+    u.run(["claude"])  # no callback: the scheduled job and every test run like this
+    assert events == ["claude"]
+
+
+class _Stream:
+    def __init__(self, tty):
+        self._tty, self.lines = tty, []
+
+    def isatty(self):
+        return self._tty
+
+    def write(self, text):
+        self.lines.append(text)
+
+    def flush(self):
+        pass
+
+
+def test_the_command_shows_progress_only_to_a_person_at_a_terminal(monkeypatch):
+    from claude_hr import ctl
+
+    monkeypatch.setattr(ctl.sys, "stderr", _Stream(tty=False))
+    assert ctl._update_progress() is None  # the scheduled job, a pipe
+    monkeypatch.setattr(ctl.sys, "stderr", None)  # pythonw.exe
+    assert ctl._update_progress() is None
+    tty = _Stream(tty=True)
+    monkeypatch.setattr(ctl.sys, "stderr", tty)
+    say = ctl._update_progress()
+    say("hello")
+    assert "hello" in "".join(tty.lines)
+
+
+def test_update_wires_the_progress_printer_into_the_run(sandbox, monkeypatch):
+    from claude_hr import ctl
+
+    got = {}
+
+    class Fake(updater.Updater):
+        def run(self, components=None):
+            got["progress"] = self.progress
+            return updater.Report()
+
+    monkeypatch.setattr(updater, "Updater", Fake)
+    tty = _Stream(tty=True)
+    monkeypatch.setattr(ctl.sys, "stderr", tty)
+    ctl.update_main(["--only", "proxy"])
+    assert got["progress"] is not None
+    assert "report follows at the end" in "".join(tty.lines)
+    monkeypatch.setattr(ctl.sys, "stderr", _Stream(tty=False))
+    ctl.update_main(["--only", "proxy"])
+    assert got["progress"] is None
+
+
+# ---- the helper does not reinstall over a tool environment that is in use ----------------------------------------------------
+def test_the_helper_script_refuses_to_reinstall_over_a_running_tool_environment(sandbox):
+    script = updater._windows_reinstall_script(["uv", "tool", "install"], 1, 2, "log.txt", env={})
+    lines = script.splitlines()
+    guard = next(i for i, ln in enumerate(lines) if ln.startswith("if ($inEnv.Count -gt 0)"))
+    loop = next(i for i, ln in enumerate(lines) if ln.startswith("while ($rc -ne 0"))
+    assert guard < loop, "the refusal comes before the first attempt"
+    assert "NOT reinstalling" in lines[guard] and "$attempt = 3" in lines[guard]
+    inenv = lines[guard - 1]
+    assert inenv.startswith("$inEnv = ")
+    # case-blind, and `tool-env-old` is not inside `tool-env`
+    assert "StartsWith($toolEnv + '\\', [StringComparison]::OrdinalIgnoreCase)" in inenv
+    mark = str(updater.paths.state_dir() / "self-update.json")
+    cleanup = next(ln for ln in lines if ln.startswith("if ($rc -ne 0) { Remove-Item"))
+    assert updater._ps_quote(mark) in cleanup  # a reinstall that did not happen leaves no mark
+
+
+@pytest.mark.skipif(os.name != "nt", reason="the helper is a Windows PowerShell script")
+def test_the_real_helper_leaves_claude_hr_alone_while_the_tool_environment_is_in_use(
+    tmp_path, monkeypatch, sandbox
+):
+    """A copy of cmd.exe running from inside the tool environment folder for far longer than the (shortened) wait: uv would
+    fail and could leave the environment half-deleted, so the helper does not call it, and clears the retry mark."""
+    import shutil
+
+    env_dir = tmp_path / "tool-env" / "Scripts"
+    env_dir.mkdir(parents=True)
+    holder_exe = env_dir / "cmd.exe"
+    shutil.copy2(
+        os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32", "cmd.exe"), holder_exe
+    )
+    monkeypatch.setattr(updater, "_tool_env", lambda: str(tmp_path / "tool-env"))
+    monkeypatch.setattr(updater, "_HOLDER_WAIT_S", 3)
+    mark = updater.paths.state_dir() / "self-update.json"
+    mark.parent.mkdir(parents=True, exist_ok=True)
+    mark.write_text('{"ts": 1}', encoding="utf-8")
+    cmd_exe = os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32", "cmd.exe")
+    stamp = tmp_path / "reinstall-started.txt"
+    holder = subprocess.Popen([str(holder_exe), "/c", "ping -n 40 127.0.0.1 > nul"])
+    try:
+        text = _run_helper(
+            tmp_path, [cmd_exe, "/c", f"echo started > {stamp}"], tmp_path / "tool-env"
+        )
+    finally:
+        holder.kill()
+    assert not stamp.exists(), "the reinstall ran over a tool environment that was in use"
+    assert "NOT reinstalling" in text and "cmd:" in text and "reinstall exit code" not in text
+    assert not mark.exists()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="the helper is a Windows PowerShell script")
+def test_the_real_helper_clears_the_retry_mark_after_a_reinstall_that_kept_failing(
+    tmp_path, monkeypatch, sandbox
+):
+    monkeypatch.setattr(updater, "_tool_env", lambda: str(tmp_path / "no-tool-env"))
+    mark = updater.paths.state_dir() / "self-update.json"
+    mark.parent.mkdir(parents=True, exist_ok=True)
+    mark.write_text('{"ts": 1}', encoding="utf-8")
+    cmd_exe = os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32", "cmd.exe")
+    text = _run_helper(tmp_path, [cmd_exe, "/c", "exit 5"], tmp_path / "no-tool-env", fast=True)
+    assert "retrying the reinstall (attempt 3 of 3)" in text and "NOT reinstalling" not in text
+    assert not mark.exists()
+    mark.write_text('{"ts": 1}', encoding="utf-8")
+    _run_helper(tmp_path, [cmd_exe, "/c", "exit 0"], tmp_path / "no-tool-env", fast=True)
+    assert mark.exists(), "a reinstall that worked is not the helper's to clear (the update does)"
+
+
+# ---- 0.3.6, found by the review: a mark that cannot be written, an interrupted launch, --force under a session ---------------
+def test_a_reinstall_mark_that_cannot_be_written_never_stops_the_launch(managed_repo, monkeypatch):
+    """The mark only keeps a second update from overlapping: an antivirus scanner holding the file must not cost the update."""
+    origin, work, managed = managed_repo
+    _release_v020(work)
+    _stub_uv(monkeypatch)
+    u = updater.Updater(config.load())
+    u.update_self()
+    spawned = _spawn_stubs(monkeypatch)
+
+    def locked(path, data):
+        raise PermissionError(13, "Access is denied")
+
+    monkeypatch.setattr(updater, "write_json", locked)
+    u._launch_reinstall()
+    assert spawned, "the reinstall was not started because its mark could not be written"
+    rows = _update_rows()
+    assert any("could not write the reinstall mark" in r.get("detail", "") for r in rows)
+    assert rows[-1]["action"] == "launched"
+
+
+def test_a_launch_that_is_interrupted_leaves_no_mark_behind(managed_repo, monkeypatch):
+    """Ctrl-C or a closed console while the helper is being started: nothing is in flight, so a retry must not wait."""
+    origin, work, managed = managed_repo
+    _release_v020(work)
+    _stub_uv(monkeypatch)
+    u = updater.Updater(config.load())
+    u.update_self()
+    monkeypatch.setattr(updater.paths, "IS_WINDOWS", False)
+    monkeypatch.setattr(updater, "_start_systemd_service", lambda cmd, log, cwd=None: False)
+
+    def interrupted(cmd, log=None, cwd=None):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(updater, "_spawn_detached", interrupted)
+    with pytest.raises(KeyboardInterrupt):
+        u._launch_reinstall()
+    assert not (updater.paths.state_dir() / "self-update.json").exists()
+
+
+def test_a_systemd_unit_that_started_is_logged_as_launched_and_marked(managed_repo, monkeypatch):
+    origin, work, managed = managed_repo
+    _release_v020(work)
+    _stub_uv(monkeypatch)
+    u = updater.Updater(config.load())
+    u.update_self()
+    spawned = _spawn_stubs(monkeypatch)
+    monkeypatch.setattr(updater, "_start_systemd_service", lambda cmd, log, cwd=None: True)
+    u._launch_reinstall()
+    assert spawned == []  # the unit ran it, not a plain spawn
+    row = _update_rows()[-1]
+    assert row["action"] == "launched" and "systemd" in row["detail"]
+    assert (updater.paths.state_dir() / "self-update.json").exists()
+
+
+def test_on_windows_a_helper_that_neither_route_can_start_leaves_no_mark(sandbox, monkeypatch):
+    monkeypatch.setattr(updater, "_start_helper_task", lambda shell, script: False)
+
+    def cannot_start(cmd, log=None, cwd=None):
+        raise OSError("no such program")
+
+    monkeypatch.setattr(updater, "_spawn_detached", cannot_start)
+    _windows_updater(monkeypatch)._launch_reinstall()
+    assert not (updater.paths.state_dir() / "self-update.json").exists()
+    assert _update_rows()[-1]["action"] == "failed"
+
+
+def test_a_forced_update_says_a_running_session_keeps_claude_hr_itself_as_it_is_on_windows(
+    managed_repo, monkeypatch
+):
+    """--force skips the session guard, but the Windows helper still will not replace a tool environment in use: the run
+    says so instead of reporting a clean update (on other systems there is nothing to say)."""
+    origin, work, managed = managed_repo
+    _release_v020(work)
+    _stub_uv(monkeypatch)
+    resources.register_session(os.getpid(), "/x")
+    try:
+        u = updater.Updater(config.load(), force=True)
+        res = u.update_self()
+    finally:
+        resources.unregister_session(os.getpid())
+    assert res.action == "updated"
+    said = [n for n in u.notes if "NOT reinstalling" in n and "session(s) running" in n]
+    assert bool(said) == (os.name == "nt")
+
+
+def test_a_closed_or_broken_terminal_never_stops_the_update_command(monkeypatch):
+    from claude_hr import ctl
+
+    class Closed:
+        def isatty(self):
+            raise ValueError("I/O operation on closed file")
+
+    monkeypatch.setattr(ctl.sys, "stderr", Closed())
+    assert ctl._update_progress() is None
+
+    class Broken(_Stream):
+        def write(self, text):
+            raise OSError(22, "Invalid argument")
+
+    monkeypatch.setattr(ctl.sys, "stderr", Broken(tty=True))
+    say = ctl._update_progress()
+    say("claude-hr update: a line the terminal cannot take")  # must not raise
+
+
+@pytest.mark.skipif(os.name != "nt", reason="the helper is a Windows PowerShell script")
+def test_the_real_helper_is_not_held_by_a_sibling_folder_of_the_tool_environment(
+    tmp_path, monkeypatch, sandbox
+):
+    """`tool-env-old` starts with the text `tool-env` but is not inside it: a program running from there is no reason to wait
+    or to refuse."""
+    import shutil
+
+    sibling = tmp_path / "tool-env-old" / "Scripts"
+    sibling.mkdir(parents=True)
+    cmd_exe = os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32", "cmd.exe")
+    holder_exe = sibling / "cmd.exe"
+    shutil.copy2(cmd_exe, holder_exe)
+    monkeypatch.setattr(updater, "_tool_env", lambda: str(tmp_path / "tool-env"))
+    monkeypatch.setattr(updater, "_HOLDER_WAIT_S", 3)
+    stamp = tmp_path / "reinstall-started.txt"
+    holder = subprocess.Popen([str(holder_exe), "/c", "ping -n 40 127.0.0.1 > nul"])
+    try:
+        text = _run_helper(
+            tmp_path, [cmd_exe, "/c", f"echo started > {stamp}"], tmp_path / "tool-env"
+        )
+    finally:
+        holder.kill()
+    assert stamp.exists() and "reinstall exit code 0" in text
+    assert "NOT reinstalling" not in text and "still running from the tool environment" not in text
+
+
+@pytest.mark.skipif(os.name != "nt", reason="the helper is a Windows PowerShell script")
+def test_the_real_helper_compares_the_tool_environment_path_without_regard_to_case(
+    tmp_path, monkeypatch, sandbox
+):
+    """sys.prefix is spelled one way, the path of a running process another (case, 8.3 names): a holder must still count."""
+    import shutil
+
+    env_dir = tmp_path / "tool-env" / "Scripts"
+    env_dir.mkdir(parents=True)
+    cmd_exe = os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32", "cmd.exe")
+    holder_exe = env_dir / "cmd.exe"
+    shutil.copy2(cmd_exe, holder_exe)
+    monkeypatch.setattr(updater, "_tool_env", lambda: str(tmp_path / "tool-env").upper())
+    monkeypatch.setattr(updater, "_HOLDER_WAIT_S", 3)
+    stamp = tmp_path / "reinstall-started.txt"
+    holder = subprocess.Popen([str(holder_exe), "/c", "ping -n 40 127.0.0.1 > nul"])
+    try:
+        text = _run_helper(
+            tmp_path, [cmd_exe, "/c", f"echo started > {stamp}"], tmp_path / "tool-env"
+        )
+    finally:
+        holder.kill()
+    assert not stamp.exists() and "NOT reinstalling" in text
