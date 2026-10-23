@@ -277,7 +277,7 @@ def test_rmtree_force_removes_read_only_files(tmp_path):
     assert not (tmp_path / "repo").exists()
 
 
-def test_doctor_survives_a_corrupt_settings_file(sandbox):
+def test_doctor_survives_a_corrupt_settings_file(sandbox, fake_claude):
     from pathlib import Path
 
     from claude_hr import doctor
