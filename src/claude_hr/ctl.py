@@ -585,7 +585,10 @@ def _update_progress():
         return None
 
     def say(line: str) -> None:
-        print(line, file=stream, flush=True)
+        try:
+            print(line, file=stream, flush=True)
+        except (OSError, ValueError):  # a closed or broken terminal must not stop an update
+            pass
 
     return say
 
@@ -678,8 +681,8 @@ def _add_update_args(s: argparse.ArgumentParser) -> None:
     s.add_argument(
         "--force",
         action="store_true",
-        help="update even while claude-hr sessions are running (claude-hr itself too: it does not wait for them), "
-        "and skip the Headroom release cooldown",
+        help="update even while claude-hr sessions are running (claude-hr itself too, except that on Windows its "
+        "reinstall is skipped while a session still runs), and skip the Headroom release cooldown",
     )
     s.add_argument(
         "--allow-downgrade",

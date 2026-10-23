@@ -180,8 +180,9 @@ def _pending(r: Result) -> str:
 # What --force really does, for the hint under a deferral: _busy() answers "" for every component, claude-hr's own reinstall
 # included, and the helper that runs that reinstall waits for this process, never for the sessions.
 _FORCE_SELF = (
-    "--force also reinstalls claude-hr itself without waiting for the sessions; on Windows a running claude-hr session "
-    "can make that reinstall fail. To update the rest now and leave claude-hr itself for later: "
+    "--force also reinstalls claude-hr itself without waiting for the sessions; on Windows the background helper then "
+    "waits 2 minutes for them and, if one still runs, leaves claude-hr as it is. To update the rest now and leave "
+    "claude-hr itself for later: "
     "`claude-hr update --force --only claude headroom plugins`."
 )
 
@@ -502,7 +503,8 @@ def _windows_reinstall_script(
         "$inEnv = @(Get-Process -ErrorAction SilentlyContinue | Where-Object { $p = $null; try { $p = $_.Path } catch {}; "
         "$p -and $_.Id -ne $PID -and $p.StartsWith($toolEnv + '\\', [StringComparison]::OrdinalIgnoreCase) })",
         "if ($inEnv.Count -gt 0) { Log ('NOT reinstalling: ' + (($inEnv | ForEach-Object { $_.ProcessName + ':' + $_.Id }) -join ', ') + "
-        "' still runs from the tool environment. claude-hr stays as it is; the next update finishes this.'); $attempt = 3 }",
+        "' still runs from the tool environment. claude-hr stays as it is; close the claude-hr sessions, then run claude-hr update "
+        "to finish this.'); $attempt = 3 }",
         "while ($rc -ne 0 -and $attempt -lt 3) {",
         "  $attempt++",
         "  if ($attempt -gt 1) { Log ('retrying the reinstall (attempt ' + $attempt + ' of 3)'); "
@@ -1413,6 +1415,14 @@ class Updater:
         # (_launch_reinstall), not here: a run that ends before that point (closed terminal, Ctrl-C, a crash) left a mark
         # for a reinstall that never started, and locked its own retry out for 15 minutes.
         self._pending_marker = {"from": head, "to": want}
+        if self.force and paths.IS_WINDOWS:
+            n = len(resources.live_sessions())
+            if n:  # --force skipped the session guard, but the helper still will not replace a tool environment in use
+                self.notes.append(
+                    f"{n} claude-hr session(s) running: the background reinstall of claude-hr waits 2 minutes for them and, "
+                    "if one still runs, leaves claude-hr as it is (logs/self-update.log says NOT reinstalling); "
+                    "close them and run `claude-hr update` again"
+                )
         res.action = "updated"
         res.detail = (
             "retrying the reinstall of the checked-out release (the last one did not finish); "
@@ -1439,9 +1449,19 @@ class Updater:
             paths.state_dir()
         )  # never the directory a person typed `update` in: it may be an untrusted repository
         marker = paths.state_dir() / "self-update.json"
+        started = False
         try:
             paths.ensure_dirs()  # the helper script lives in state/, its log in logs/
-            write_json(marker, {**(self._pending_marker or {}), "ts": time.time()})
+            try:
+                write_json(marker, {**(self._pending_marker or {}), "ts": time.time()})
+            except OSError as exc:  # the mark only keeps a second run from overlapping: the reinstall starts without it
+                _log(
+                    {
+                        "component": "self",
+                        "action": "note",
+                        "detail": f"could not write the reinstall mark: {exc}",
+                    }
+                )
             if paths.IS_WINDOWS:
                 shell = procutil.which_all("powershell") or procutil.which_all("pwsh")
                 if shell:
@@ -1455,6 +1475,7 @@ class Updater:
                         b"\xef\xbb\xbf" + script.encode("utf-8")
                     )  # BOM: PowerShell 5.1 reads ANSI otherwise
                     if _start_helper_task(str(shell[0]), ps1):
+                        started = True
                         _launched("the Windows task scheduler started the helper")
                         return
                     _log(
@@ -1480,17 +1501,13 @@ class Updater:
             if not paths.IS_WINDOWS and post:
                 cmd = _posix_chain(cmd, post)
             if not paths.IS_WINDOWS and _start_systemd_service(cmd, log, cwd=cwd):
+                started = True
                 _launched("a systemd unit was started")
                 return
             _spawn_detached(cmd, log, cwd=cwd)
+            started = True
             _launched("a detached process was started")
         except OSError as exc:
-            try:
-                marker.unlink(
-                    missing_ok=True
-                )  # nothing is in flight: the next update may retry at once
-            except OSError:
-                pass
             _log(
                 {
                     "component": "self",
@@ -1498,6 +1515,12 @@ class Updater:
                     "detail": f"could not start the reinstall: {exc}",
                 }
             )
+        finally:
+            if not started:  # nothing is in flight (a failed launch, Ctrl-C, a closed console): the next update may retry at once
+                try:
+                    marker.unlink(missing_ok=True)
+                except OSError:
+                    pass
 
     # ---- orchestration --------------------------------------------------------------------
     def _post_command(self) -> list[str]:
@@ -1673,12 +1696,8 @@ class Updater:
     def _cancel_reinstall(self, report: Report, busy: str) -> None:
         """Sessions started while the other components ran: claude-hr's own reinstall must not replace the tool environment
         under them (see _busy). The checkout stays on the new release; the next update finds the installed tool behind it and
-        reinstalls (the 15-minute `started` mark is removed, or that retry would wait for it)."""
+        reinstalls at once: no 15-minute mark exists, because it is written only when the helper is launched."""
         self._pending_reinstall = None
-        try:
-            (paths.state_dir() / "self-update.json").unlink(missing_ok=True)
-        except OSError:
-            pass
         for r in report.results:
             if r.component == "self" and r.action == "updated":
                 r.action, r.busy = "deferred", True
