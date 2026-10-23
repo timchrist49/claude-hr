@@ -31,8 +31,12 @@ machine's own files.
 - **The wrapper now honours the config it ignored:** `resources.cpu_quota_pct` (per session, times the up to four the shared scope
   holds, at most all cores) and `resources.memory_high_gb = 0` (no soft limit: the kernel kills at the hard cap instead of
   throttling the allocating tasks above it).
-- **Not changed, on purpose:** the soft limit stays at 75% of the hard cap (whether throttling or an OOM kill hurts less in a scope
-  that holds the service itself could not be settled without the incident's kernel logs; `memory_high_gb = 0` is the switch);
+- **Not changed, on purpose:** the soft limit stays at 75% of the hard cap. It was an unexplained default since 0.1.0; measured now
+  on real cgroups (a 2 GB scope, swap off, 3 sessions of 350 MB timing small allocations, 15 workers growing towards 3.3 GB): at 75%
+  the workers were slowed to a crawl, nothing was killed and the sessions' allocations took 2 ms at most; at 90% the workers broke
+  through to the hard cap after 16 s and the OOM killer killed a session twice (it takes the largest process, not the runaway); with
+  no soft limit it killed a session after 1.5 s. A narrower band, or `memory_high_gb = 0`, trades a slow test run for a dead session.
+  The test was anonymous memory only, so it does not explain the VM freeze; that cause is still open. Also unchanged:
   sessions hosted by the background service are still not counted by admission control (they are bounded by their shared scope; the
   docs now say so); the monitor still runs every `monitor.interval_minutes` (15; `schedule install` applies a changed value), so an
   alert follows an event rather than predicting it; and sessions do not get a scope each (a scope created inside another is a sibling

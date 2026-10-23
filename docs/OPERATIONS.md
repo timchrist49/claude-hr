@@ -165,8 +165,7 @@ process wrapper (`~/.claude-hr/bin/hr-wrap.sh`, set as `CLAUDE_CODE_PROCESS_WRAP
 `claude-hr-<pid>.scope`, together with every session it hosts and their MCP servers and test runs. Its caps are sized for the whole
 group: `MemoryMax` = `memory_max_gb` x min(the session limit, 4) (the session limit is `resources.max_sessions`; `auto` = the RAM,
 core and `session_cap` formula), at most 70% of RAM; `MemoryHigh` = 75% of that (`memory_high_gb = 0` turns the soft limit off: the
-kernel then kills at the hard cap instead of throttling the allocating tasks above it; which of the two hurts less for a scope that
-holds the service itself is not settled, so the default is unchanged); `CPUQuota` = `cpu_quota_pct` x the same count, at most all
+kernel then kills at the hard cap instead of throttling the allocating tasks above it, which is worse, see below); `CPUQuota` = `cpu_quota_pct` x the same count, at most all
 cores. The background service keeps that scope, and its caps, for as long as it runs (days), so the numbers must follow the machine:
 - the wrapper records what it was sized for (`# sized for:` line) and the monitor re-writes it when RAM, CPUs or `resources.*`
   change (more than 5%: a few MB of MemTotal noise is not a resize); `doctor` shows `agent caps` with both sizes while it is stale;
@@ -177,6 +176,17 @@ cores. The background service keeps that scope, and its caps, for as long as it 
 - `doctor` lists each running scope with its real numbers (`agent scopes`: what it holds without reclaimable cache, with it, hard cap,
   soft limit, tasks, how often it went over the soft limit and reached the hard cap). `doctor` and the monitor cover this shared
   scope only; the scopes of sessions started through `claude-hr` itself (`run-*.scope`) are not listed.
+
+**Why a soft limit at 75% of the cap, and not 90% or none** (measured, not assumed: a sealed 2 GB scope, swap off, with 3 "sessions"
+holding 350 MB each and timing small allocations, plus 15 workers growing towards 3.3 GB of demand in total). With the soft limit at
+75% the kernel slowed the workers to a crawl (the scope peaked at 1.8 GB), killed nothing, and the sessions' allocations took at most
+2 ms. At 90% the narrow band could not hold the workers: they reached the hard cap after 16 s and the OOM killer killed a SESSION
+(twice), because it picks the process with the most memory, not the runaway. With no soft limit it killed a session after 1.5 s
+(5 kills in the run). At 50% the soft limit sat below the sessions' own memory and their allocations stalled for seconds. So the
+band between the soft limit and the cap is the room the kernel has to slow a runaway down instead of killing the largest process;
+narrowing it, or removing it (`memory_high_gb = 0`), trades a slow test run for a dead session. Keep the soft limit above what the
+sessions themselves hold. The test used anonymous memory only (no file cache pressure, no disk I/O), so it does not rule out other
+causes of a stall.
 
 Session admission (`max_sessions`) counts the sessions started through `claude-hr`; sessions hosted by the background service are
 bounded by their shared scope instead, not counted. Above the soft limit the kernel throttles the tasks that allocate memory, which
