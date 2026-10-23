@@ -738,3 +738,204 @@ def test_the_process_probe_never_breaks_doctor(sandbox, fake_claude, monkeypatch
     monkeypatch.setattr(sysinfo, "process_table", boom)
     got = checks()
     assert "claude outside claude-hr" not in got and "platform" in got
+
+
+# ---- the caps on Claude's background sessions: what the RUNNING scope has, not what a fresh computation would give -----
+from claude_hr import cgroups, resources, sysinfo  # noqa: E402
+from claude_hr.checks import OK, WARN  # noqa: E402
+
+
+def linux_vm(monkeypatch, ram, cpus):
+    monkeypatch.setattr(resources.paths, "IS_LINUX", True)
+    monkeypatch.setattr(sysinfo, "memory_gb", lambda: (ram, ram * 0.8))
+    monkeypatch.setattr(sysinfo, "cpu_count", lambda: cpus)
+
+
+def install_wrapper_for(monkeypatch, ram, cpus):
+    linux_vm(monkeypatch, ram, cpus)
+    dest = resources.wrapper_path()
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    dest.write_text(resources.render_wrapper(config.load()), encoding="utf-8")
+
+
+def by_name(found):
+    return {c.name: c for c in found}
+
+
+def scopes_are(monkeypatch, *found):
+    monkeypatch.setattr(cgroups, "scopes", lambda: list(found))
+
+
+def test_a_current_wrapper_says_what_the_background_sessions_share(sandbox, monkeypatch):
+    install_wrapper_for(monkeypatch, 32.0, 16)
+    scopes_are(monkeypatch)
+    got = by_name(doctor._agent_cap_checks(config.load()))
+    assert got["agent caps"].status == OK
+    assert (
+        "MemoryMax 22.4 GB" in got["agent caps"].detail
+        and "32.0 GB RAM, 16 CPUs" in got["agent caps"].detail
+    )
+    assert "agent scopes" not in got  # nothing is running
+
+
+def test_a_wrapper_sized_for_a_smaller_vm_is_a_warning_with_both_sizes(sandbox, monkeypatch):
+    install_wrapper_for(monkeypatch, 7.56, 4)
+    linux_vm(monkeypatch, 32.0, 16)  # the VM was resized afterwards
+    scopes_are(monkeypatch)
+    check = by_name(doctor._agent_cap_checks(config.load()))["agent caps"]
+    assert check.status == WARN
+    assert (
+        "5.3 GB (sized for 7.6 GB RAM, 4 CPUs)" in check.detail and "gets 22.4 GB" in check.detail
+    )
+    assert "monitor tick" in check.fix and "heal_resource_caps" in check.fix
+    assert "daemon restart" in check.fix  # a lower number only applies to a new scope
+
+
+def test_a_wrapper_from_before_the_sizing_record_is_not_called_stale_on_an_unchanged_vm(
+    sandbox, monkeypatch
+):
+    install_wrapper_for(monkeypatch, 32.0, 16)
+    dest = resources.wrapper_path()
+    dest.write_text(
+        "\n".join(
+            ln for ln in dest.read_text(encoding="utf-8").splitlines() if "sized for" not in ln
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    scopes_are(monkeypatch)
+    assert by_name(doctor._agent_cap_checks(config.load()))["agent caps"].status == OK
+
+
+def test_a_scope_that_kept_its_old_cap_is_named_with_its_numbers(sandbox, monkeypatch):
+    install_wrapper_for(monkeypatch, 32.0, 16)
+    old = cgroups.Scope("claude-hr-4242.scope", 3.9, 4.0, 5.3, 41, {"high": 812, "max": 3})
+    scopes_are(monkeypatch, old)
+    check = by_name(doctor._agent_cap_checks(config.load()))["agent scopes"]
+    assert check.status == WARN
+    assert (
+        "claude-hr-4242.scope: 3.9 GB in use (3.9 with reclaimable cache), hard cap 5.3 GB, soft limit 4.0 GB, 41 tasks"
+        in check.detail
+    )
+    assert "over the soft limit 812x" in check.detail and "at the hard cap 3x" in check.detail
+    assert (
+        "near its ceiling" in check.detail
+        and "smaller than the 22.4 GB this machine allows" in check.detail
+    )
+
+
+def test_a_healthy_scope_is_ok_and_says_nothing_about_a_cpu_quota_nobody_set(sandbox, monkeypatch):
+    install_wrapper_for(monkeypatch, 32.0, 16)
+    scopes_are(monkeypatch, cgroups.Scope("claude-hr-4242.scope", 2.0, 16.8, 22.4, 12, {}))
+    got = by_name(doctor._agent_cap_checks(config.load()))
+    assert got["agent scopes"].status == OK and "<-" not in got["agent scopes"].detail
+    assert (
+        "cpu quota" not in got
+    )  # resources.cpu_quota_pct is 0 and there is no cpu.max: nothing to report
+
+
+def test_reclaimable_cache_does_not_make_a_scope_look_full(sandbox, monkeypatch):
+    install_wrapper_for(monkeypatch, 32.0, 16)
+    cached = cgroups.Scope(
+        "claude-hr-4242.scope", 16.8, 16.8, 22.4, 12, {"high": 2189}, working_gb=0.3
+    )
+    scopes_are(monkeypatch, cached)
+    check = by_name(doctor._agent_cap_checks(config.load()))["agent scopes"]
+    assert check.status == OK and "0.3 GB in use (16.8 with reclaimable cache)" in check.detail
+
+
+def test_the_warning_share_is_the_configured_one_and_exact(sandbox, monkeypatch):
+    install_wrapper_for(monkeypatch, 32.0, 16)
+    scope = cgroups.Scope("claude-hr-4242.scope", 15.12, 16.8, 22.4, 12, {})  # exactly 90% of 16.8
+    scopes_are(monkeypatch, scope)
+    assert by_name(doctor._agent_cap_checks(config.load()))["agent scopes"].status == WARN
+    monkeypatch.setenv("CLAUDE_HR_MONITOR__SCOPE_WARN_PCT", "95")
+    assert by_name(doctor._agent_cap_checks(config.load()))["agent scopes"].status == OK
+
+
+def test_a_scope_larger_than_the_machine_after_a_shrink_is_flagged_not_called_fine(
+    sandbox, monkeypatch
+):
+    """A VM that went from 32 GB back to 8: the monitor can re-write the wrapper but cannot lower a running scope."""
+    install_wrapper_for(monkeypatch, 8.0, 4)
+    big = cgroups.Scope("claude-hr-4242.scope", 2.0, 16.8, 22.4, 12, {})
+    scopes_are(monkeypatch, big)
+    check = by_name(doctor._agent_cap_checks(config.load()))["agent scopes"]
+    assert check.status == WARN and "larger than the 5.6 GB this machine allows" in check.detail
+    assert "daemon restart" in check.detail
+
+
+def test_a_soft_limit_the_config_no_longer_wants_is_flagged(sandbox, monkeypatch):
+    monkeypatch.setenv("CLAUDE_HR_RESOURCES__MEMORY_HIGH_GB", "0")
+    install_wrapper_for(monkeypatch, 32.0, 16)
+    scopes_are(monkeypatch, cgroups.Scope("claude-hr-4242.scope", 2.0, 16.8, 22.4, 12, {}))
+    check = by_name(doctor._agent_cap_checks(config.load()))["agent scopes"]
+    assert check.status == WARN and "soft limit the config no longer wants" in check.detail
+
+
+def test_a_scope_without_a_limit_says_so_instead_of_printing_zero(sandbox, monkeypatch):
+    install_wrapper_for(monkeypatch, 32.0, 16)
+    scopes_are(monkeypatch, cgroups.Scope("claude-hr-4242.scope", 2.0, 0.0, 22.4, 12, {}))
+    assert (
+        "soft limit no limit"
+        in by_name(doctor._agent_cap_checks(config.load()))["agent scopes"].detail
+    )
+
+
+def test_a_cpu_quota_the_kernel_ignores_is_told_apart_from_a_scope_that_predates_it(
+    sandbox, monkeypatch
+):
+    monkeypatch.setenv("CLAUDE_HR_RESOURCES__CPU_QUOTA_PCT", "200")
+    install_wrapper_for(monkeypatch, 32.0, 16)
+    no_controller = cgroups.Scope("claude-hr-1.scope", 2.0, 16.8, 22.4, 12, {}, cpu_max="")
+    scopes_are(monkeypatch, no_controller)
+    check = by_name(doctor._agent_cap_checks(config.load()))["cpu quota"]
+    assert check.status == WARN and "not delegated" in check.detail and "as root" in check.fix
+    older = cgroups.Scope(
+        "claude-hr-2.scope", 2.0, 16.8, 22.4, 12, {}, cpu_max="max 100000"
+    )  # controller works, no quota set
+    scopes_are(monkeypatch, older)
+    check = by_name(doctor._agent_cap_checks(config.load()))["cpu quota"]
+    assert (
+        "started before resources.cpu_quota_pct was set" in check.detail
+        and "daemon restart" in check.fix
+    )
+    assert "not delegated" not in check.detail
+
+
+def test_one_unlimited_scope_among_limited_ones_is_enough_for_the_cpu_warning(sandbox, monkeypatch):
+    monkeypatch.setenv("CLAUDE_HR_RESOURCES__CPU_QUOTA_PCT", "200")
+    install_wrapper_for(monkeypatch, 32.0, 16)
+    limited = cgroups.Scope("claude-hr-1.scope", 2.0, 16.8, 22.4, 12, {}, cpu_max="800000 100000")
+    unlimited = cgroups.Scope("claude-hr-2.scope", 2.0, 16.8, 22.4, 12, {}, cpu_max="")
+    scopes_are(monkeypatch, limited, unlimited)
+    check = by_name(doctor._agent_cap_checks(config.load()))["cpu quota"]
+    assert "claude-hr-2.scope" in check.detail and "claude-hr-1.scope" not in check.detail
+    scopes_are(monkeypatch, limited)
+    assert "cpu quota" not in by_name(
+        doctor._agent_cap_checks(config.load())
+    )  # in force: nothing to say
+
+
+def test_no_wrapper_no_check_about_it(sandbox, monkeypatch):
+    linux_vm(monkeypatch, 32.0, 16)  # setup never ran here
+    scopes_are(monkeypatch)
+    assert doctor._agent_cap_checks(config.load()) == []
+
+
+def test_doctor_shows_the_agent_caps_only_where_caps_can_really_apply(
+    sandbox, fake_claude, monkeypatch
+):
+    """Without a user bus the wrapper runs Claude uncapped: 'agent caps OK' there would be a false assurance."""
+    install_wrapper_for(monkeypatch, 32.0, 16)
+    scopes_are(monkeypatch)
+    monkeypatch.setattr(doctor.paths, "IS_LINUX", True)
+    monkeypatch.setattr(resources, "caps_available", lambda: False)
+    assert "agent caps" not in checks() and checks()["resource caps"].status == WARN
+    monkeypatch.setattr(resources, "caps_available", lambda: True)
+    got = checks()
+    assert got["agent caps"].status == OK
+    assert (
+        "each session started by claude-hr runs in its own systemd scope"
+        in got["resource caps"].detail
+    )

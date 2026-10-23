@@ -241,6 +241,108 @@ def _plan_meter_check() -> Check | None:
     )
 
 
+def _agent_cap_checks(cfg: Config) -> list[Check]:
+    """Linux: the caps on Claude's background service and the sessions it hosts, which share ONE scope (the process wrapper).
+    Shows the caps the RUNNING scope really has, not what a fresh computation would give: the wrapper is written once, and the
+    scope keeps its numbers for as long as the service runs, so both go stale when the machine is resized. (The scopes of
+    sessions started through `claude-hr` itself are named `run-*.scope` and are not listed here.)"""
+    from . import cgroups
+
+    def gb(value: float) -> str:
+        return f"{value:.1f} GB" if value > 0 else "no limit"
+
+    out: list[Check] = []
+    st = resources.wrapper_state(cfg)
+    wanted = st.wanted
+    if st.state == "ok" and wanted:
+        high = f", MemoryHigh {wanted.high_mb / 1024:.1f} GB" if wanted.high_mb else ""
+        out.append(
+            Check(
+                "agent caps",
+                OK,
+                f"Claude's background sessions share one scope: MemoryMax {wanted.max_mb / 1024:.1f} GB{high} "
+                f"(this machine: {wanted.ram_gb:.1f} GB RAM, {wanted.cpus} CPUs)",
+            )
+        )
+    elif st.state == "stale" and wanted:
+        have = st.installed
+        was = (
+            f"{have['ram_gb']:.1f} GB RAM, {have['cpus']:.0f} CPUs"
+            if "ram_gb" in have
+            else "an unknown machine"
+        )
+        out.append(
+            Check(
+                "agent caps",
+                WARN,
+                f"the process wrapper caps Claude's background sessions at {have['max_mb'] / 1024:.1f} GB (sized for {was}); "
+                f"this machine ({wanted.ram_gb:.1f} GB RAM, {wanted.cpus} CPUs) gets {wanted.max_mb / 1024:.1f} GB",
+                "`claude-hr-ctl monitor tick` re-writes it and raises the running scope (the scheduled monitor does this on every "
+                "run unless monitor.heal_resource_caps = false); a LOWER number only applies after `claude-hr-ctl daemon restart`, "
+                "once no session is running",
+            )
+        )
+    running = cgroups.scopes()
+    if not running:
+        return out
+    pct = float(cfg.get("monitor.scope_warn_pct", 90))
+    notes: list[str] = []
+    level = OK
+    for sc in running:
+        line = (
+            f"{sc.name}: {sc.used_gb:.1f} GB in use ({sc.current_gb:.1f} with reclaimable cache), hard cap {gb(sc.max_gb)}, "
+            f"soft limit {gb(sc.high_gb)}, {sc.pids} tasks; over the soft limit {sc.events.get('high', 0)}x "
+            f"(cache pressure included), at the hard cap {sc.events.get('max', 0)}x"
+        )
+        if sc.ceiling_gb and sc.used_gb >= sc.ceiling_gb * pct / 100:
+            line += "  <- near its ceiling"
+            level = WARN
+        if wanted and sc.max_gb and sc.max_gb * 1024 * 1.05 < wanted.max_mb:
+            line += f"  <- smaller than the {wanted.max_mb / 1024:.1f} GB this machine allows (the monitor raises it)"
+            level = WARN
+        elif wanted and sc.max_gb and sc.max_gb * 1024 > wanted.max_mb * 1.05:
+            line += (
+                f"  <- larger than the {wanted.max_mb / 1024:.1f} GB this machine allows "
+                "(a lower cap applies after `claude-hr-ctl daemon restart`, once no session is running)"
+            )
+            level = WARN
+        if wanted and not wanted.high_mb and sc.high_gb:
+            line += "  <- has a soft limit the config no longer wants (the monitor lifts it)"
+            level = WARN
+        notes.append(line)
+    out.append(
+        Check(
+            "agent scopes",
+            level,
+            "\n         ".join(notes),
+            ""
+            if level == OK
+            else "`claude-hr-ctl monitor tick` fixes what can be fixed in place; stop or bound the heavy run",
+        )
+    )
+    if int(cfg.get("resources.cpu_quota_pct", 0) or 0) > 0:
+        unlimited = [s for s in running if not s.cpu_limited]
+        undelegated = [s.name for s in unlimited if not s.cpu_max]
+        predating = [s.name for s in unlimited if s.cpu_max]
+        why: list[str] = []
+        fix: list[str] = []
+        if undelegated:
+            why.append(
+                f"{', '.join(undelegated)} has no CPU limit: the cpu controller is not delegated to the user manager, so systemd "
+                "accepts CPUQuota and ignores it"
+            )
+            fix.append("one-time, as root: see 'Resource governor tuning' in docs/OPERATIONS.md")
+        if predating:
+            why.append(
+                f"{', '.join(predating)} has no CPU limit although the controller works: it was started before "
+                "resources.cpu_quota_pct was set (or before the wrapper was re-written)"
+            )
+            fix.append("`claude-hr-ctl daemon restart` once no session is running")
+        if why:
+            out.append(Check("cpu quota", WARN, "; ".join(why), "; ".join(fix)))
+    return out
+
+
 REAPPLY = "claude-hr-ctl setup --only settings claude-md plugins"
 
 
@@ -640,9 +742,10 @@ def run(cfg: Config, cwd: Path, deep: bool = False) -> list[Check]:
                 Check(
                     "resource caps",
                     OK,
-                    f"each session runs in a systemd scope, MemoryMax {cap:.0f} GB",
+                    f"each session started by claude-hr runs in its own systemd scope, MemoryMax {cap:.0f} GB",
                 )
             )
+            out.extend(_agent_cap_checks(cfg))
         elif cap > 0:
             out.append(
                 Check(
@@ -652,6 +755,7 @@ def run(cfg: Config, cwd: Path, deep: bool = False) -> list[Check]:
                     "install dbus-user-session (apt install dbus-user-session), log in again; on WSL also enable systemd",
                 )
             )
+
     free = sysinfo.disk_free_gb(paths.home())
     out.append(
         Check(

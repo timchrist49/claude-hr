@@ -1,5 +1,48 @@
 # Changelog
 
+## 0.3.5
+The caps on Claude's background sessions now follow the machine as it grows, and `doctor` and the monitor show what the kernel really
+gave them. From a Linux VM that froze twice while three background (`claude agents`) sessions ran an unbounded `jest` suite: the wrapper
+that caps those sessions had been written for the VM's old size (7.6 GB RAM, so a 4 GB soft limit for the whole group) and nothing
+re-checked it after the VM was resized, doctor printed a freshly computed per-session number instead of the cap the running scope
+had, and the monitor (every 15 minutes) looked at RAM, disk, `~/.claude` and the proxy, not at the scope. The exact stall mechanism
+could not be confirmed (the kernel logs were gone); the stale cap, the shared scope and the blind spots could, from the code and the
+machine's own files.
+- **The wrapper is kept right for the machine.** It records what it was sized for (`# sized for:` line), and the scheduled monitor
+  re-writes it when RAM, CPUs or `resources.*` change by more than 5% (`monitor.heal_resource_caps`, on by default; `doctor` shows
+  `agent caps` with both sizes while it is stale). A wrapper from before 0.3.5 whose limits are still right is re-written once to add
+  the record, without a warning.
+- **The scope that is already running is raised too.** The background service keeps its scope, and its caps, for days, so a new wrapper
+  alone changes nothing. The monitor raises a running `claude-hr-*.scope` with `systemctl --user set-property --runtime` (verified on
+  systemd 249): never given a cap it did not have, no restart, and a soft limit the config no longer wants (`memory_high_gb = 0`) is
+  lifted. A LOWER number (the VM shrank) is not applied to a running scope: `doctor` flags it as larger than the machine allows and
+  `claude-hr-ctl daemon restart` replaces it once no session is running.
+- **`doctor` reads the running scope** (`agent scopes`): what it holds without reclaimable page cache and with it, hard cap and soft
+  limit, tasks, how often it went over the soft limit and reached the hard cap, with a warning near the ceiling or when the scope does
+  not match this machine. `agent caps` is only shown when the caps can really be applied (a systemd user bus). It also says when
+  `resources.cpu_quota_pct` is set but a running scope has no CPU limit, and why: the cpu controller is not delegated to the user
+  manager (systemd accepts `CPUQuota` and does nothing), or the scope was started before the setting.
+- **The monitor watches the scope and the kernel's pressure stall information.** New alerts `scope-full` (the working set, not
+  `memory.current`: a long-lived scope keeps clean page cache up to its soft limit, which a test showed reads as "full" with pressure
+  0.00), `scope-capped` (reached the hard cap), `scope-oom` (lost a process to the OOM killer; both counted since the previous tick,
+  including everything a scope that appeared in between has counted so far) and `pressure` (memory or I/O stalled tasks for 20% of the
+  time since the previous tick, from the cumulative stall counters, so a stall in the middle of the 15 minutes is not missed;
+  thresholds `monitor.scope_warn_pct` and `monitor.psi_warn_pct`). A damaged `state/health.json` no longer stops the monitor.
+- **The wrapper now honours the config it ignored:** `resources.cpu_quota_pct` (per session, times the up to four the shared scope
+  holds, at most all cores) and `resources.memory_high_gb = 0` (no soft limit: the kernel kills at the hard cap instead of
+  throttling the allocating tasks above it).
+- **Not changed, on purpose:** the soft limit stays at 75% of the hard cap. It was an unexplained default since 0.1.0; measured now
+  on real cgroups (a 2 GB scope, swap off, 3 sessions of 350 MB timing small allocations, 15 workers growing towards 3.3 GB): at 75%
+  the workers were slowed to a crawl, nothing was killed and the sessions' allocations took 2 ms at most; at 90% the workers broke
+  through to the hard cap after 16 s and the OOM killer killed a session twice (it takes the largest process, not the runaway); with
+  no soft limit it killed a session after 1.5 s. A narrower band, or `memory_high_gb = 0`, trades a slow test run for a dead session.
+  The test was anonymous memory only, so it does not explain the VM freeze; that cause is still open. Also unchanged:
+  sessions hosted by the background service are still not counted by admission control (they are bounded by their shared scope; the
+  docs now say so); the monitor still runs every `monitor.interval_minutes` (15; `schedule install` applies a changed value), so an
+  alert follows an event rather than predicting it; and sessions do not get a scope each (a scope created inside another is a sibling
+  and would escape the shared cap). Bounding the test runner remains the real prevention: `jest --maxWorkers=2`, `pytest -n 2`,
+  `cargo test -- --test-threads=2`.
+
 ## 0.3.4
 The managed CLAUDE.md block now nudges security-sensitive changes to the security reviewer that `hr-core` already ships.
 - **One new baseline line** (Security section): if the change touches authentication, file paths built from untrusted input,

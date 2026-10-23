@@ -122,7 +122,14 @@ the installer.
 
 ## Monitoring and alerts
 `monitor tick` (every 15 min) writes `state/health.json`, appends `logs/monitor.jsonl`, restarts a dead proxy, and alerts
-(once per 6 h per condition) on: low disk, high RAM, large `~/.claude`, proxy down. The weekly `maintain` job also runs
+(once per 6 h per condition) on: low disk, high RAM, large `~/.claude`, proxy down. On Linux it also watches Claude's shared
+background scope (see below) and the kernel's pressure stall information: `scope-full` (a scope holds `monitor.scope_warn_pct` = 90%
+of its memory ceiling, the soft limit else the hard cap; reclaimable file cache is not counted), `scope-capped` (it reached its hard
+cap) and `scope-oom` (it lost a process to the OOM killer), both counted since the previous tick, and `pressure` (memory or I/O
+stalled tasks for `monitor.psi_warn_pct` = 20% of the time since the previous tick, from the kernel's cumulative stall counters, or
+of the last minute). These alerts arrive shortly AFTER the event, within one `monitor.interval_minutes` (15; a changed interval
+reaches the scheduler with `claude-hr-ctl schedule install`), and a frozen machine cannot run the tick at all. The monitor also
+keeps the caps right for the machine (`monitor.heal_resource_caps`). The weekly `maintain` job also runs
 `creds scan` over the last 7 days of transcripts and sends a one-off `transcript-secrets` alert through the same channels.
 Channels (set any): `monitor.alert_ntfy_url` (phone push), `monitor.alert_webhook_url`, `monitor.alert_command`
 (argv, no shell; text arrives in `CLAUDE_HR_ALERT_TITLE` / `CLAUDE_HR_ALERT_BODY`). Claude's own phone push needs Remote Control,
@@ -150,7 +157,42 @@ format-native lossless compaction and never emits a retrieval marker, so no `hea
 `headroom proxy --help` for the other flags.
 CPU quotas on Linux need the `cpu` controller delegated to user managers (one-time, root):
 `/etc/systemd/system/user@.service.d/delegate.conf` → `[Service]\nDelegate=cpu cpuset io memory pids`, then
-`systemctl daemon-reload` and re-login; then set `resources.cpu_quota_pct`.
+`systemctl daemon-reload` and re-login; then set `resources.cpu_quota_pct`. Without that delegation systemd accepts `CPUQuota`
+and ignores it; `doctor` says so (`cpu quota`) when the setting is on and a running scope has no CPU limit.
+
+**Claude's background sessions share one scope.** `claude agents` / `--bg` run inside Claude's background service, which the
+process wrapper (`~/.claude-hr/bin/hr-wrap.sh`, set as `CLAUDE_CODE_PROCESS_WRAPPER`) puts into ONE systemd scope,
+`claude-hr-<pid>.scope`, together with every session it hosts and their MCP servers and test runs. Its caps are sized for the whole
+group: `MemoryMax` = `memory_max_gb` x min(the session limit, 4) (the session limit is `resources.max_sessions`; `auto` = the RAM,
+core and `session_cap` formula), at most 70% of RAM; `MemoryHigh` = 75% of that (`memory_high_gb = 0` turns the soft limit off: the
+kernel then kills at the hard cap instead of throttling the allocating tasks above it, which is worse, see below); `CPUQuota` = `cpu_quota_pct` x the same count, at most all
+cores. The background service keeps that scope, and its caps, for as long as it runs (days), so the numbers must follow the machine:
+- the wrapper records what it was sized for (`# sized for:` line) and the monitor re-writes it when RAM, CPUs or `resources.*`
+  change (more than 5%: a few MB of MemTotal noise is not a resize); `doctor` shows `agent caps` with both sizes while it is stale;
+- the scope that is already running is RAISED to the new numbers with `systemctl --user set-property --runtime` (never given a cap
+  it did not have; a soft limit the config no longer wants is lifted). A LOWER number (the VM shrank, or you tightened `resources.*`)
+  applies to the next scope only: `doctor` flags the running scope as larger than the machine allows, and
+  `claude-hr-ctl daemon restart` replaces it once no session is running;
+- `doctor` lists each running scope with its real numbers (`agent scopes`: what it holds without reclaimable cache, with it, hard cap,
+  soft limit, tasks, how often it went over the soft limit and reached the hard cap). `doctor` and the monitor cover this shared
+  scope only; the scopes of sessions started through `claude-hr` itself (`run-*.scope`) are not listed.
+
+**Why a soft limit at 75% of the cap, and not 90% or none** (measured, not assumed: a sealed 2 GB scope, swap off, with 3 "sessions"
+holding 350 MB each and timing small allocations, plus 15 workers growing towards 3.3 GB of demand in total). With the soft limit at
+75% the kernel slowed the workers to a crawl (the scope peaked at 1.8 GB), killed nothing, and the sessions' allocations took at most
+2 ms. At 90% the narrow band could not hold the workers: they reached the hard cap after 16 s and the OOM killer killed a SESSION
+(twice), because it picks the process with the most memory, not the runaway. With no soft limit it killed a session after 1.5 s
+(5 kills in the run). At 50% the soft limit sat below the sessions' own memory and their allocations stalled for seconds. So the
+band between the soft limit and the cap is the room the kernel has to slow a runaway down instead of killing the largest process;
+narrowing it, or removing it (`memory_high_gb = 0`), trades a slow test run for a dead session. Keep the soft limit above what the
+sessions themselves hold. The test used anonymous memory only (no file cache pressure, no disk I/O), so it does not rule out other
+causes of a stall.
+
+Session admission (`max_sessions`) counts the sessions started through `claude-hr`; sessions hosted by the background service are
+bounded by their shared scope instead, not counted. Above the soft limit the kernel throttles the tasks that allocate memory, which
+can make every session in the scope crawl; at the hard cap it kills a process. Bound heavy runs inside agent sessions: `jest
+--maxWorkers=2`, `pytest -n 2` (needs pytest-xdist), `cargo test -- --test-threads=2` (`-j` only limits compile jobs). An unbounded
+test run starts a worker per core.
 
 ## Troubleshooting
 | Symptom | Cause / fix |
@@ -161,6 +203,7 @@ CPU quotas on Linux need the `cpu` controller delegated to user managers (one-ti
 | Subscription limit burning faster than expected | `ANTHROPIC_API_KEY` exported (overrides login — `creds doctor`), or many parallel sessions: lower `resources.max_sessions`. `claude-hr-ctl usage --by project`. Once the 7-day window is full, extra usage is billed at API prices: `claude-hr-ctl status` and `doctor` show the window and the extra-usage dollars (from Headroom's poll, so the proxy must have run), and the status line adds `7d` at 80% and the extra dollars when the window is full. Fast mode (`/fast`) doubles Opus prices; `fastModePerSessionOptIn` in settings.json keeps it from persisting across sessions. |
 | `/rc` (Remote Control) unavailable | Disabled by Claude Code behind any custom base URL. `claude-hr --hr-direct`. |
 | High RAM | Proxy ~1.2 GB + ~0.3–0.7 GB per session. `footprint = "lite"`, fewer sessions. |
+| Linux VM crawls or freezes while several background (`claude agents`) sessions work; `ps` and `git` time out | Likely cause: a heavy run (a full test suite with a worker per core) in the memory-capped scope the background sessions share, or a cap sized for a smaller machine. `claude-hr-ctl doctor` (`agent caps`, `agent scopes`: near its ceiling? sized for a smaller machine?), `claude-hr-ctl monitor tick` to re-size now, then bound the runner (`--maxWorkers`). The `scope-*` and `pressure` alerts follow within one monitor interval. To see what the kernel did, the previous boot's log must be persistent (`Storage=persistent` in journald.conf): `sudo journalctl -k -b -1 --no-pager \| grep -i -E "oom\|hung_task\|Memory cgroup"`; your hypervisor's disk-latency graph covers the I/O side. |
 | `~/.claude` huge | `claude-hr-ctl cleanup` (dry-run) then `--apply`. |
 | Plugin token cost too high | `claude-hr-ctl plugins audit`; move big ones to project scope (`plugins suggest`). |
 | Claude shows a non-blocking hook notice every turn | `claude-hr-hook` is not on PATH in the shell Claude runs in: `uv tool update-shell`, open a new terminal (`doctor` says so). |
