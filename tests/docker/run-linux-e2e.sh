@@ -228,6 +228,25 @@ u._launch_reinstall(post=[d + "/post"])
   check "the reinstall and post chain survives dollar and percent signs in a path, starts in the state directory and logs a failed post phase" chain_through_systemd
 fi
 
+# A scope created long ago keeps its caps: the monitor must raise it when the machine allows more, doctor must list it.
+scope_raise_probe() {
+  local uid cg pid i now doc
+  uid=$(id -u)
+  cg=/sys/fs/cgroup/user.slice/user-$uid.slice/user@$uid.service/app.slice/claude-hr-e2eprobe.scope
+  systemd-run --user --scope --quiet --collect --unit=claude-hr-e2eprobe -p MemoryMax=300M -p MemoryHigh=200M -- sleep 120 &
+  pid=$!
+  for i in $(seq 1 20); do [ -d "$cg" ] && break; sleep 0.5; done
+  [ -d "$cg" ] || { echo "the probe scope never appeared at $cg"; kill "$pid" 2>/dev/null; return 1; }
+  CLAUDE_HR_MONITOR__RESTART_PROXY=false claude-hr-ctl monitor tick >/dev/null
+  now=$(cat "$cg/memory.max")
+  # captured first: `doctor | grep -q` under pipefail fails on SIGPIPE when grep exits at its first match
+  doc=$(claude-hr-ctl doctor 2>&1)
+  grep -q 'claude-hr-e2eprobe' <<<"$doc" || { echo "doctor does not list the scope"; kill "$pid" 2>/dev/null; return 1; }
+  kill "$pid" 2>/dev/null
+  echo "memory.max after the monitor tick: $now"
+  [ "$now" != max ] && [ "$now" -gt 314572800 ]
+}
+
 if [ "$HAVE_SYSTEMD" = 1 ]; then
   echo "== 7b. resource governor (real cgroups) =="
   check "wrapper fails open without a user bus" bash -c "XDG_RUNTIME_DIR=/nonexistent $HOME/.claude-hr/bin/hr-wrap.sh echo ran | grep -q ran"
@@ -246,6 +265,12 @@ r = subprocess.run(cmd, capture_output=True, text=True)
 print('rc', r.returncode, r.stdout.strip())
 sys.exit(0 if r.returncode != 0 and 'survived' not in r.stdout else 1)
 PY"
+  check "the wrapper records what it was sized for" grep -q '^# sized for: RAM' "$HOME/.claude-hr/bin/hr-wrap.sh"
+  check "a wrapper sized for a smaller VM is re-written by the monitor" bash -c "
+    sed -i 's/-p MemoryMax=[0-9]*M/-p MemoryMax=300M/; s/^# sized for: RAM [0-9.]* GB/# sized for: RAM 1.0 GB/' $HOME/.claude-hr/bin/hr-wrap.sh &&
+    CLAUDE_HR_MONITOR__RESTART_PROXY=false claude-hr-ctl monitor tick >/dev/null &&
+    ! grep -q 'MemoryMax=300M' $HOME/.claude-hr/bin/hr-wrap.sh && grep -q '^# sized for: RAM' $HOME/.claude-hr/bin/hr-wrap.sh && test -x $HOME/.claude-hr/bin/hr-wrap.sh"
+  check "the monitor raises a running scope's caps and doctor lists it" scope_raise_probe
   else
     echo "  SKIP cgroup checks: no user D-Bus session here (apt install dbus-user-session)"
   fi

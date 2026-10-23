@@ -232,7 +232,7 @@ class ClaudeSetup:
         from . import resources
 
         script = resources.render_wrapper(self.cfg)
-        dest = paths.bin_dir() / "hr-wrap.sh"
+        dest = resources.wrapper_path()
         if not script:
             if dest.exists() and not self.dry:
                 dest.unlink()
