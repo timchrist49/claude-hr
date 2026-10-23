@@ -106,7 +106,7 @@ function Wait-ForLastUpdate($v, $seconds) {
   return $rec
 }
 function Verify-PostPhase($label, $v) {
-  $rec = Wait-ForLastUpdate $v 150
+  $rec = Wait-ForLastUpdate $v 270
   Check "$label : the post phase ran after the reinstall (state\update-last.json is complete and written by $v)" ($rec -and $rec.phase -eq 'complete' -and $rec.versions.'claude-hr' -eq $v) (($rec | ConvertTo-Json -Compress -Depth 4))
   Check "$label : the record names the self update and the plugins step" ((@($rec.results | Where-Object { $_.component -eq 'self' -and $_.action -eq 'updated' }).Count -eq 1) -and (@($rec.results | Where-Object { $_.component -eq 'plugins' }).Count -eq 1)) (($rec.results | ConvertTo-Json -Compress -Depth 4))
   $helperLog = Get-Content "$sb\h\.claude-hr\logs\self-update.log" -Raw -ErrorAction SilentlyContinue
@@ -116,7 +116,7 @@ function Verify-PostPhase($label, $v) {
   Check "$label : claude-hr-ctl status shows the last update" ($st -match 'Last update: ') $st
 }
 function Verify-Update($label, $v) {
-  $o = Wait-ForVersion $v 150
+  $o = Wait-ForVersion $v 270
   if ($o -notmatch "claude-hr $([regex]::Escape($v))") { "  --- helper log:"; Get-Content "$sb\h\.claude-hr\logs\self-update.log" -ErrorAction SilentlyContinue | ForEach-Object { "      $_" } }
   Check "$label : claude-hr-ctl runs on $v (no ModuleNotFoundError)" (($o -match "claude-hr $([regex]::Escape($v))") -and ($o -notmatch 'ModuleNotFoundError')) ($o.Substring(0, [Math]::Min(300, $o.Length)))
   $tl = Run "uv tool list"

@@ -114,11 +114,23 @@ claude-hr itself updates to the newest `vX.Y.Z` tag (`self.update_ref`); cut a r
 **Rollback by hand:** `claude install <version> --force`; `uv tool install --python 3.13 "headroom-ai[all]==<ver>"`;
 `git -C ~/.claude-hr/repo checkout <tag> && uv tool install --force --reinstall ~/.claude-hr/repo`.
 
+**While it runs:** at a terminal, `update` lists each component on stderr as it starts (`updating Claude Code (a new version
+takes about a minute) ...`); the one report still comes at the end. The scheduled job and pipes get no progress lines, only the
+report and the log. When the report says claude-hr itself is "finishing in the background", the reinstall takes a minute or two:
+**do not open `claude-hr` again until `claude-hr-ctl --version` shows the new version.** The helper waits up to 2 minutes for
+every running `claude-hr` program; a session that is still running from the tool environment when the wait ends makes it leave
+claude-hr as it is (it logs `NOT reinstalling`) rather than let uv fail halfway and leave the environment half-deleted. Nothing
+is lost: the checkout is already on the new release, and the next `claude-hr update` finishes the job at once.
+
 **A self-update that did not finish:** claude-hr's own reinstall runs in the background after `update` exits and logs to
 `~/.claude-hr/logs/self-update.log` (Windows: a one-shot Task Scheduler task `selfupdate` in the `claude-hr` folder that deletes
-itself and its script; Linux: a transient `claude-hr-selfupdate-*` systemd user unit). If `doctor` warns that the installed
-version is behind the checkout, run `claude-hr-ctl update --only self` to retry (the next daily update retries too), or re-run
-the installer.
+itself and its script; Linux: a transient `claude-hr-selfupdate-*` systemd user unit). `logs/update.jsonl` has a `self` row with
+action `launched` once the helper was really started; an `updated` row without it means the run ended before that point (closed
+terminal, Ctrl-C). If `doctor` warns that the installed version is behind the checkout, run `claude-hr-ctl update --only self`
+to retry (the next daily update retries too), or re-run the installer. A retry waits 15 minutes only after a reinstall WAS
+launched (`state/self-update.json`, written at launch and cleared when the reinstall did not happen); a run that ended earlier
+can be retried at once. Last resort, from a terminal with no `claude-hr` running:
+`uv tool install --python 3.13 --force --reinstall ~/.claude-hr/repo`.
 
 ## Monitoring and alerts
 `monitor tick` (every 15 min) writes `state/health.json`, appends `logs/monitor.jsonl`, restarts a dead proxy, and alerts
@@ -204,6 +216,7 @@ test run starts a worker per core.
 | `/rc` (Remote Control) unavailable | Disabled by Claude Code behind any custom base URL. `claude-hr --hr-direct`. |
 | High RAM | Proxy ~1.2 GB + ~0.3–0.7 GB per session. `footprint = "lite"`, fewer sessions. |
 | Linux VM crawls or freezes while several background (`claude agents`) sessions work; `ps` and `git` time out | Likely cause: a heavy run (a full test suite with a worker per core) in the memory-capped scope the background sessions share, or a cap sized for a smaller machine. `claude-hr-ctl doctor` (`agent caps`, `agent scopes`: near its ceiling? sized for a smaller machine?), `claude-hr-ctl monitor tick` to re-size now, then bound the runner (`--maxWorkers`). The `scope-*` and `pressure` alerts follow within one monitor interval. To see what the kernel did, the previous boot's log must be persistent (`Storage=persistent` in journald.conf): `sudo journalctl -k -b -1 --no-pager \| grep -i -E "oom\|hung_task\|Memory cgroup"`; your hypervisor's disk-latency graph covers the I/O side. |
+| `claude-hr update` printed nothing for a minute and the version did not change | The report comes at the end, and claude-hr's own reinstall finishes in the background (see "While it runs" under Updates). Check `claude-hr-ctl --version` after two minutes; `logs/update.jsonl` shows whether the helper was `launched`, `logs/self-update.log` what it did. |
 | `~/.claude` huge | `claude-hr-ctl cleanup` (dry-run) then `--apply`. |
 | Plugin token cost too high | `claude-hr-ctl plugins audit`; move big ones to project scope (`plugins suggest`). |
 | Claude shows a non-blocking hook notice every turn | `claude-hr-hook` is not on PATH in the shell Claude runs in: `uv tool update-shell`, open a new terminal (`doctor` says so). |

@@ -573,6 +573,23 @@ def _claude_only_update(cfg) -> int:
     return subprocess.call([str(claude), "update"])
 
 
+def _update_progress():
+    """A line per component on stderr when a person is watching. The run prints its one report only at the end, a minute
+    or more later, and a silent terminal looks like a command that did nothing. None when stderr is not a terminal (the
+    scheduled job, a pipe): those get the report and the log, as before."""
+    stream = sys.stderr
+    try:
+        if stream is None or not stream.isatty():
+            return None
+    except (AttributeError, ValueError):
+        return None
+
+    def say(line: str) -> None:
+        print(line, file=stream, flush=True)
+
+    return say
+
+
 def cmd_update(a, cfg) -> int:
     """Update everything (see updater.py), print the one report, and exit with 0 ok | 1 failed | 75 deferred (sessions run,
     or another update is running) | 2 refused."""
@@ -608,6 +625,10 @@ def cmd_update(a, cfg) -> int:
         allow_downgrade=a.allow_downgrade,
         restart=not a.no_restart,
     )
+    say = None if a.post else _update_progress()
+    if say:
+        say("claude-hr update: each step is listed as it runs; the report follows at the end.")
+    u.progress = say
     try:
         rep = u.run_post() if a.post else u.run(a.only or None)
     except updater.UpdateInProgress:
