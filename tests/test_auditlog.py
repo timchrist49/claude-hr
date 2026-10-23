@@ -91,6 +91,7 @@ def test_audit_dir_lives_under_the_claude_hr_home(sandbox):
 _APPENDER = (
     "import sys, time\n"
     "from claude_hr import auditlog\n"
+    "auditlog.LOCK_WAIT_S = 30.0  # the product gives up after 0.1 s and appends anyway; a slow runner must not\n"
     "start, n, tag = float(sys.argv[1]), int(sys.argv[2]), sys.argv[3]\n"
     "while time.time() < start:\n"
     "    pass\n"

@@ -123,3 +123,27 @@ def pytest_sessionfinish(session, exitstatus):
     if changed:
         print(f"\nTEST ISOLATION BREACH - the suite touched the real profile: {changed}")
         session.exitstatus = 1
+
+
+@pytest.fixture
+def fake_claude(monkeypatch):
+    import subprocess
+
+    from claude_hr import doctor, sysinfo
+
+    """doctor needs a Claude Code binary to run its settings checks: fake one so the tests do not depend on the machine."""
+    monkeypatch.setattr(doctor.procutil, "find_claude", lambda *a, **k: Path("/fake/claude"))
+    real_run = doctor.procutil.run
+    monkeypatch.setattr(
+        doctor.procutil,
+        "run",
+        lambda cmd, **k: (
+            subprocess.CompletedProcess(cmd, 0, "2.1.300 (Claude Code)", "")
+            if str(cmd[0]).endswith("claude")
+            else real_run(cmd, **k)
+        ),
+    )
+    # ... and no Claude Code session of the developer's own may turn up in what doctor says about running processes
+    monkeypatch.setattr(sysinfo, "process_table", lambda: {})
+    # ... nor may the shell the tests run in: inside a claude-hr session ANTHROPIC_BASE_URL points at the proxy
+    monkeypatch.delenv("ANTHROPIC_BASE_URL", raising=False)

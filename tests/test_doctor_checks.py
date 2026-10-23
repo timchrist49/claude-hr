@@ -10,28 +10,6 @@ from claude_hr import config, doctor, paths
 from claude_hr.headroom import Headroom
 
 
-@pytest.fixture
-def fake_claude(monkeypatch):
-    """doctor needs a Claude Code binary to run its settings checks: fake one so the tests do not depend on the machine."""
-    monkeypatch.setattr(doctor.procutil, "find_claude", lambda *a, **k: Path("/fake/claude"))
-    real_run = doctor.procutil.run
-    monkeypatch.setattr(
-        doctor.procutil,
-        "run",
-        lambda cmd, **k: (
-            subprocess.CompletedProcess(cmd, 0, "2.1.300 (Claude Code)", "")
-            if str(cmd[0]).endswith("claude")
-            else real_run(cmd, **k)
-        ),
-    )
-    # ... and no Claude Code session of the developer's own may turn up in what doctor says about running processes
-    from claude_hr import sysinfo
-
-    monkeypatch.setattr(sysinfo, "process_table", lambda: {})
-    # ... nor may the shell the tests run in: inside a claude-hr session ANTHROPIC_BASE_URL points at the proxy
-    monkeypatch.delenv("ANTHROPIC_BASE_URL", raising=False)
-
-
 def checks(cwd: Path | None = None):
     return {c.name: c for c in doctor.run(config.load(), cwd or Path.cwd())}
 
