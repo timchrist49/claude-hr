@@ -160,7 +160,8 @@ def is_shimmed(name: str) -> bool:
     entry = names.get(name) if isinstance(names, dict) else None
     if not isinstance(entry, dict) or not entry.get("shim") or not data.get("bin"):
         return False
-    return _is_ours(Path(str(data["bin"])) / f"{name}.cmd")
+    folder = Path(str(data["bin"]))
+    return _is_ours(folder / f"{name}.cmd") or _is_ours(folder / name)
 
 
 # ---- ensure / remove -------------------------------------------------------------------------------------------------------
@@ -172,16 +173,23 @@ class Outcome:
     refused: dict[str, Probe] = field(default_factory=dict)
 
 
-def _write_shims(bin_dir: Path, name: str, module: str, python: str) -> str | None:
-    """Write the two stand-ins of `name`. None when done, else why not. A file that is not ours is never touched."""
+def _write_shims(
+    bin_dir: Path, name: str, module: str, python: str, with_cmd: bool = True
+) -> str | None:
+    """Write the stand-ins of `name`: the shell script, and the .cmd unless `with_cmd` is False (a .cmd hands its arguments to
+    cmd.exe, which acts on & | < > in them; a person who does not want that keeps only the script, and PowerShell and cmd.exe
+    then have no `name`). None when done, else why not. A file that is not ours is never touched."""
     cmd, sh = bin_dir / f"{name}.cmd", bin_dir / name
-    for target in (cmd, sh):
+    for target in (cmd, sh) if with_cmd else (sh,):
         if target.exists() and not _is_ours(target):
             return f"{target} exists and was not made by claude-hr"
-    if not python.isascii():
+    if with_cmd and not python.isascii():
         # cmd.exe reads a batch file in the console's code page, not in UTF-8: a path with other characters would be misread
         return f"the Python path {python} has characters that cmd.exe cannot read from a batch file"
-    atomic_write_text(cmd, render_cmd(python, module), newline="\r\n", follow_symlinks=False)
+    if with_cmd:
+        atomic_write_text(cmd, render_cmd(python, module), newline="\r\n", follow_symlinks=False)
+    elif cmd.is_file() and _is_ours(cmd):
+        cmd.unlink()  # written by an earlier look, before the .cmd was switched off
     atomic_write_text(sh, render_sh(python, module), newline="\n", follow_symlinks=False)
     return None
 
@@ -203,17 +211,19 @@ def ensure(
     waits: tuple[float, ...] = WAITS,
     sleep: Callable[[float], None] = time.sleep,
     dry: bool = False,
+    cmd: bool = True,
 ) -> Outcome:
-    """Look at each launcher; give a refused one a stand-in, give a launcher that starts again its place back. Never raises:
-    claude-hr must start, and set itself up, on a PC where this does not work."""
+    """Look at each launcher; give a refused one a stand-in, give a launcher that starts again its place back. `cmd`: also
+    write the .cmd stand-ins (config launchers.cmd). Never raises: claude-hr must start, and set itself up, on a PC where this
+    does not work."""
     out = Outcome()
     folder = Path(bin_dir) if bin_dir else default_bin_dir()
     try:
         py = python or console_python()
         if dry:
-            return _ensure(out, folder, py, probe_fn, waits, sleep, dry=True)
+            return _ensure(out, folder, py, probe_fn, waits, sleep, True, cmd)
         with locked(paths.state_dir() / "launchers.lock", timeout=10.0, stale_after=300.0):
-            return _ensure(out, folder, py, probe_fn, waits, sleep, dry=False)
+            return _ensure(out, folder, py, probe_fn, waits, sleep, False, cmd)
     except LockTimeout:
         out.lines.append("another claude-hr process is checking the launchers; skipped")
     except Exception as exc:  # noqa: BLE001 - fail open
@@ -230,6 +240,7 @@ def _ensure(
     waits: tuple[float, ...],
     sleep: Callable[[float], None],
     dry: bool,
+    with_cmd: bool,
 ) -> Outcome:
     found: dict[str, Path] = {}  # name -> the launcher file to look at
     moved_back: set[str] = set()
@@ -279,9 +290,12 @@ def _ensure(
                 )
                 names_state[name] = {"refused": True, "shim": False}
                 continue
+            stand_ins = (
+                f"{name}.cmd and {name}" if with_cmd else f"{name} (a shell script: Git Bash only)"
+            )
             problem: str | None = None
             try:
-                problem = _write_shims(bin_dir, name, module, python)
+                problem = _write_shims(bin_dir, name, module, python, with_cmd)
                 if problem is None and exe.is_file():
                     try:
                         os.replace(
@@ -291,15 +305,29 @@ def _ensure(
                         problem = f"{exe.name} could not be moved aside: {exc}"
             except OSError as exc:
                 problem = str(exc)
-            if problem is None and name in moved_back:
+            standin_refused: Probe | None = None
+            if problem is None and with_cmd:
+                # the stand-in has to start, too: a rule on the folder (a Deny rule that new files inherit) or a script rule of
+                # AppLocker refuses a .cmd as well, and then PowerShell and cmd.exe have nothing to start
+                check = probe_fn(bin_dir / f"{name}.cmd", LAUNCHERS[name][1])
+                if check.refused:
+                    standin_refused = check
+            if standin_refused is not None:
+                out.ok = False
+                out.lines.append(
+                    f"{name}: Windows refuses {exe.name} ({why}), and refuses the stand-in {name}.cmd too "
+                    f"(error {standin_refused.code}: {standin_refused.message}): PowerShell and cmd.exe cannot start {name}; "
+                    "the shell script of that name still starts it in Git Bash"
+                )
+            elif problem is None and name in moved_back:
                 # put back for this look, refused again, moved aside again: the folder is as it was
                 out.lines.append(
-                    f"{name}: Windows still refuses {exe.name} ({why}); {name}.cmd and {name} keep running it through Python"
+                    f"{name}: Windows still refuses {exe.name} ({why}); {stand_ins} keep running it through Python"
                 )
             elif problem is None:
                 out.changed = True
                 out.lines.append(
-                    f"{name}: Windows refuses {exe.name} ({why}); {name}.cmd and {name} run it through Python instead"
+                    f"{name}: Windows refuses {exe.name} ({why}); {stand_ins} run it through Python instead"
                 )
             else:
                 out.ok = False
@@ -309,6 +337,8 @@ def _ensure(
             names_state[name] = {
                 "refused": True,
                 "shim": problem is None,
+                "cmd": with_cmd,
+                "standin_refused": standin_refused is not None,
                 "code": verdict.code,
                 "message": verdict.message,
             }
@@ -325,6 +355,13 @@ def _ensure(
                     pass
             names_state[name] = {"refused": False, "shim": False}
 
+    if out.refused and with_cmd:
+        # the same warning wherever the .cmd is mentioned: it is the price of a launcher that works in PowerShell
+        out.lines.append(
+            "The .cmd stand-ins hand their arguments to cmd.exe, which acts on & | < > and % ^ in them: never pass them text from "
+            f"an untrusted source; a script calls Python directly ({python} -I -m claude_hr.launcher ...). "
+            "`claude-hr-ctl config set launchers.cmd false` keeps only the shell scripts (Git Bash)."
+        )
     if out.refused and not dry:
         out.lines.append(
             f"To get the real launchers back, have {bin_dir} and the tool environment ({Path(python).parent.parent}) allowed, "

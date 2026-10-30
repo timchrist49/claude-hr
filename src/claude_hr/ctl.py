@@ -97,7 +97,7 @@ def cmd_launchers(a, cfg) -> int:
             out(f"       {line}")
         out("[ok ] launchers: stand-ins removed; the launcher programs have their names back")
         return 0
-    res = launchers.ensure(dry=a.action == "status")
+    res = launchers.ensure(dry=a.action == "status", cmd=cfg.flag("launchers.cmd", True))
     st = Step("launchers")
     st.ok, st.changed, st.lines = res.ok, res.changed, res.lines
     _print_step(st)
@@ -131,7 +131,7 @@ def cmd_setup(a, cfg) -> int:
     if "launchers" in steps and paths.IS_WINDOWS and cfg.flag("launchers.fallback", True):
         from . import launchers
 
-        res = launchers.ensure(dry=a.dry_run)
+        res = launchers.ensure(dry=a.dry_run, cmd=cfg.flag("launchers.cmd", True))
         st = Step("launchers")
         st.ok, st.changed, st.lines = res.ok, res.changed, res.lines
         _print_step(st)

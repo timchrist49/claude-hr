@@ -575,7 +575,7 @@ def test_a_refused_claude_hr_ctl_is_set_up_through_python_instead(tmp_path):
     out = r["out"]
     assert "VIA=True" in out and f"PY={py}" in out, out
     assert (
-        "WARNING: claude-hr-ctl was installed at C:\\fake\\claude-hr-ctl.exe but Windows will not start it: "
+        "WARNING: claude-hr-ctl was installed at C:\\fake\\claude-hr-ctl.exe but does not start: "
         "Program 'claude-hr-ctl.exe' failed to run: Access is denied"
     ) in out
     assert (
@@ -670,7 +670,7 @@ def test_a_real_claude_hr_ctl_that_windows_refuses_is_set_up_through_the_real_py
         subprocess.run(["icacls", str(exe), "/remove:d", user], capture_output=True)
     out = r["out"]
     assert "VIA=True" in out and f"PY={py}" in out, out
-    assert "Windows will not start it" in out and "Windows would not start it: " in out
+    assert "but does not start: Windows would not start it: " in out
     assert "(Windows error 5)" in out, (
         "the reason comes from Windows, not from the edition of PowerShell"
     )
@@ -861,7 +861,13 @@ def test_the_banner_of_an_install_through_python_says_what_differs_and_how_to_ge
     out = r["out"]
     assert "claude-hr is installed - with stand-ins for its launcher programs." in out
     assert "Headroom (token compression) was not installed" in out
-    assert "pass through cmd.exe" in out and "Git Bash does not" in out
+    assert "go through cmd.exe, which acts on & | < > and % ^ in them" in out
+    assert (
+        "never give" in out
+        and "C:\\py\\python.exe -I -m claude_hr.launcher" in out
+        and "Git Bash is not affected" in out
+    )
+    assert "claude-hr-ctl config set launchers.cmd false" in out
     assert "claude-hr-ctl launchers ensure" in out and "%APPDATA%\\uv\\tools" in out
     assert "Open a NEW terminal, then:   claude-hr" in out
 

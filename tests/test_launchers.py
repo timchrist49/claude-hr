@@ -233,6 +233,48 @@ def test_a_launcher_that_cannot_be_moved_is_reported_and_is_not_called_shimmed(
     )
 
 
+def test_a_stand_in_that_windows_refuses_too_is_reported_and_the_step_fails(tmp_path):
+    """A Deny rule that new files inherit from the folder, or an AppLocker script rule, refuses the .cmd as well."""
+    folder = make_bin(tmp_path, ("claude-hr-ctl",))
+    out = look(folder, {"claude-hr-ctl": REFUSED, "claude-hr-ctl.cmd": REFUSED})
+    assert not out.ok
+    text = " ".join(out.lines)
+    assert "refuses the stand-in claude-hr-ctl.cmd too (error 5: Access is denied)" in text
+    assert (
+        "PowerShell and cmd.exe cannot start claude-hr-ctl" in text
+        and "still starts it in Git Bash" in text
+    )
+    assert launchers.state()["names"]["claude-hr-ctl"]["standin_refused"] is True
+    assert (folder / "claude-hr-ctl").is_file(), "the shell script is there for Git Bash"
+    [check] = doctor.launcher_checks()
+    assert "also the .cmd stand-in" in check.detail and "Git Bash" in check.detail
+
+
+def test_a_stand_in_that_starts_is_not_mentioned_and_the_script_only_setting_probes_no_cmd(
+    tmp_path,
+):
+    folder = make_bin(tmp_path, ("claude-hr-ctl",))
+    log: list = []
+    ensure(
+        bin_dir=folder, python=PY, probe_fn=fake_probe({"claude-hr-ctl": REFUSED}, log), waits=()
+    )
+    assert [entry[1] for entry in log].count("claude-hr-ctl.cmd") == 1, (
+        "the stand-in is started once to see that it can be"
+    )
+    assert launchers.state()["names"]["claude-hr-ctl"]["standin_refused"] is False
+    (tmp_path / "two").mkdir()
+    folder2 = make_bin(tmp_path / "two", ("claude-hr-ctl",))
+    log2: list = []
+    ensure(
+        bin_dir=folder2,
+        python=PY,
+        probe_fn=fake_probe({"claude-hr-ctl": REFUSED}, log2),
+        waits=(),
+        cmd=False,
+    )
+    assert "claude-hr-ctl.cmd" not in [entry[1] for entry in log2]
+
+
 def test_a_python_path_that_cmd_cannot_read_gets_no_cmd_stand_in(tmp_path):
     folder = make_bin(tmp_path, ("claude-hr-ctl",))
     out = look(folder, {"claude-hr-ctl": REFUSED}, python=r"C:\Users\José\Scripts\python.exe")
@@ -360,6 +402,74 @@ def test_isolated_mode_keeps_the_current_directory_off_the_import_path():
     assert " -I -m " in render_cmd(PY, "m") and " -I -m " in render_sh(PY, "m")
 
 
+# ---- the .cmd stand-ins are a choice ---------------------------------------------------------------------------------------
+def test_the_cmd_stand_ins_can_be_left_out_and_only_the_shell_scripts_are_written(tmp_path):
+    folder = make_bin(tmp_path)
+    out = look(folder, {n: REFUSED for n in LAUNCHERS}, cmd=False)
+    assert out.ok and out.changed
+    for name in LAUNCHERS:
+        assert (folder / name).is_file() and (folder / f"{name}.exe.refused").is_file()
+        assert not (folder / f"{name}.cmd").exists() and not (folder / f"{name}.exe").exists()
+        assert launchers.is_shimmed(name)
+        assert launchers.state()["names"][name]["cmd"] is False
+    text = " ".join(out.lines)
+    assert "a shell script: Git Bash only" in text
+    assert "hand their arguments to cmd.exe" not in text, "no .cmd, nothing to warn about"
+
+
+def test_switching_the_cmd_stand_ins_off_removes_the_ones_written_before(tmp_path):
+    folder = make_bin(tmp_path, ("claude-hr",))
+    look(folder, {"claude-hr": REFUSED})
+    assert (folder / "claude-hr.cmd").is_file()
+    look(folder, {"claude-hr": REFUSED}, cmd=False)
+    assert not (folder / "claude-hr.cmd").exists() and (folder / "claude-hr").is_file()
+    look(folder, {"claude-hr": REFUSED}, cmd=True)
+    assert (folder / "claude-hr.cmd").is_file()
+
+
+def test_the_cmd_stand_ins_come_with_a_warning_about_cmd_exe_that_says_what_to_do(tmp_path):
+    folder = make_bin(tmp_path, ("claude-hr",))
+    out = look(folder, {"claude-hr": REFUSED})
+    text = " ".join(out.lines)
+    assert "hand their arguments to cmd.exe, which acts on & | < > and % ^ in them" in text
+    assert "never pass them text from an untrusted source" in text
+    assert f"{PY} -I -m claude_hr.launcher" in text, "a script is told how to call Python directly"
+    assert "launchers.cmd false" in text
+
+
+def test_the_cmd_stand_ins_are_on_by_default_and_the_default_is_documented_in_the_config():
+    cfg = config.load()
+    assert cfg.flag("launchers.fallback") is True and cfg.flag("launchers.cmd") is True
+    text = (paths.package_data_dir() / "defaults.toml").read_text(encoding="utf-8")
+    assert "acts on & | < > in them" in text and "cmd = true" in text
+
+
+def test_setup_passes_the_cmd_setting_on(sandbox, monkeypatch, capsys):
+    monkeypatch.setenv("CLAUDE_HR_LAUNCHERS__CMD", "false")
+    seen: list = []
+    monkeypatch.setattr(launchers, "ensure", lambda **kw: seen.append(kw) or launchers.Outcome())
+    monkeypatch.setattr(paths, "ensure_dirs", lambda: None)
+    monkeypatch.setattr(paths, "IS_WINDOWS", True)
+    assert ctl.main(["setup", "--only", "launchers", "--dry-run"]) == 0
+    assert seen == [{"dry": True, "cmd": False}]
+
+
+def test_doctor_tells_which_kind_of_stand_ins_there_are(tmp_path):
+    folder = make_bin(tmp_path)
+    look(folder, {"claude-hr-ctl": REFUSED})
+    [check] = doctor.launcher_checks()
+    assert (
+        "hand their arguments to cmd.exe" in check.detail
+        and "launchers.cmd = false" in check.detail
+    )
+    look(folder, {"claude-hr-ctl": REFUSED}, cmd=False)
+    [check] = doctor.launcher_checks()
+    assert (
+        "only as shell scripts for Git Bash" in check.detail
+        and "no claude-hr command" in check.detail
+    )
+
+
 # ---- where it plugs in -----------------------------------------------------------------------------------------------------
 def test_the_hook_module_runs_with_dash_m_which_is_how_its_stand_in_starts_it():
     src = str(Path(__file__).resolve().parents[1] / "src")
@@ -391,7 +501,7 @@ def test_setup_has_a_launchers_step_that_runs_first_on_windows_only(sandbox, mon
     assert seen == [] and "launchers" not in capsys.readouterr().out
     monkeypatch.setattr(paths, "IS_WINDOWS", True)
     assert ctl.main(["setup", "--only", "launchers", "--dry-run"]) == 0
-    assert seen == [{"dry": True}]
+    assert seen == [{"dry": True, "cmd": True}]
     assert "[ok ] launchers" in capsys.readouterr().out
 
 
@@ -501,12 +611,12 @@ def test_the_updater_looks_at_the_launchers_after_a_reinstall_but_not_in_a_previ
     monkeypatch.setattr(launchers, "ensure", lambda **kw: calls.append(kw) or launchers.Outcome())
     monkeypatch.setattr(paths, "IS_WINDOWS", True)
     updater.Updater(config.load())._look_at_launchers()
-    assert calls == [{}]
+    assert calls == [{"cmd": True}]
     updater.Updater(config.load(), dry=True)._look_at_launchers()
-    assert calls == [{}]
+    assert calls == [{"cmd": True}]
     monkeypatch.setenv("CLAUDE_HR_LAUNCHERS__FALLBACK", "false")
     updater.Updater(config.load())._look_at_launchers()
-    assert calls == [{}]
+    assert calls == [{"cmd": True}]
 
 
 def test_the_updater_survives_a_look_that_fails(sandbox, monkeypatch):
@@ -526,7 +636,7 @@ def test_doctor_is_quiet_when_nothing_is_refused_and_says_what_to_do_when_someth
     look(folder, {"claude-hr-ctl": REFUSED})
     [check] = doctor.launcher_checks()
     assert check.name == "launchers" and check.status == "warn"
-    assert "claude-hr-ctl" in check.detail and "stand-ins" in check.detail
+    assert "claude-hr-ctl" in check.detail and "shell scripts" in check.detail
     assert str(folder) in check.fix and "launchers ensure" in check.fix
     # an update writes a new claude-hr-ctl.exe, which wins the lookup over the stand-in: doctor says so
     (folder / "claude-hr-ctl.exe").write_bytes(b"MZ new")
@@ -551,7 +661,11 @@ def test_the_launchers_command_looks_by_default_and_fixes_only_when_told(
     assert ctl.main(["launchers"]) == 0
     assert ctl.main(["launchers", "status"]) == 0
     assert ctl.main(["launchers", "ensure"]) == 0
-    assert seen == [{"dry": True}, {"dry": True}, {"dry": False}]
+    assert seen == [
+        {"dry": True, "cmd": True},
+        {"dry": True, "cmd": True},
+        {"dry": False, "cmd": True},
+    ]
     monkeypatch.setattr(
         launchers, "remove", lambda **kw: ["claude-hr-ctl: claude-hr-ctl.exe is back"]
     )
@@ -575,6 +689,8 @@ def test_state_file_is_valid_json_the_doctor_and_setup_can_read(tmp_path):
     assert data["names"]["claude-hr-ctl"] == {
         "refused": True,
         "shim": True,
+        "cmd": True,
+        "standin_refused": False,
         "code": 5,
         "message": "Access is denied",
     }

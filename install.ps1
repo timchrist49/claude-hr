@@ -335,7 +335,7 @@ function Get-ToolPython {
 function Resolve-HrCtl {
   $run = Test-ToolRuns claude-hr-ctl
   if ($run.Ok) { return @{ ViaPython = $false; Python = '' } }
-  Write-Host "[claude-hr-install] WARNING: claude-hr-ctl was installed at $($run.Path) but Windows will not start it: $($run.Error)" -ForegroundColor Yellow
+  Write-Host "[claude-hr-install] WARNING: claude-hr-ctl was installed at $($run.Path) but does not start: $($run.Error)" -ForegroundColor Yellow
   Show-BlockEvidence $run.Path
   $py = Get-ToolPython
   $pyRun = if ($py) { Test-ToolRuns $py } else { @{ Ok = $false; Path = ''; Error = 'the Python of the claude-hr tool environment was not found' } }
@@ -383,7 +383,10 @@ claude-hr is installed - with stand-ins for its launcher programs.
   small stand-ins there (claude-hr.cmd and a shell script of the same name) that start the same commands through Python.
   It works like the real thing, with three differences:
     - Headroom (token compression) was not installed: headroom.exe comes from the same tool and would be refused too.
-    - In PowerShell and cmd the arguments of claude-hr pass through cmd.exe, which reads % and ^ in them (Git Bash does not).
+    - In PowerShell and cmd.exe the arguments of claude-hr go through cmd.exe, which acts on & | < > and % ^ in them: never give
+      claude-hr text from an untrusted source that way (a script calls Python directly:
+      $Python -I -m claude_hr.launcher ...). Git Bash is not affected. To keep only the Git Bash scripts:
+      claude-hr-ctl config set launchers.cmd false
     - After an update, if Windows still refuses the new launchers, setup puts the stand-ins back by itself.
   To get the real launchers: have $localBin and %APPDATA%\uv\tools allowed by whoever manages this PC's security
   software, then run   claude-hr-ctl launchers ensure

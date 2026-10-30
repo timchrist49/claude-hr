@@ -446,12 +446,35 @@ def launcher_checks() -> list[Check]:
                 "claude-hr-ctl launchers ensure",
             )
         ]
+    entries = data.get("names") if isinstance(data.get("names"), dict) else {}
+    both = [
+        n for n in refused if isinstance(entries.get(n), dict) and entries[n].get("standin_refused")
+    ]
+    if both:
+        return [
+            Check(
+                "launchers",
+                WARN,
+                f"Windows refuses {', '.join(both)} and also the .cmd stand-in written for it: PowerShell and cmd.exe cannot "
+                "start it (the shell script of the same name works in Git Bash, and Python can be called directly)",
+                allow,
+            )
+        ]
+    cmd_off = all(
+        isinstance(entries.get(n), dict) and entries[n].get("cmd") is False for n in refused
+    )
+    how = (
+        "only as shell scripts for Git Bash (launchers.cmd = false): PowerShell and cmd.exe have no claude-hr command"
+        if cmd_off
+        else "as .cmd files and shell scripts through Python; the .cmd files hand their arguments to cmd.exe, which acts on "
+        "& | < > in them, so never pass them text from an untrusted source (a script calls Python directly), or set "
+        "launchers.cmd = false"
+    )
     return [
         Check(
             "launchers",
             WARN,
-            f"Windows refuses {names}; they run through stand-ins (.cmd / shell script) and Python instead. Headroom is not "
-            "installed while launcher programs are refused, and arguments of the .cmd stand-ins pass through cmd.exe",
+            f"Windows refuses {names}; they run {how}. Headroom is not installed while launcher programs are refused",
             allow,
         )
     ]

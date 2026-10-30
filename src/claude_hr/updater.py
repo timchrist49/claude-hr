@@ -1680,7 +1680,7 @@ class Updater:
         try:
             from . import launchers
 
-            launchers.ensure()
+            launchers.ensure(cmd=self.cfg.flag("launchers.cmd", True))
         except Exception:  # noqa: BLE001 - the update must not fail on it
             pass
 
