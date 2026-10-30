@@ -41,6 +41,31 @@ try { $tls = [int][Net.ServicePointManager]::SecurityProtocol; if ($tls -ne 0 -a
 
 function Test-HaveCommand([string]$Name) { [bool](Get-Command $Name -ErrorAction SilentlyContinue) }
 
+# The reason in an exception message, without the "At line:..." / "At C:\...ps1:3" trace that PowerShell glues on right after
+# the text of a program that failed to start ("...Access is deniedAt line:201 char:24"). Case-sensitive, and only where the
+# "At" is attached to the text before it (or starts a line), so a sentence that says "... at C:\data ..." is left alone.
+function Get-ErrorReason([string]$Message) { ($Message -creplace '(?s)(?<=\S|\n)At (line:\d+|[A-Za-z]:\\).*$', '').Trim() }
+
+# Run `<name> --version` the way a person would. "On the PATH" is not "works": Windows can refuse to start a program that is
+# there (antivirus, AppLocker or other application control, a scan that has not finished), and PowerShell raises that as an
+# exception - "Program 'claude.exe' failed to run: Access is denied" - not as an exit code. A program that cannot be started
+# is tried again a few times (a virus scanner may still hold a file written a moment ago); one that starts and fails is not.
+function Test-ToolRuns([string]$Name) {
+  $cmd = Get-Command $Name -ErrorAction SilentlyContinue | Select-Object -First 1
+  if (-not $cmd) { return @{ Ok = $false; Path = ''; Version = ''; Error = "'$Name' is not on the PATH" } }
+  $path = if ($cmd.Source) { $cmd.Source } else { "$($cmd.Definition)" }
+  $why = ''
+  for ($try = 1; $try -le 4; $try++) {
+    try {
+      $out = @(N { & $Name --version })
+      if ($LASTEXITCODE -eq 0) { return @{ Ok = $true; Path = $path; Version = "$($out | Select-Object -First 1)"; Error = '' } }
+      return @{ Ok = $false; Path = $path; Version = ''; Error = "it started but exited with code $LASTEXITCODE" }
+    } catch { $why = Get-ErrorReason $_.Exception.Message }
+    if ($try -lt 4) { Start-Sleep -Seconds 5 }
+  }
+  @{ Ok = $false; Path = $path; Version = ''; Error = $why }
+}
+
 # A new folder that only this user can write to, even when TEMP points at a shared one: what is checked here is what is run.
 function New-StagingFolder {
   $root = if ($env:LOCALAPPDATA -and (Test-Path -LiteralPath (Join-Path $env:LOCALAPPDATA 'Temp'))) { Join-Path $env:LOCALAPPDATA 'Temp' } else { [IO.Path]::GetTempPath() }
@@ -152,20 +177,42 @@ function Install-UvFromGitHub {
   N { uv tool update-shell } | Out-Null
 }
 
+# A step that ran a program and failed: say what git, uv or whatever printed (the last lines of it), not a guess about why.
+function Stop-WithOutput([string]$What, $Output, [string]$Hint = '') {
+  Write-Host "[claude-hr-install] ERROR: $What" -ForegroundColor Red
+  $tail = @($Output | ForEach-Object { "$_".Trim() } | Where-Object { $_ } | Select-Object -Last 6)
+  if ($tail.Count) { Write-Host "  it printed:" -ForegroundColor Red; foreach ($line in $tail) { Write-Host "    $line" -ForegroundColor Red } }
+  else { Write-Host '  it printed nothing' -ForegroundColor Red }
+  if ($Hint) { Write-Host $Hint -ForegroundColor Red }
+  throw "claude-hr-install failed: $What (details above)"
+}
+
+# What to tell a person whose PC will not start a program that is there. $Extra: anything that is specific to the program.
+function Get-BlockedAdvice([string]$Path, [string]$Extra = '') {
+  ("A program that is installed but will not start is being blocked on this PC: antivirus, AppLocker or other application control (ThreatLocker, Defender rules, a policy of your organisation). " +
+    "After a product like that is removed, restart Windows before trying again: it may keep blocking until then. " +
+    "In a normal PowerShell window run   & '$($Path -replace "'", "''")' --version   to see Windows' exact reason, and ask whoever manages this PC to allow that file. $Extra").Trim()
+}
+
 # Try each route until `$Command` runs. A route fails by throwing; every reason is kept for the final message.
 function Install-Tool([string]$Command, [hashtable[]]$Routes, [string]$Manual) {
-  $why = @()
+  $why = @(); $blocked = $null
   foreach ($route in $Routes) {
     $threw = $false
     try { & $route.Run } catch { $threw = $true; $why += "$($route.Name): $($_.Exception.Message)" }
     Update-SessionPath
-    if (Test-HaveCommand $Command) { return }
-    if (-not $threw) { $why += "$($route.Name): finished, but '$Command' is still not on the PATH" }
+    if (Test-HaveCommand $Command) {
+      $run = Test-ToolRuns $Command
+      if ($run.Ok) { return }
+      $blocked = $run  # found is not the same as working: keep where it is and what Windows said
+      $why += "$($route.Name): installed at $($run.Path), but it will not run: $($run.Error)"
+    } elseif (-not $threw) { $why += "$($route.Name): finished, but '$Command' is still not on the PATH" }
     Write-Host "[claude-hr-install] $($why[-1])" -ForegroundColor Yellow
   }
   Show-Reachability
   Write-Host "[claude-hr-install] ERROR: could not install $Command. What was tried:" -ForegroundColor Red
   foreach ($w in $why) { Write-Host "  - $w" -ForegroundColor Red }
+  if ($blocked) { Write-Host (Get-BlockedAdvice $blocked.Path) -ForegroundColor Red }
   Write-Host $Manual -ForegroundColor Red
   throw "claude-hr-install failed: could not install $Command (details above)"
 }
@@ -186,6 +233,23 @@ function Install-ClaudeCode {
     @{ Name = 'winget'; Run = { Install-WithWinget 'Anthropic.ClaudeCode' } }
   ) 'Install Claude Code another way (https://code.claude.com/docs/en/setup), open a NEW terminal and run this installer again.'
 }
+# One that was just installed has been checked already. One that was there before is the person's own business: a Claude Code
+# that will not run is a warning (claude-hr installs anyway), never a crash of this script.
+function Show-ClaudeCode {
+  $run = Test-ToolRuns claude
+  if ($run.Ok) { Log ("claude " + $run.Version) }
+  else { Write-Host "[claude-hr-install] WARNING: Claude Code ($($run.Path)) did not run: $($run.Error). claude-hr is installed anyway, but Claude Code itself needs attention." -ForegroundColor Yellow }
+}
+# claude-hr's own commands are launcher programs (.exe) that uv writes next to the tool environment, so they are new files that
+# security software has never seen; one that will not start must stop the install here, with the reason, not crash in setup.
+function Assert-HrCtlRuns {
+  $run = Test-ToolRuns claude-hr-ctl
+  if ($run.Ok) { return }
+  Write-Host "[claude-hr-install] ERROR: claude-hr-ctl was installed at $($run.Path) but will not start: $($run.Error)" -ForegroundColor Red
+  $folder = if ($run.Path) { Split-Path -Parent $run.Path } else { $localBin }
+  Write-Host (Get-BlockedAdvice $run.Path "claude-hr's commands are small launcher programs that uv creates in $folder, and their Python environment is under %APPDATA%\uv\tools: a rule has to allow both folders. Run this installer again afterwards (it skips what is done).") -ForegroundColor Red
+  throw 'claude-hr-install failed: claude-hr-ctl will not start (details above)'
+}
 # ---- downloads: END -------------------------------------------------------------------------------------------------------
 
 if (-not (Get-Command git -ErrorAction SilentlyContinue)) { Die 'git is required: winget install --id Git.Git -e' }
@@ -198,7 +262,7 @@ if (-not (Test-HaveCommand uv)) { Install-Uv }
 
 # ---- Claude Code -------------------------------------------------------------------------
 if (-not (Test-HaveCommand claude)) { Install-ClaudeCode }
-Log ("claude " + ((N { claude --version }) | Select-Object -First 1))
+Show-ClaudeCode
 
 # ---- claude-hr source -------------------------------------------------------------------------
 $hrHome = if ($env:CLAUDE_HR_HOME) { $env:CLAUDE_HR_HOME } else { Join-Path $env:USERPROFILE '.claude-hr' }
@@ -234,21 +298,24 @@ if ($Local) {
         $curUrl = (N { git -C $src remote get-url origin } | Select-Object -First 1)
         if ("$curUrl".Trim() -ne $Repo) { Log "switching origin to $Repo"; N { git -C $src remote set-url origin $Repo } | Out-Null }
       }
-      N { git -C $src fetch --quiet --tags --prune origin } | Out-Null
+      $gitOut = @(N { git -C $src fetch --quiet --tags --prune origin })
     } else {
       Log "cloning $Repo ($Ref)"
-      N { git clone --quiet $Repo $src } | Out-Null
+      $gitOut = @(N { git clone --quiet $Repo $src })
     }
-    if ($LASTEXITCODE -ne 0) { Die 'git could not fetch the claude-hr repository (check the URL and credentials)' }
+    if ($LASTEXITCODE -ne 0) {
+      Stop-WithOutput 'git could not fetch the claude-hr repository' $gitOut ('Check the URL, your network and credentials. If git says "dubious ownership", run this installer in a normal (not Administrator) PowerShell window ' +
+        'of the account that installed it the first time; git''s own message above names the exact "git config --global --add safe.directory" command if you must keep using this window.')
+    }
   } finally {
     Remove-Item Env:GIT_CONFIG_COUNT, Env:GIT_CONFIG_KEY_0, Env:GIT_CONFIG_VALUE_0 -ErrorAction SilentlyContinue
   }
   # Native-command stderr becomes a terminating error under $ErrorActionPreference='Stop' in Windows PowerShell 5.1,
   # so probe the ref with Continue and decide from the exit code.
   # Prefer the remote-tracking ref: a LOCAL branch `main` is only as new as the original clone. Tags and SHAs fall through.
-  N { git -C $src checkout --quiet --detach "origin/$Ref" } | Out-Null
-  if ($LASTEXITCODE -ne 0) { N { git -C $src checkout --quiet --detach $Ref } | Out-Null }
-  if ($LASTEXITCODE -ne 0) { Die "could not check out '$Ref'" }
+  $gitOut = @(N { git -C $src checkout --quiet --detach "origin/$Ref" })
+  if ($LASTEXITCODE -ne 0) { $gitOut = @(N { git -C $src checkout --quiet --detach $Ref }) }
+  if ($LASTEXITCODE -ne 0) { Stop-WithOutput "could not check out '$Ref'" $gitOut "Is '$Ref' a branch, tag or commit of $Repo?" }
 }
 
 # Replacing the tool environment under a running launcher fails on Windows and can leave a broken install.
@@ -259,11 +326,12 @@ if ($busy -and -not $env:CLAUDE_HR_FORCE_INSTALL) {
 
 # ---- commands ----------------------------------------------------------------------------
 Log 'installing claude-hr and claude-hr-ctl'
-N { uv tool install --python 3.13 --force --reinstall $src } | Out-Null
-if ($LASTEXITCODE -ne 0) { Die 'uv tool install failed' }
+$uvOut = @(N { uv tool install --python 3.13 --force --reinstall $src })
+if ($LASTEXITCODE -ne 0) { Stop-WithOutput 'uv tool install failed' $uvOut 'uv needs pypi.org, files.pythonhosted.org and github.com (it downloads Python 3.13 from there if the PC has none).' }
 $toolBin = (N { uv tool dir --bin } | Select-Object -First 1)
 if ($toolBin -and ($env:PATH -notlike "*$toolBin*")) { $env:PATH = "$toolBin;$env:PATH" }
 if (-not (Get-Command claude-hr-ctl -ErrorAction SilentlyContinue)) { Die 'claude-hr-ctl not on PATH after install (try: uv tool update-shell)' }
+Assert-HrCtlRuns
 
 $setupArgs = @('setup')
 if ($PluginProfile) { $setupArgs += @('--profile', $PluginProfile) }

@@ -1,6 +1,33 @@
 # Changelog
 
 ## Unreleased
+**Windows installer (`install.ps1`): found is not the same as working.** Second report from the same PC, after the fallbacks
+below worked: `claude.ai` is blocked there too, winget installed Claude Code (a portable `claude.exe`, downloaded from
+`downloads.claude.ai`, a different host), PowerShell found it on the PATH, and the last line of the installer, `claude --version`,
+then died with `iex : Program 'claude.exe' failed to run: Access is denied` (Windows refused to start the program: security
+software or application control on that PC). Three faults of the installer, none of them the cause of the block:
+- A route counted as a success when the tool was on the PATH. Now the tool is started once (`--version`) after every route; one that
+  will not start makes the route fail, and the next route is tried. A program that cannot be started is tried four times over
+  15 s (a virus scanner may still hold a file written a moment ago); one that starts and fails is reported at once.
+- When no route gives a working tool the message names the route, the path, Windows' own reason (without PowerShell's "At line"
+  trace) and the command that shows it, and says that someone who manages the PC has to allow the file (and that a restart may
+  be needed after a product such as ThreatLocker is removed).
+- **A failing git or uv now says why.** Fourth report, from an Administrator PowerShell on that PC: `git could not fetch the
+  claude-hr repository (check the URL and credentials)`. The installer had thrown git's output away and printed a guess, so
+  nobody could see the cause (a first guess is git's "dubious ownership" check, which an elevated window can trigger on a
+  folder another token created; not confirmed). The fetch, clone, checkout and `uv tool install` steps now show the last
+  six lines the program printed, then a hint (for git: use a normal, not Administrator, window; git's message names the
+  `git config --global --add safe.directory` command). Run the installer in a normal window: nothing in it needs Administrator.
+- **claude-hr's own commands get the same check** (third report, after ThreatLocker had been removed and `claude.exe` ran:
+  `iex : Program 'claude-hr-ctl.exe' failed to run: Access is denied` at the setup step). `claude-hr-ctl` is started once right
+  after `uv tool install`; if Windows refuses it the install stops there with the path, the reason and the two folders to
+  allow (`%USERPROFILE%\.local\bin`, `%APPDATA%\uv\tools`) instead of crashing in setup. What blocks it on that PC is not known.
+- The last line crashed the script on any program that would not start. It is now a warning for a Claude Code that was there
+  before (claude-hr installs anyway) and part of the install check for one that was just installed.
+- Tests start real programs: a copy of `curl.exe` whose execute right is denied reproduces the exact error, and one that is denied
+  at first and allowed on the second try stands for a scanner finishing. A Claude Code installed through winget is updated by
+  winget, not by `claude-hr update` (stated in the README).
+
 **Windows installer (`install.ps1`): a blocked download no longer ends the install.** The installer is fetched from `main`, so this
 takes effect without a claude-hr release. Reported from a Windows PC where `irm .../install.ps1 | iex` stopped at the first
 download with `Invoke-RestMethod : Unable to connect to the remote server` (PowerShell's message for a failed TCP connection to
