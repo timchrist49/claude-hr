@@ -47,6 +47,10 @@ def sandbox(tmp_path, monkeypatch, _empty_gitconfig):
         ):
             monkeypatch.delenv(k, raising=False)
     monkeypatch.setenv("HF_HOME", str(tmp_path / "hf"))
+    # where `uv tool install` puts its launchers (and the stand-ins for refused ones are written): the developer's own shell may
+    # name a real folder
+    for k in ("UV_TOOL_BIN_DIR", "XDG_BIN_HOME", "UV_TOOL_DIR"):
+        monkeypatch.delenv(k, raising=False)
     for k in list(os.environ):
         if k.startswith("CLAUDE_HR_") and k not in {"CLAUDE_HR_USER_HOME", "CLAUDE_HR_HOME"}:
             monkeypatch.delenv(k, raising=False)
@@ -95,6 +99,13 @@ _WATCHED_BELOW = [
     _REAL_HOME / ".claude-hr" / "state" / "verify-offer.json",
     _REAL_HOME / ".claude-hr" / "state" / "verify-trust.json",
     _REAL_HOME / ".claude-hr" / "logs" / "crash.log",
+]
+# The stand-ins for launcher programs that Windows refuses (and the programs moved aside for them): only a look at the real
+# launchers, by a test that was not sandboxed, creates them on a PC that does not need them.
+_WATCHED += [
+    _REAL_HOME / ".local" / "bin" / f"{name}{suffix}"
+    for name in ("claude-hr", "claude-hr-ctl", "claude-hr-hook")
+    for suffix in (".cmd", ".exe.refused")
 ]
 
 

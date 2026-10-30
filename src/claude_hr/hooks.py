@@ -366,6 +366,65 @@ def _no_verify_risk(command: str, tool: str) -> str | None:
     return _NO_VERIFY_WHY if _NO_VERIFY_RE.search(_MESSAGE_VALUE.sub(" -m X", command)) else None
 
 
+# Where Windows refuses claude-hr-ctl.exe (and its siblings), `claude-hr-ctl` in PowerShell is the .cmd stand-in that
+# `claude-hr-ctl launchers` wrote, and cmd.exe reads the arguments PowerShell hands it a second time: it acts on & | < > ^ % !
+# whatever PowerShell's quotes say. A permission rule or an approval prompt for the PowerShell tool was judged on PowerShell
+# syntax, so such a call is not let through.
+#
+# This does not try to read PowerShell: every reader of its quoting (backtick escapes, here-strings, $(...) inside strings,
+# comments, a call inside a string that cmd /c or iex runs) had a way to be read differently by PowerShell. The rule has no
+# parser to disagree with: once a launcher that runs as a stand-in is called, NOTHING after the call may contain a character
+# cmd.exe acts on, or one with which PowerShell builds text at run time ($x, (...), @x, { }, a backtick). That is strict (a
+# `| Select-String` or a `2>&1` after the call is refused too, and the message gives the Python command, which has no such
+# limit), and it is best effort like the other guards, not a boundary: a name built at run time ('claude-hr-' + 'ctl') is
+# not seen. Text BEFORE the call cannot be an argument of it and is not looked at.
+_STAND_IN_CALL = re.compile(
+    r"(?<![\w-])(claude-hr(?:-ctl|-hook)?)(?:\.cmd)?(?![\w-])(?![\\/]|\.\w)", re.IGNORECASE
+)  # (not claude-hr.log, nor the folder .claude-hr/ or claude-hr\)
+# (a line break too: inside a quoted argument cmd.exe ends the line there and drops the rest, a --dry-run among it; outside
+# quotes it would only end the statement, but telling those apart is reading PowerShell's quoting)
+_CMD_ACTS = re.compile(r"[&|<>^%!`$@(){}\r\n]")
+_START_PROCESS = re.compile(r"(?i)(?<![\w-])(?:start-process|saps|start)(?![\w-])|-arg")
+
+
+def stand_in_risk(command: str) -> str | None:
+    """PowerShell tool: a call of a launcher that runs as a .cmd stand-in, with anything after it that cmd.exe acts on or
+    that PowerShell builds at run time. Why not, or None."""
+    if not paths.IS_WINDOWS or "claude-hr" not in command.lower():
+        return None
+    from . import launchers
+
+    in_use: dict[str, bool] = {}
+    for match in _STAND_IN_CALL.finditer(command):
+        name = match.group(1).lower()
+        if (
+            name not in in_use
+        ):  # each name is looked up once: padding with mentions must not cost file reads
+            in_use[name] = name in launchers.LAUNCHERS and launchers.is_shimmed(name)
+        if not in_use[name]:
+            continue
+        # what follows the first such call includes what follows every later one: this one look settles the command.
+        # Start-Process takes its arguments BEFORE the program as well (-ArgumentList 'x&y' -FilePath claude-hr-ctl).
+        start = 0 if _START_PROCESS.search(command) else match.end()
+        if not _CMD_ACTS.search(
+            command[start:].rstrip()
+        ):  # (a line break at the very end ends nothing)
+            return None
+        python = launchers.console_python().replace(
+            "'", "''"
+        )  # the hook runs in the tool environment's Python
+        return (
+            f"on this PC Windows refuses {name}.exe, so `{name}` in PowerShell is a .cmd stand-in, and cmd.exe reads its "
+            "arguments a second time: it acts on & | < > ^ % ! whatever the quotes say, and drops everything after a line "
+            "break. After a call of it this guard allows none of & | < > ^ % ! ` $ @ ( ) { } nor a line break (not even a "
+            "pipe, 2>&1 or a next line: put the call in a command of its own; text PowerShell builds at run time cannot be "
+            f"checked). Call Python directly instead, which has no such limit: & '{python}' -I -m "
+            f"{launchers.LAUNCHERS[name][0]} ... (or use the Bash tool: Git Bash runs the shell-script stand-in, "
+            "without cmd.exe)"
+        )
+    return None
+
+
 def main(argv: list[str] | None = None) -> int:
     """`claude-hr-hook <bash-guard|stop|statusline>`: a tiny entry point so hooks do not import the whole control CLI (~250 ms)."""
     argv = sys.argv[1:] if argv is None else argv
@@ -429,6 +488,14 @@ def _judge(command: str, tool: str = "") -> int:
                 "session transcript. Use the configured credential helper (gh auth, op run) or ask the user to "
                 "run it themselves.\n"
             )
+            return 2
+    if tool == "PowerShell":
+        try:
+            risk = stand_in_risk(command)
+        except Exception:  # a broken launchers.json must not switch off the git check below
+            risk = None
+        if risk:
+            sys.stderr.write(f"Blocked by the claude-hr guard: {risk}\n")
             return 2
     mode = os.environ.get("CLAUDE_HR_GIT_GUARD", "ask").strip().lower()
     if mode != "off":
@@ -577,3 +644,7 @@ def statusline() -> int:
     except Exception:
         pass
     return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

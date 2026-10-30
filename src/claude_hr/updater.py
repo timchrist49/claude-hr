@@ -1662,6 +1662,8 @@ class Updater:
         self, report: Report, steps: list[str], doctor: bool, post_only: bool = False
     ) -> None:
         """The post steps (they need the code of the release that is installed NOW), the doctor verdict and the record."""
+        if steps:
+            self._look_at_launchers()
         for name in steps:
             self._step(report, name)
         if doctor and not self.dry:
@@ -1669,6 +1671,18 @@ class Updater:
         self._attach(report)
         if self.record:
             self._save_last(report, "complete", post_only=post_only)
+
+    def _look_at_launchers(self) -> None:
+        """Windows: a reinstall writes new launcher programs, and one that Windows refuses (launchers.py) has to get its
+        stand-in again before the settings step names the hook. Cheap when nothing is refused; never fails the update."""
+        if self.dry or not paths.IS_WINDOWS or not self.cfg.flag("launchers.fallback", True):
+            return
+        try:
+            from . import launchers
+
+            launchers.ensure(cmd=self.cfg.flag("launchers.cmd", True))
+        except Exception:  # noqa: BLE001 - the update must not fail on it
+            pass
 
     @contextlib.contextmanager
     def _exclusive(self, wait_s: float = 0.0):

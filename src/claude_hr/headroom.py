@@ -405,7 +405,12 @@ class Headroom:
                         return Health(False, "not-installed", detail="headroom is not installed")
                     if announce:
                         announce("starting the Headroom proxy (cold start takes up to ~1 min)")
-                    proc = self.start()
+                    try:
+                        proc = self.start()
+                    except OSError as exc:  # Windows refuses to start the file: an error 5 is not a crash of claude-hr
+                        return Health(
+                            False, "refused", detail=f"the proxy could not be started: {exc}"
+                        )
         except LockTimeout:
             pass
         deadline = time.monotonic() + wait_s

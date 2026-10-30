@@ -1,6 +1,63 @@
 # Changelog
 
-## Unreleased
+## 0.3.7
+**Windows: claude-hr works where Windows refuses its launcher programs.** Fifth report from the PC that blocks `astral.sh` and
+`claude.ai`, and now `claude-hr-ctl.exe` itself: Windows PowerShell stopped at the setup step with `Program 'claude-hr-ctl.exe'
+failed to run: Access is denied`, and an Administrator PowerShell 7 with `... failed to run: StandardOutputEncoding is only
+supported when standard output is redirected`. Those are one refusal: PowerShell 7 starts a program a second way when the first
+fails, and that second start is what throws, which hides Windows' reason. The cause on that PC is unknown (ThreatLocker had been
+removed; Defender attack-surface rules, AppLocker or an endpoint product are the usual suspects, and a refused new file next to
+an allowed `uv.exe` and `python.exe` fits any of them). What claude-hr did wrong was to depend on files Windows may refuse.
+- **`claude-hr-ctl launchers` (new) and a first `launchers` step in `setup`** (Windows). `uv tool install` writes `claude-hr.exe`,
+  `claude-hr-ctl.exe` and `claude-hr-hook.exe`: new files, different on every PC. Each is started once with an argument that
+  only prints something; one that Windows refuses (Windows error 5, 225, 1260, 1261 or 4551, believed only after three more
+  looks over twelve seconds, since a scanner may still hold a fresh file) is moved aside as `<name>.exe.refused`, and two
+  stand-ins are written next to it: `<name>.cmd` for PowerShell and cmd.exe and a shell script `<name>` for Git Bash (where the
+  hooks and skills run). Both start the same entry point with `python -I -m claude_hr.<module>` (`-I`: `-m` would put the current
+  directory first on the import path, and a launcher runs in whatever repository you are in). Every later look (setup, the post
+  phase of an update, `launchers ensure`) probes again, so a launcher that starts again gets its name back and the stand-ins
+  go, and a reinstall that writes a new refused launcher gets stand-ins again. Files that are not ours are never overwritten or
+  deleted. `launchers.fallback = false` switches it off.
+- **The cost is stated where it is incurred.** A `.cmd` hands its arguments to cmd.exe, which acts on `& | < >` and `% ^ !` in them
+  and drops everything after a line break: never pass `claude-hr` text from an untrusted source that way (a script calls Python
+  directly). `launchers.cmd = false` writes only the Git Bash scripts. The setup output, the installer's closing text, `doctor`
+  and the docs all say so, and that this runs claude-hr through Python where the PC refuses the launcher programs (a policy of
+  the organisation may be behind that: ask). Plain `claude` gets no such stand-in (`shim install` refuses): every IDE and script
+  calls it with prompts.
+- **Not covered, stated:** the end-of-turn gates of the `hr-gates` plugin start `claude-hr-hook` without a shell (exec form); whether
+  Claude Code can start a `.cmd` that way was not verified, so on a PC with stand-ins assume the gates do not run.
+- **Hardening (from the security reviews of this change):** the PowerShell tool is not let call a `.cmd` stand-in when anything
+  after the call contains `& | < > ^ % !`, a line break (cmd.exe drops the rest of the arguments there), or a character with
+  which PowerShell builds text at run time (`` ` $ @ ( ) { } ``;
+  `Start-Process` is read whole, it takes arguments before the program). A permission rule or an approval prompt had judged
+  the PowerShell text, and cmd.exe reads it again. The rule reads no PowerShell quoting on purpose: the first two versions did,
+  and automated reviews found ways round each (backtick escapes, here-strings, a call inside `cmd /c "..."`). Strict (a pipe
+  after the call is refused too); the message gives the Python command and the Bash tool, which have no such limit; best
+  effort like the other guards, not a boundary. Stand-ins are only written by the Python of a `uv tool` environment
+  (`uv-receipt.toml`): a development checkout or a venv under review never becomes claude-hr for every command and hook (a test
+  run from a shell that exports `UV_TOOL_BIN_DIR` or `XDG_BIN_HOME` could not reach the real launchers either: the sandbox of the
+  tests clears them, the guard that watches the real profile watches the stand-ins, and a relative value is ignored); a
+  launcher that was already waited for is refused once, not four times
+  (each refused start is an event for whoever watches the PC); the status line runs `"<python>" -I -m claude_hr.hooks statusline`
+  by absolute path instead of the bare name `claude-hr-hook` (cmd.exe looks in the current folder first); a Python path with `!`
+  gets no `.cmd`; `remove` takes the lock; the installer's evidence says to read it before pasting, and its copy-paste commands
+  escape every single-quote character PowerShell knows.
+- **Around it:** the status line runs the hook through Python when its launcher is replaced; Headroom is not downloaded where
+  launchers are refused (`headroom.exe` comes from the same tool; the download is large) and a refused `headroom.exe` is
+  reported instead of raising out of setup; `claude-hr-hook` runs with `python -m` (it had no `__main__` guard); `doctor`
+  reports the state; `uninstall --purge` removes the stand-ins.
+- **install.ps1:** the reason a program was refused now comes from Windows (a .NET start reports the Win32 error), so every
+  PowerShell says `Access is denied (Windows error 5)`. A refused `claude-hr-ctl` no longer stops the install: setup runs through
+  the tool's Python and the `launchers` step does the rest; if Python is refused too the install stops with the reason and both
+  folders to allow. The installer prints what the PC recorded about the refused file (a Deny rule on it or its folder, security
+  software that is present, a ThreatLocker that is still installed, and the Defender, code-integrity and AppLocker events of the
+  last day that name it), tries `claude-hr-ctl` and `claude-hr` after setup, and ends with one of three texts. The running check
+  also sees programs that run from the tool environment. The evidence is read even when Windows PowerShell inherits PowerShell 7's module path (it cannot load `Get-Acl` then; the CI runners hit it): the modules of the running PowerShell are loaded by their own path.
+- **Tests:** real programs again (an execute-deny rule on a copy of `curl.exe` is the same "Access is denied"), in Windows
+  PowerShell 5.1 and PowerShell 7; the stand-ins are run for real from PowerShell, cmd.exe and Git Bash, with arguments that
+  contain spaces, `&`, `%` and `^`, with stdin, and with their exit code. `tests/windows/verify-windows-launchers.ps1` runs the
+  real installer against a folder where every new file is refused (an inheritable deny rule) and lifts the block afterwards.
+
 **Windows installer (`install.ps1`): found is not the same as working.** Second report from the same PC, after the fallbacks
 below worked: `claude.ai` is blocked there too, winget installed Claude Code (a portable `claude.exe`, downloaded from
 `downloads.claude.ai`, a different host), PowerShell found it on the PATH, and the last line of the installer, `claude --version`,

@@ -46,6 +46,27 @@ function Test-HaveCommand([string]$Name) { [bool](Get-Command $Name -ErrorAction
 # "At" is attached to the text before it (or starts a line), so a sentence that says "... at C:\data ..." is left alone.
 function Get-ErrorReason([string]$Message) { ($Message -creplace '(?s)(?<=\S|\n)At (line:\d+|[A-Za-z]:\\).*$', '').Trim() }
 
+# Why Windows will not start the program at $Path, asked of Windows itself ($null when it does start). PowerShell does not
+# report a refusal the same way everywhere: Windows PowerShell 5.1 says "Access is denied", PowerShell 7 says
+# "StandardOutputEncoding is only supported when standard output is redirected" for the very same refusal (it starts the
+# program a second way when the first fails, and that second start is what throws).
+function Get-StartFailure([string]$Path) {
+  try {
+    $info = New-Object System.Diagnostics.ProcessStartInfo
+    $info.FileName = $Path; $info.Arguments = '--version'; $info.UseShellExecute = $false
+    $info.RedirectStandardOutput = $true; $info.RedirectStandardError = $true; $info.CreateNoWindow = $true
+    $proc = [System.Diagnostics.Process]::Start($info)
+    try { if (-not $proc.WaitForExit(10000)) { try { $proc.Kill() } catch { } } } finally { $proc.Dispose() }
+    return $null
+  } catch {
+    $e = $_.Exception
+    while ($e.InnerException) { $e = $e.InnerException }
+    $code = if ($e -is [System.ComponentModel.Win32Exception]) { $e.NativeErrorCode } else { 0 }
+    if ($code) { return ((New-Object System.ComponentModel.Win32Exception $code).Message.TrimEnd('.') + " (Windows error $code)") }
+    return "$($e.Message)".Trim()
+  }
+}
+
 # Run `<name> --version` the way a person would. "On the PATH" is not "works": Windows can refuse to start a program that is
 # there (antivirus, AppLocker or other application control, a scan that has not finished), and PowerShell raises that as an
 # exception - "Program 'claude.exe' failed to run: Access is denied" - not as an exit code. A program that cannot be started
@@ -60,7 +81,11 @@ function Test-ToolRuns([string]$Name) {
       $out = @(N { & $Name --version })
       if ($LASTEXITCODE -eq 0) { return @{ Ok = $true; Path = $path; Version = "$($out | Select-Object -First 1)"; Error = '' } }
       return @{ Ok = $false; Path = $path; Version = ''; Error = "it started but exited with code $LASTEXITCODE" }
-    } catch { $why = Get-ErrorReason $_.Exception.Message }
+    } catch {
+      $why = Get-ErrorReason $_.Exception.Message
+      $native = Get-StartFailure $path  # PowerShell 7 hides the real reason behind a message about output encodings
+      if ($native) { $why = "Windows would not start it: $native" }
+    }
     if ($try -lt 4) { Start-Sleep -Seconds 5 }
   }
   @{ Ok = $false; Path = $path; Version = ''; Error = $why }
@@ -187,11 +212,17 @@ function Stop-WithOutput([string]$What, $Output, [string]$Hint = '') {
   throw "claude-hr-install failed: $What (details above)"
 }
 
+# A value inside '...' in a command that a person is told to paste. PowerShell ends such a string at any of the single quotes
+# (U+2018 to U+201B as well as the ASCII one), so each of them is doubled.
+function ConvertTo-SingleQuoted([string]$Text) {
+  "'" + [regex]::Replace($Text, ("['" + [char]0x2018 + '-' + [char]0x201B + ']'), '$0$0') + "'"
+}
+
 # What to tell a person whose PC will not start a program that is there. $Extra: anything that is specific to the program.
 function Get-BlockedAdvice([string]$Path, [string]$Extra = '') {
   ("A program that is installed but will not start is being blocked on this PC: antivirus, AppLocker or other application control (ThreatLocker, Defender rules, a policy of your organisation). " +
     "After a product like that is removed, restart Windows before trying again: it may keep blocking until then. " +
-    "In a normal PowerShell window run   & '$($Path -replace "'", "''")' --version   to see Windows' exact reason, and ask whoever manages this PC to allow that file. $Extra").Trim()
+    "In a normal PowerShell window run   & $(ConvertTo-SingleQuoted $Path) --version   to see Windows' exact reason, and ask whoever manages this PC to allow that file. $Extra").Trim()
 }
 
 # Try each route until `$Command` runs. A route fails by throwing; every reason is kept for the final message.
@@ -212,7 +243,7 @@ function Install-Tool([string]$Command, [hashtable[]]$Routes, [string]$Manual) {
   Show-Reachability
   Write-Host "[claude-hr-install] ERROR: could not install $Command. What was tried:" -ForegroundColor Red
   foreach ($w in $why) { Write-Host "  - $w" -ForegroundColor Red }
-  if ($blocked) { Write-Host (Get-BlockedAdvice $blocked.Path) -ForegroundColor Red }
+  if ($blocked) { Show-BlockEvidence $blocked.Path; Write-Host (Get-BlockedAdvice $blocked.Path) -ForegroundColor Red }
   Write-Host $Manual -ForegroundColor Red
   throw "claude-hr-install failed: could not install $Command (details above)"
 }
@@ -240,15 +271,170 @@ function Show-ClaudeCode {
   if ($run.Ok) { Log ("claude " + $run.Version) }
   else { Write-Host "[claude-hr-install] WARNING: Claude Code ($($run.Path)) did not run: $($run.Error). claude-hr is installed anyway, but Claude Code itself needs attention." -ForegroundColor Yellow }
 }
-# claude-hr's own commands are launcher programs (.exe) that uv writes next to the tool environment, so they are new files that
-# security software has never seen; one that will not start must stop the install here, with the reason, not crash in setup.
-function Assert-HrCtlRuns {
+# What this PC itself recorded about a program it would not start (read-only; a log that cannot be read, or a cmdlet that is not
+# there, is skipped). Returns lines of text: a Deny rule on the file or its folder, security software that is present, and the
+# events of the last day in the logs of Defender, code integrity (WDAC, Smart App Control) and AppLocker that name the file.
+function Get-BlockEvidence([string]$Path) {
+  $found = New-Object System.Collections.ArrayList
+  $leaf = Split-Path -Leaf $Path
+  # Windows PowerShell started from PowerShell 7 (a CI runner, a terminal, an editor) inherits its module path, finds ITS copies of
+  # these modules first and cannot load them ("Get-Acl ... was found in the module Microsoft.PowerShell.Security, but the module
+  # could not be loaded"). The modules that come with the PowerShell that runs this are loaded by their own path.
+  foreach ($module in 'Microsoft.PowerShell.Security', 'Microsoft.PowerShell.Diagnostics') {
+    try { Import-Module (Join-Path $PSHOME "Modules\$module") -ErrorAction Stop } catch { }
+  }
+  foreach ($target in @($Path, (Split-Path -Parent $Path))) {
+    try {
+      foreach ($rule in @((Get-Acl -LiteralPath $target -ErrorAction Stop).Access)) {
+        if ("$($rule.AccessControlType)" -eq 'Deny') { [void]$found.Add("$target has a Deny rule for $($rule.IdentityReference) ($($rule.FileSystemRights))") }
+      }
+    } catch { }
+  }
+  try {
+    $products = 'ThreatLocker|SentinelOne|SentinelAgent|CrowdStrike|CSFalcon|Carbon Black|CbDefense|Cylance|Sophos|Symantec|McAfee|Trend Micro|Kaspersky|ESET|Bitdefender|Malwarebytes|Webroot|Cortex XDR|Elastic Endpoint|Application Identity|Advanced Threat Protection'
+    $names = @(Get-Service -ErrorAction Stop | Where-Object { "$($_.Name) $($_.DisplayName)" -match $products } | ForEach-Object { "$($_.DisplayName) ($($_.Status))" })
+    if ($names.Count) { [void]$found.Add('security software that decides what may run is present: ' + ($names -join ', ')) }
+  } catch { }
+  try {
+    foreach ($dir in @($env:ProgramFiles, ${env:ProgramFiles(x86)}, $env:ProgramData)) {
+      if ($dir -and (Test-Path -LiteralPath (Join-Path $dir 'ThreatLocker'))) {
+        [void]$found.Add("ThreatLocker is still on this PC ($dir\ThreatLocker exists): removing it is not finished until Windows has been restarted")
+        break
+      }
+    }
+  } catch { }
+  $since = (Get-Date).AddDays(-1)
+  $logs = @(
+    @{ Log = 'Microsoft-Windows-Windows Defender/Operational'; Ids = @(1121, 1122, 1116, 1117); Who = 'Microsoft Defender' },
+    @{ Log = 'Microsoft-Windows-CodeIntegrity/Operational'; Ids = @(3033, 3034, 3076, 3077); Who = 'Windows code integrity (WDAC or Smart App Control)' },
+    @{ Log = 'Microsoft-Windows-AppLocker/EXE and DLL'; Ids = @(8003, 8004); Who = 'AppLocker' }
+  )
+  foreach ($l in $logs) {
+    try {
+      $hit = Get-WinEvent -FilterHashtable @{ LogName = $l.Log; Id = $l.Ids; StartTime = $since } -MaxEvents 300 -ErrorAction Stop |
+        Where-Object { "$($_.Message)" -like ('*' + [WildcardPattern]::Escape($leaf) + '*') } | Select-Object -First 1
+      if ($hit) {
+        $text = ("$($hit.Message)" -split "`r?`n" | Where-Object { $_.Trim() } | Select-Object -First 4 | ForEach-Object { $_.Trim() }) -join ' | '
+        $rule = if ("$($hit.Message)" -match '01443614-cd74-433a-b99e-2ecdc07bfc25') { ' = "Block executable files from running unless they meet a prevalence, age, or trusted list criterion"' } else { '' }
+        [void]$found.Add("$($l.Who), event $($hit.Id) at $($hit.TimeCreated.ToString('yyyy-MM-dd HH:mm')): $text$rule")
+      }
+    } catch { }
+  }
+  $found
+}
+
+function Show-BlockEvidence([string]$Path) {
+  $lines = @(Get-BlockEvidence $Path)
+  $leaf = if ($Path) { Split-Path -Leaf $Path } else { 'the program' }
+  Write-Host "  What this PC records about $($leaf):" -ForegroundColor Red
+  if ($lines.Count) {
+    foreach ($l in $lines) { Write-Host "    - $l" -ForegroundColor Red }
+    Write-Host '    (This names accounts, folders and security products of this PC: read it before you paste it into an issue or a chat.)' -ForegroundColor Red
+  }
+  else { Write-Host '    - nothing: no rule on the file, and no Defender, code integrity or AppLocker event names it. The product that blocks it keeps its own log - look in its console.' -ForegroundColor Red }
+}
+
+# The Python of claude-hr's tool environment: what claude-hr.exe and claude-hr-ctl.exe start, and enough to run claude-hr when
+# Windows will not start those launchers. '' when it is not there.
+function Get-ToolPython {
+  $dir = (N { uv tool dir } | Select-Object -First 1)
+  if (-not $dir) { return '' }
+  $py = Join-Path "$dir" 'claude-hr\Scripts\python.exe'
+  if (Test-Path -LiteralPath $py) { $py } else { '' }
+}
+
+# claude-hr's commands are launcher programs (.exe) that uv writes when it installs the tool: new files that nobody has run,
+# which endpoint security and application control may refuse ("Access is denied") while the Python interpreter runs. So the
+# first thing run is claude-hr-ctl; if Windows refuses it, setup is run through the Python that it would have started, and
+# its "launchers" step puts stand-ins (.cmd files) where the refused launchers are. Returns @{ ViaPython; Python }.
+function Resolve-HrCtl {
   $run = Test-ToolRuns claude-hr-ctl
-  if ($run.Ok) { return }
-  Write-Host "[claude-hr-install] ERROR: claude-hr-ctl was installed at $($run.Path) but will not start: $($run.Error)" -ForegroundColor Red
-  $folder = if ($run.Path) { Split-Path -Parent $run.Path } else { $localBin }
-  Write-Host (Get-BlockedAdvice $run.Path "claude-hr's commands are small launcher programs that uv creates in $folder, and their Python environment is under %APPDATA%\uv\tools: a rule has to allow both folders. Run this installer again afterwards (it skips what is done).") -ForegroundColor Red
-  throw 'claude-hr-install failed: claude-hr-ctl will not start (details above)'
+  if ($run.Ok) { return @{ ViaPython = $false; Python = '' } }
+  Write-Host "[claude-hr-install] WARNING: claude-hr-ctl was installed at $($run.Path) but does not start: $($run.Error)" -ForegroundColor Yellow
+  Show-BlockEvidence $run.Path
+  $py = Get-ToolPython
+  $pyRun = if ($py) { Test-ToolRuns $py } else { @{ Ok = $false; Path = ''; Error = 'the Python of the claude-hr tool environment was not found' } }
+  if ($pyRun.Ok) {
+    Log "Python ($py) starts, so claude-hr is set up through it; setup puts stand-ins where the launcher programs are refused"
+    return @{ ViaPython = $true; Python = $py }
+  }
+  $where = if ($py) { $py } else { $run.Path }
+  Write-Host "[claude-hr-install] ERROR: Windows will not start claude-hr's Python either: $($pyRun.Error)" -ForegroundColor Red
+  Write-Host (Get-BlockedAdvice $where "claude-hr's launcher programs are in $(if ($run.Path) { Split-Path -Parent $run.Path } else { $localBin }) and its Python environment is under %APPDATA%\uv\tools: ask for rules that allow the programs in both (by file or publisher, not by folder: your own account can write to both folders). Run this installer again afterwards (it skips what is done).") -ForegroundColor Red
+  throw 'claude-hr-install failed: Windows will not start claude-hr or its Python (details above)'
+}
+
+# After setup: what a person types has to start. $true when both commands do.
+function Test-HrCommandsRun {
+  $ok = $true
+  foreach ($name in 'claude-hr-ctl', 'claude-hr') {
+    $run = Test-ToolRuns $name
+    if (-not $run.Ok) { $ok = $false; Write-Host "[claude-hr-install] WARNING: $name does not start: $($run.Error)" -ForegroundColor Yellow }
+  }
+  $ok
+}
+
+# Programs of claude-hr that are running: its launchers, and anything that runs from the tool environment (the Python of a
+# session started through a stand-in has no claude-hr name, and it keeps uv from replacing the environment).
+function Get-ClaudeHrProcesses {
+  $found = @(Get-Process -Name 'claude-hr', 'claude-hr-ctl' -ErrorAction SilentlyContinue)
+  $dir = (N { uv tool dir } | Select-Object -First 1)
+  if ($dir) {
+    $inEnv = (Join-Path "$dir" 'claude-hr') + '\'
+    $found += @(Get-Process -ErrorAction SilentlyContinue | Where-Object {
+      $p = $null; try { $p = $_.Path } catch { }
+      $p -and $_.Id -ne $PID -and $p.StartsWith($inEnv, [StringComparison]::OrdinalIgnoreCase)
+    })
+  }
+  @($found | Sort-Object Id -Unique)
+}
+
+function Show-Done([bool]$ViaPython, [bool]$CommandsRun, [string]$Python) {
+  if ($ViaPython -and $CommandsRun) {
+    Write-Host @"
+
+claude-hr is installed - with stand-ins for its launcher programs.
+  Windows refuses to start claude-hr.exe and its siblings on this PC ($localBin), so setup moved the refused ones aside and put
+  small stand-ins there (claude-hr.cmd and a shell script of the same name) that start the same commands through Python.
+  It works like the real thing, with three differences:
+    - Headroom (token compression) was not installed: headroom.exe comes from the same tool and would be refused too.
+    - In PowerShell and cmd.exe the arguments of claude-hr go through cmd.exe, which acts on & | < > and % ^ ! in them and drops
+      everything after a line break: never give claude-hr text from an untrusted source that way (a script calls Python directly:
+      $Python -I -m claude_hr.launcher ...). Git Bash is not affected. To keep only the Git Bash scripts:
+      claude-hr-ctl config set launchers.cmd false
+    - After an update, if Windows still refuses the new launchers, setup puts the stand-ins back by itself.
+  This runs claude-hr through Python, which this PC allows, instead of the launcher programs, which it refuses. If that refusal
+  is a policy of your organisation, ask whoever manages this PC before you rely on it (to turn it off:
+  claude-hr-ctl config set launchers.fallback false).
+  To get the real launchers: ask whoever manages this PC's security software to allow the claude-hr programs in $localBin
+  (by file: your own account can write to that folder), then run   claude-hr-ctl launchers ensure
+  Open a NEW terminal, then:   claude-hr
+  Health:                      claude-hr-ctl doctor
+  First run on a new machine: log in to Claude Code (/login); until then claude-hr starts it without Headroom on purpose.
+"@
+    return
+  }
+  if ($ViaPython) {
+    Write-Host @"
+
+claude-hr is installed, but its commands do not start from the command line yet (see the warnings above).
+  What does work, through Python:
+    & $(ConvertTo-SingleQuoted $Python) -I -m claude_hr.launcher          (claude-hr)
+    & $(ConvertTo-SingleQuoted $Python) -I -m claude_hr.ctl doctor       (claude-hr-ctl)
+  Fix the cause above, restart Windows if a security product was removed, then run this installer again.
+"@
+    return
+  }
+  Write-Host @"
+
+claude-hr is installed.
+  Open a NEW terminal, then:   claude-hr
+                               claude-hr agents --dangerously-skip-permissions
+  Health:                      claude-hr-ctl doctor
+  If 'claude-hr' is not found: run  uv tool update-shell  and restart the terminal.
+  First run on a new machine: log in to Claude Code (/login); until then claude-hr starts it without Headroom on purpose.
+"@
+  if (-not $CommandsRun) { Write-Host "[claude-hr-install] WARNING: claude-hr-ctl or claude-hr did not start when it was tried above: run  claude-hr-ctl doctor  in a new terminal." -ForegroundColor Yellow }
 }
 # ---- downloads: END -------------------------------------------------------------------------------------------------------
 
@@ -319,9 +505,9 @@ if ($Local) {
 }
 
 # Replacing the tool environment under a running launcher fails on Windows and can leave a broken install.
-$busy = Get-Process -Name 'claude-hr', 'claude-hr-ctl' -ErrorAction SilentlyContinue
-if ($busy -and -not $env:CLAUDE_HR_FORCE_INSTALL) {
-  Die ("claude-hr is running (PID " + (($busy | Select-Object -First 3).Id -join ', ') + "). Close those sessions and re-run, or set `$env:CLAUDE_HR_FORCE_INSTALL=1.")
+$busy = @(Get-ClaudeHrProcesses)
+if ($busy.Count -and -not $env:CLAUDE_HR_FORCE_INSTALL) {
+  Die ("claude-hr is running (" + (($busy | Select-Object -First 3 | ForEach-Object { "$($_.ProcessName) $($_.Id)" }) -join ', ') + "). Close those sessions and re-run, or set `$env:CLAUDE_HR_FORCE_INSTALL=1.")
 }
 
 # ---- commands ----------------------------------------------------------------------------
@@ -331,26 +517,21 @@ if ($LASTEXITCODE -ne 0) { Stop-WithOutput 'uv tool install failed' $uvOut 'uv n
 $toolBin = (N { uv tool dir --bin } | Select-Object -First 1)
 if ($toolBin -and ($env:PATH -notlike "*$toolBin*")) { $env:PATH = "$toolBin;$env:PATH" }
 if (-not (Get-Command claude-hr-ctl -ErrorAction SilentlyContinue)) { Die 'claude-hr-ctl not on PATH after install (try: uv tool update-shell)' }
-Assert-HrCtlRuns
+$hrCtl = Resolve-HrCtl
 
 $setupArgs = @('setup')
 if ($PluginProfile) { $setupArgs += @('--profile', $PluginProfile) }
 if ($NoHeadroomInstall) { $setupArgs += '--no-headroom-install' }
 if ($SkipSchedule) { $setupArgs += @('--skip', 'schedule') }
 if ($DryRun) { $setupArgs += '--dry-run' }
-Log ("running claude-hr-ctl " + ($setupArgs -join ' '))
+Log ("running claude-hr-ctl " + ($setupArgs -join ' ') + $(if ($hrCtl.ViaPython) { ' (through Python)' }))
 $env:CLAUDE_HR_REPO = $src
-N { claude-hr-ctl @setupArgs }
+if ($hrCtl.ViaPython) { N { & $hrCtl.Python -I -m claude_hr.ctl @setupArgs } } else { N { claude-hr-ctl @setupArgs } }
 if ($LASTEXITCODE -ne 0) { Write-Host '[claude-hr-install] setup reported problems - see above' -ForegroundColor Yellow }
 
-if ($Shim) { N { claude-hr-ctl shim install } }
+if ($Shim) {
+  if ($hrCtl.ViaPython) { Write-Host '[claude-hr-install] -Shim skipped: a claude.exe copy of the refused claude-hr.exe would be refused too (claude-hr-ctl shim install says more).' -ForegroundColor Yellow }
+  else { N { claude-hr-ctl shim install } }
+}
 
-Write-Host @"
-
-claude-hr is installed.
-  Open a NEW terminal, then:   claude-hr
-                               claude-hr agents --dangerously-skip-permissions
-  Health:                      claude-hr-ctl doctor
-  If 'claude-hr' is not found: run  uv tool update-shell  and restart the terminal.
-  First run on a new machine: log in to Claude Code (/login); until then claude-hr starts it without Headroom on purpose.
-"@
+Show-Done $hrCtl.ViaPython (Test-HrCommandsRun) $hrCtl.Python

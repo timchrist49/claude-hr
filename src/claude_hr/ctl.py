@@ -45,7 +45,7 @@ def _color() -> bool:
     return bool(sys.stdout) and sys.stdout.isatty() and os.environ.get("NO_COLOR") is None
 
 
-ALL_STEPS = ["headroom", "settings", "claude-md", "mcp", "plugins", "schedule"]
+ALL_STEPS = ["launchers", "headroom", "settings", "claude-md", "mcp", "plugins", "schedule"]
 
 
 def _utf8_stdio() -> None:
@@ -79,6 +79,31 @@ def _schedule_line(msg: str) -> tuple[str, bool]:
     return f"[{'ERR' if bad else 'ok '}] schedule: {msg}", bad
 
 
+def _launchers_refused() -> bool:
+    """Did the last look (the launchers step of setup) find a launcher program that Windows refuses to start?"""
+    from . import launchers
+
+    return bool(launchers.refused_names())
+
+
+def cmd_launchers(a, cfg) -> int:
+    from . import launchers
+
+    if not paths.IS_WINDOWS:
+        out("launchers: nothing to do (launcher programs are only refused on Windows)")
+        return 0
+    if a.action == "remove":
+        for line in launchers.remove() or ["no stand-ins found"]:
+            out(f"       {line}")
+        out("[ok ] launchers: stand-ins removed; the launcher programs have their names back")
+        return 0
+    res = launchers.ensure(dry=a.action == "status", cmd=cfg.flag("launchers.cmd", True))
+    st = Step("launchers")
+    st.ok, st.changed, st.lines = res.ok, res.changed, res.lines
+    _print_step(st)
+    return 0 if res.ok else 1
+
+
 def cmd_setup(a, cfg) -> int:
     paths.ensure_dirs()
     steps = [s for s in ALL_STEPS if (not a.only or s in a.only) and s not in (a.skip or [])]
@@ -103,6 +128,14 @@ def cmd_setup(a, cfg) -> int:
             f"[{'ok ' if ok else 'ERR'}] headroom footprint: {msg if not ok else 'lite saved to ' + str(paths.user_config_file())}"
         )
         failed += 0 if ok else 1
+    if "launchers" in steps and paths.IS_WINDOWS and cfg.flag("launchers.fallback", True):
+        from . import launchers
+
+        res = launchers.ensure(dry=a.dry_run, cmd=cfg.flag("launchers.cmd", True))
+        st = Step("launchers")
+        st.ok, st.changed, st.lines = res.ok, res.changed, res.lines
+        _print_step(st)
+        failed += 0 if st.ok else 1
     if "headroom" in steps and cfg.flag("headroom.enabled", True):
         st = Step("headroom")
         cur = hr.version()
@@ -113,6 +146,13 @@ def cmd_setup(a, cfg) -> int:
             st.add(f"would install {hr.install_spec()}")
         elif a.no_headroom_install:
             st.add("skipped install (--no-headroom-install)")
+        elif paths.IS_WINDOWS and _launchers_refused():
+            # headroom.exe is made by the same tool, in the same folder: a PC that refuses claude-hr.exe refuses it too, and
+            # the download is large
+            st.add(
+                "skipped install: Windows refuses launcher programs on this PC (see launchers), and would refuse headroom.exe "
+                "as well. Once the folders are allowed: claude-hr-ctl launchers ensure, then claude-hr-ctl setup --only headroom"
+            )
         else:
             st.changed = True
             st.add(
@@ -126,9 +166,15 @@ def cmd_setup(a, cfg) -> int:
                 st.add(f"installed {hr.version()}")
         if st.ok and not a.dry_run and hr.binary():
             h = hr.ensure(wait_s=0, announce=lambda m: st.add(m))
-            st.add(
-                "proxy healthy" if h.ok else "proxy starting in the background (cold start ~1 min)"
-            )
+            if h.status == "refused":
+                st.ok = False
+                st.add(h.detail)
+            else:
+                st.add(
+                    "proxy healthy"
+                    if h.ok
+                    else "proxy starting in the background (cold start ~1 min)"
+                )
         _print_step(st)
         failed += 0 if st.ok else 1
     # outcome of the steps that make up the managed baseline (see applied-version.json)
@@ -224,6 +270,10 @@ def cmd_uninstall(a, cfg) -> int:
         for f in ("claude", "claude.exe", "claude.cmd", "claude.ps1"):
             (paths.bin_dir() / f).unlink(missing_ok=True)
         if a.purge:
+            if paths.IS_WINDOWS:
+                from . import launchers
+
+                launchers.remove()  # the stand-ins belong to the tool, not to the managed config: only a purge takes them
             procutil.run(["uv", "tool", "uninstall", "headroom-ai"], timeout=300)
             if not reverted.ok:
                 # the ownership record in state/ is what lets a later uninstall remove exactly the keys claude-hr added
@@ -813,6 +863,15 @@ def cmd_shim(a, cfg) -> int:
     if paths.IS_WINDOWS:
         # A real .exe, NOT a .cmd: cmd.exe re-parses arguments, so `claude -p "a&b"`, `|`, `>`, `%VAR%`, `^` and
         # multi-line prompts would be mangled (or executed) on the way through a batch file.
+        from . import launchers
+
+        if launchers.is_shimmed("claude-hr"):
+            out(
+                "Windows refuses claude-hr.exe on this PC (see `claude-hr-ctl launchers`), so a copy of it named claude.exe would be "
+                "refused too. A .cmd stand-in for plain `claude` is not offered: it would hand the arguments of every `claude` call "
+                "(scripts, IDEs) to cmd.exe, which reads %, ^ and & in them."
+            )
+            return 1
         if not found:
             out("claude-hr.exe not found; run the installer first")
             return 1
@@ -1547,6 +1606,19 @@ def build_parser() -> argparse.ArgumentParser:
     s = sub.add_parser("shim", help="make plain `claude` run claude-hr")
     s.add_argument("action", choices=["install", "remove"])
     s.set_defaults(fn=cmd_shim)
+
+    s = sub.add_parser(
+        "launchers",
+        help="Windows: stand-ins for launcher programs (.exe) that Windows refuses to start",
+    )
+    s.add_argument(
+        "action",
+        nargs="?",
+        choices=["status", "ensure", "remove"],
+        default="status",
+        help="status = look and say (default), ensure = look and fix, remove = take the stand-ins away",
+    )
+    s.set_defaults(fn=cmd_launchers)
 
     s = sub.add_parser("workflows", help="saved multi-agent Workflow scripts (opt-in, token-heavy)")
     s.add_argument("action", choices=["list", "install"])
