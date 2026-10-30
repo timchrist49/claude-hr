@@ -505,6 +505,148 @@ def test_the_hint_survives_a_path_with_an_apostrophe(tmp_path):
     assert "& 'C:\\Users\\O''Brien\\bin\\claude.exe' --version" in r["out"], r["out"]
 
 
+def test_claude_hr_ctl_is_started_once_before_setup_runs_it():
+    """The third report: ThreatLocker removed, Claude Code ran, then `claude-hr-ctl.exe` (a launcher uv had just written) was
+    refused and `N { claude-hr-ctl @setupArgs }` crashed with a raw exception. The check sits between the install and setup."""
+    text = INSTALLER.read_text(encoding="utf-8")
+    install = text.index("N { uv tool install")
+    check = text.index("\nAssert-HrCtlRuns\n")
+    setup = text.index("N { claude-hr-ctl @setupArgs }")
+    assert install < check < setup
+
+
+@windows_only
+def test_claude_hr_ctl_that_starts_lets_the_install_go_on(tmp_path):
+    r = run_block(tmp_path, "Assert-HrCtlRuns; 'AFTER'")
+    assert r["result"] == "RESULT=OK" and "AFTER" in r["out"], r["out"]
+
+
+@windows_only
+def test_claude_hr_ctl_that_will_not_start_stops_the_install_with_the_reason_and_the_way_out(
+    tmp_path,
+):
+    r = run_block(tmp_path, "Assert-HrCtlRuns", setup="$global:Broken = @('claude-hr-ctl')\n")
+    out = r["out"]
+    assert (
+        r["result"]
+        == "RESULT=THROW: claude-hr-install failed: claude-hr-ctl will not start (details above)"
+    ), out
+    assert (
+        "claude-hr-ctl was installed at C:\\fake\\claude-hr-ctl.exe but will not start: "
+        "Program 'claude-hr-ctl.exe' failed to run: Access is denied"
+    ) in out
+    assert (
+        "& 'C:\\fake\\claude-hr-ctl.exe' --version" in out and "ask whoever manages this PC" in out
+    )
+    assert "ThreatLocker" in out and "restart Windows" in out
+    assert "a rule has to allow both folders" in out and "%APPDATA%\\uv\\tools" in out
+
+
+@windows_only
+def test_a_real_claude_hr_ctl_that_windows_refuses_ends_in_that_message_not_in_an_exception(
+    tmp_path,
+):
+    """Your situation with a real program: claude-hr-ctl.exe is found on the PATH and Windows answers 'Access is denied'."""
+    exe = _program(tmp_path / "tools", "claude-hr-ctl.exe")
+    user = _deny_execute(exe)
+    try:
+        r = run_block(
+            tmp_path,
+            "Assert-HrCtlRuns",
+            mocks=False,
+            pre=_on_path(exe.parent),
+            setup=COUNT_SLEEPS,
+        )
+    finally:
+        subprocess.run(["icacls", str(exe), "/remove:d", user], capture_output=True)
+    out = r["out"]
+    assert r["result"].startswith(
+        "RESULT=THROW: claude-hr-install failed: claude-hr-ctl will not start"
+    ), out
+    assert "claude-hr-ctl was installed at " in out and "failed to run: Access is denied" in out
+    assert "At line" not in out
+
+
+# ---- a failing git or uv says why ------------------------------------------------------------------------------------------
+def test_a_failing_step_shows_what_the_program_printed_instead_of_guessing():
+    """The fourth report: `git fetch` failed in an Administrator window and the installer answered '(check the URL and
+    credentials)' because it had thrown git's output away. git's own message is the only thing that names the cause."""
+    text = INSTALLER.read_text(encoding="utf-8")
+    assert "(check the URL and credentials)" not in text
+    for call in ("git -C $src fetch", "git clone --quiet", "uv tool install --python 3.13"):
+        line = next(ln for ln in text.splitlines() if call in ln and "N {" in ln)
+        assert "Out-Null" not in line, f"{call}: its output is thrown away again"
+    assert "Stop-WithOutput 'git could not fetch the claude-hr repository' $gitOut" in text
+    assert "Stop-WithOutput 'uv tool install failed' $uvOut" in text
+
+
+@windows_only
+def test_the_last_lines_a_program_printed_are_shown_and_the_hint_follows(tmp_path):
+    lines = "; ".join(f"'line {i}'" for i in range(1, 11))
+    r = run_block(
+        tmp_path,
+        f"Stop-WithOutput 'the step failed' @({lines}) 'Try this instead.'",
+        mocks=False,
+    )
+    out = r["out"]
+    assert (
+        r["result"] == "RESULT=THROW: claude-hr-install failed: the step failed (details above)"
+    ), out
+    assert "ERROR: the step failed" in out and "it printed:" in out
+    assert "line 4" not in out and all(f"line {i}" in out for i in range(5, 11)), (
+        "the last six lines, no more"
+    )
+    assert out.index("line 10") < out.index("Try this instead.")
+
+
+@windows_only
+def test_a_step_that_printed_nothing_says_so(tmp_path):
+    r = run_block(tmp_path, "Stop-WithOutput 'the step failed' @()", mocks=False)
+    assert "it printed nothing" in r["out"], r["out"]
+
+
+@windows_only
+def test_gits_own_message_reaches_the_screen_when_a_fetch_fails(tmp_path):
+    """Real git, a folder that is not a repository: what the old installer hid behind its guess."""
+    if shutil.which("git") is None:
+        pytest.skip("needs git")
+    folder = tmp_path / "not-a-repo"
+    folder.mkdir()
+    scenario = (
+        f"$o = @(N {{ git -C {q(folder)} fetch --quiet --tags --prune origin }}); "
+        "Stop-WithOutput 'git could not fetch the claude-hr repository' $o 'hint'"
+    )
+    r = run_block(
+        tmp_path,
+        scenario,
+        mocks=False,
+        pre="$env:GIT_CEILING_DIRECTORIES = " + q(tmp_path.parent) + "\n",
+    )
+    assert "fatal: not a git repository" in r["out"], r["out"]
+
+
+@windows_only
+def test_the_dubious_ownership_message_of_git_is_shown_with_the_way_out(tmp_path):
+    """What running the installer in an Administrator window can give: git refuses a folder another token created."""
+    fake_git = (
+        "function git { "
+        "'fatal: detected dubious ownership in repository at ''C:/Users/x/.claude-hr/repo'''; "
+        "'To add an exception for this directory, call:'; ''; "
+        "'    git config --global --add safe.directory C:/Users/x/.claude-hr/repo'; "
+        "$global:LASTEXITCODE = 128 }\n"
+    )
+    scenario = (
+        "$o = @(N { git -C x fetch }); "
+        "Stop-WithOutput 'git could not fetch the claude-hr repository' $o "
+        "('If git says \"dubious ownership\", run this installer in a normal (not Administrator) PowerShell window.')"
+    )
+    r = run_block(tmp_path, scenario, mocks=False, setup=fake_git)
+    out = r["out"]
+    assert "fatal: detected dubious ownership in repository at" in out
+    assert "git config --global --add safe.directory C:/Users/x/.claude-hr/repo" in out
+    assert "normal (not Administrator) PowerShell window" in out
+
+
 def _ps_text(value: str) -> str:
     """A PowerShell expression that yields exactly `value` (newlines and quotes included)."""
     b64 = base64.b64encode(value.encode("utf-8")).decode("ascii")

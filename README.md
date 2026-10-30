@@ -73,7 +73,10 @@ hand (`winget install --id astral-sh.uv -e`), open a new terminal and run the on
 A program the installer has just installed is also started once (`--version`) before it counts. If Windows refuses to start it
 (antivirus or application control: `Program 'claude.exe' failed to run: Access is denied`) the installer stops with that
 reason, the program's path and the command that shows Windows' own message, so whoever manages the PC knows which file to
-allow; running the one-liner again afterwards is quick. A Claude Code installed through `winget` is updated by `winget`
+allow; running the one-liner again afterwards is quick. The same goes for claude-hr's own commands: uv writes them as small
+launcher programs, new files that security software has not seen, so a tool that only lets known programs run (ThreatLocker,
+AppLocker, application control) has to allow `%USERPROFILE%\.local\bin` and `%APPDATA%\uv\tools`; after removing such a product,
+restart Windows before you try again, it may keep blocking until then. A Claude Code installed through `winget` is updated by `winget`
 (`winget upgrade Anthropic.ClaudeCode`), not by `claude-hr update`.
 
 The repo is public, so the installers clone `https://github.com/timchrist49/claude-hr.git` anonymously and the scheduled
