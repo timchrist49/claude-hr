@@ -271,6 +271,12 @@ function Show-ClaudeCode {
 function Get-BlockEvidence([string]$Path) {
   $found = New-Object System.Collections.ArrayList
   $leaf = Split-Path -Leaf $Path
+  # Windows PowerShell started from PowerShell 7 (a CI runner, a terminal, an editor) inherits its module path, finds ITS copies of
+  # these modules first and cannot load them ("Get-Acl ... was found in the module Microsoft.PowerShell.Security, but the module
+  # could not be loaded"). The modules that come with the PowerShell that runs this are loaded by their own path.
+  foreach ($module in 'Microsoft.PowerShell.Security', 'Microsoft.PowerShell.Diagnostics') {
+    try { Import-Module (Join-Path $PSHOME "Modules\$module") -ErrorAction Stop } catch { }
+  }
   foreach ($target in @($Path, (Split-Path -Parent $Path))) {
     try {
       foreach ($rule in @((Get-Acl -LiteralPath $target -ErrorAction Stop).Access)) {

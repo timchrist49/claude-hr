@@ -107,9 +107,12 @@ function Test-ToolRuns([string]$Name) {
 """
 
 
-def run_block(tmp_path, scenario: str, *, mocks=True, setup="", pre="", shell=None) -> dict:
+def run_block(
+    tmp_path, scenario: str, *, mocks=True, setup="", pre="", shell=None, env=None
+) -> dict:
     """Run `scenario` (PowerShell) after the installer's download block. Returns the output, the result line and the calls.
-    `shell`: the PowerShell to use (default: Windows PowerShell 5.1, which is what a plain `powershell` is)."""
+    `shell`: the PowerShell to use (default: Windows PowerShell 5.1, which is what a plain `powershell` is).
+    `env`: environment variables to add to (or, with None as the value, remove from) the test's own."""
     shell = shell or _shell()
     if shell is None:
         pytest.skip("needs PowerShell")
@@ -133,18 +136,25 @@ def run_block(tmp_path, scenario: str, *, mocks=True, setup="", pre="", shell=No
     staging = tmp_path / "local" / "Temp"
     staging.mkdir(parents=True)
     (tmp_path / "tmp").mkdir()
-    env = {
+    child_env = {
         **os.environ,
         "LOCALAPPDATA": str(tmp_path / "local"),
         "TEMP": str(tmp_path / "tmp"),
         "TMP": str(tmp_path / "tmp"),
     }
+    for key, value in (env or {}).items():
+        for existing in [
+            k for k in child_env if k.upper() == key.upper()
+        ]:  # Windows names ignore case
+            del child_env[existing]
+        if value is not None:
+            child_env[key] = value
     out = subprocess.run(
         [shell, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", str(ps1)],
         capture_output=True,
         text=True,
         timeout=120,
-        env=env,
+        env=child_env,
     ).stdout
     leftovers = sorted(p.name for p in staging.iterdir())
     assert not leftovers, f"download staging folders left behind: {leftovers}\n{out}"
@@ -766,6 +776,35 @@ def test_evidence_names_a_deny_rule_on_the_file(tmp_path):
         and f"{exe} has a Deny rule for" in lines[0]
         and user.lower() in lines[0].lower()
     ), r["out"]
+
+
+@windows_only
+def test_evidence_is_read_when_windows_powershell_inherits_the_module_path_of_powershell_7(
+    tmp_path,
+):
+    """Windows PowerShell started from PowerShell 7 (a CI runner, an editor, a terminal) finds PowerShell 7's copy of the Security
+    module first and cannot load it: a bare Get-Acl failed, and the evidence came back empty without a word."""
+    pwsh = _pwsh()
+    seven = Path(pwsh).parent / "Modules" if pwsh else None
+    if seven is None or not seven.is_dir():
+        pytest.skip("needs PowerShell 7 next to Windows PowerShell")
+    exe = _program(tmp_path / "t", "hrmodule.exe")
+    user = _deny_execute(exe)
+    try:
+        r = run_block(
+            tmp_path,
+            "try { $null = Get-Acl -LiteralPath $PSHOME -ErrorAction Stop; 'RAW=works' } catch { 'RAW=fails' }\n"
+            f"@(Get-BlockEvidence {q(exe)}) | ForEach-Object {{ 'E=' + $_ }}",
+            mocks=False,
+            setup=EVIDENCE_STUBS,
+            env={"PSModulePath": os.pathsep.join([str(seven), os.environ.get("PSModulePath", "")])},
+        )
+    finally:
+        subprocess.run(["icacls", str(exe), "/remove:d", user], capture_output=True)
+    if "RAW=works" in r["out"]:
+        pytest.skip("this Windows PowerShell copes with the module path of PowerShell 7")
+    lines = [ln for ln in r["out"].splitlines() if ln.startswith("E=")]
+    assert len(lines) == 1 and f"{exe} has a Deny rule for" in lines[0], r["out"]
 
 
 @windows_only
