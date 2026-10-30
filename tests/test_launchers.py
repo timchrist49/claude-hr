@@ -182,6 +182,34 @@ def test_a_new_launcher_after_a_reinstall_is_looked_at_and_replaces_the_old_asid
     assert (folder / "claude-hr-ctl.cmd").is_file()
 
 
+def test_the_launcher_moved_aside_is_deleted_when_a_new_one_starts_in_its_place(tmp_path):
+    """`uv tool install --reinstall` after the cause was fixed: the new launcher starts, the old one is nobody's."""
+    folder = make_bin(tmp_path, ("claude-hr-ctl",))
+    look(folder, {"claude-hr-ctl": REFUSED})
+    (folder / "claude-hr-ctl.exe").write_bytes(b"MZ the NEW launcher")
+    out = look(folder, {"claude-hr-ctl": STARTS})
+    assert out.ok and out.changed
+    assert (folder / "claude-hr-ctl.exe").read_bytes() == b"MZ the NEW launcher"
+    for left in ("claude-hr-ctl.exe.refused", "claude-hr-ctl.cmd", "claude-hr-ctl"):
+        assert not (folder / left).exists(), left
+    assert "the old claude-hr-ctl.exe.refused is deleted" in " ".join(out.lines)
+
+
+def test_a_file_that_no_look_moved_aside_is_never_deleted(tmp_path):
+    folder = make_bin(tmp_path, ("claude-hr-ctl",))
+    (folder / "claude-hr-ctl.exe.refused").write_bytes(b"somebody's own file")
+    look(folder, {"claude-hr-ctl": STARTS})
+    assert (folder / "claude-hr-ctl.exe.refused").read_bytes() == b"somebody's own file"
+
+
+def test_a_dry_run_deletes_no_old_launcher(tmp_path):
+    folder = make_bin(tmp_path, ("claude-hr-ctl",))
+    look(folder, {"claude-hr-ctl": REFUSED})
+    (folder / "claude-hr-ctl.exe").write_bytes(b"MZ the NEW launcher")
+    look(folder, {"claude-hr-ctl": STARTS}, dry=True)
+    assert (folder / "claude-hr-ctl.exe.refused").is_file()
+
+
 def test_other_trouble_is_not_a_refusal_and_nothing_is_moved(tmp_path):
     folder = make_bin(tmp_path, ("claude-hr-ctl",))
     out = look(
@@ -280,6 +308,110 @@ def test_a_python_path_that_cmd_cannot_read_gets_no_cmd_stand_in(tmp_path):
     out = look(folder, {"claude-hr-ctl": REFUSED}, python=r"C:\Users\José\Scripts\python.exe")
     assert not out.ok and "cmd.exe cannot read" in " ".join(out.lines)
     assert (folder / "claude-hr-ctl.exe").is_file() and not (folder / "claude-hr-ctl.cmd").exists()
+
+
+def test_a_python_path_with_an_exclamation_mark_gets_no_cmd_stand_in(tmp_path):
+    """Where delayed expansion is on (a registry value, a calling batch file), cmd.exe would read !...! in the batch file."""
+    folder = make_bin(tmp_path, ("claude-hr-ctl",))
+    out = look(folder, {"claude-hr-ctl": REFUSED}, python=r"C:\Users\Hi!\Scripts\python.exe")
+    assert not out.ok and "exclamation mark" in " ".join(out.lines)
+    assert (folder / "claude-hr-ctl.exe").is_file() and not (folder / "claude-hr-ctl.cmd").exists()
+
+
+def test_a_launcher_that_was_waited_for_before_is_refused_once_not_four_times(tmp_path):
+    """Each refused start is an event for whoever watches the PC, and the name is a failing program while it is looked at."""
+    folder = make_bin(tmp_path, ("claude-hr-ctl",))
+    look(folder, {"claude-hr-ctl": REFUSED})
+    slept: list[float] = []
+    log: list = []
+    out = ensure(
+        bin_dir=folder,
+        python=PY,
+        probe_fn=fake_probe({"claude-hr-ctl": REFUSED}, log),
+        sleep=slept.append,
+    )
+    assert slept == [] and [entry[1] for entry in log].count("claude-hr-ctl.exe") == 1
+    assert out.ok and launchers.is_shimmed("claude-hr-ctl")
+    # a NEW launcher (a reinstall) has not been waited for: it still gets the full look
+    (folder / "claude-hr-ctl.exe").write_bytes(b"MZ the NEW launcher")
+    ensure(
+        bin_dir=folder,
+        python=PY,
+        probe_fn=fake_probe({"claude-hr-ctl": REFUSED}),
+        sleep=slept.append,
+    )
+    assert slept == [2.0, 4.0, 6.0]
+
+
+def test_a_python_that_is_not_a_uv_tool_environment_gets_no_stand_ins_written_for_it(
+    tmp_path, monkeypatch
+):
+    """A stand-in runs whatever its Python finds: a checkout under development, or a venv of a branch under review, must not
+    become claude-hr for every command and hook."""
+    folder = make_bin(tmp_path, ("claude-hr-ctl",))
+    monkeypatch.setattr(launchers, "running_from_tool_environment", lambda: False)
+    out = ensure(bin_dir=folder, probe_fn=fake_probe({"claude-hr-ctl": REFUSED}), waits=())
+    assert "is not the Python of a uv tool environment" in " ".join(out.lines)
+    assert [p.name for p in folder.iterdir()] == ["claude-hr-ctl.exe"]
+    assert not launchers.state_file().exists()
+    monkeypatch.setattr(launchers, "running_from_tool_environment", lambda: True)
+    monkeypatch.setattr(launchers, "console_python", lambda: PY)
+    ensure(bin_dir=folder, probe_fn=fake_probe({"claude-hr-ctl": REFUSED}), waits=())
+    assert (folder / "claude-hr-ctl.cmd").is_file()
+
+
+def test_a_tool_environment_is_told_by_its_uv_receipt(tmp_path, monkeypatch):
+    monkeypatch.setattr(sys, "prefix", str(tmp_path))
+    assert not launchers.running_from_tool_environment()
+    (tmp_path / "uv-receipt.toml").write_text("[tool]\n", encoding="utf-8")
+    assert launchers.running_from_tool_environment()
+
+
+def test_the_sandbox_does_not_see_where_uv_puts_launchers(sandbox):
+    """The shell of a developer may export UV_TOOL_BIN_DIR or XDG_BIN_HOME: a test must not follow it to the real launchers
+    (tests/conftest.py clears them; stand-ins are besides only written by the Python of a uv tool environment)."""
+    assert not {"UV_TOOL_BIN_DIR", "XDG_BIN_HOME", "UV_TOOL_DIR"} & set(os.environ)
+    assert launchers.default_bin_dir() == sandbox / ".local" / "bin"
+
+
+def test_only_the_first_lines_of_a_file_say_whether_it_is_ours(tmp_path):
+    ours, late = tmp_path / "a.cmd", tmp_path / "b.cmd"
+    ours.write_text(f"@echo off\nrem {MARKER}\n", encoding="ascii")
+    late.write_text("x" * 700 + MARKER, encoding="ascii")
+    assert launchers._is_ours(ours)
+    assert not launchers._is_ours(late) and not launchers._is_ours(tmp_path / "missing.cmd")
+
+
+def test_the_status_line_runs_python_by_the_path_the_last_look_recorded(
+    sandbox, tmp_path, monkeypatch
+):
+    python = tmp_path / "tool" / "Scripts" / "python.exe"
+    python.parent.mkdir(parents=True)
+    python.write_bytes(b"MZ")
+    monkeypatch.setattr(
+        launchers, "console_python", lambda: r"C:\dev\checkout\.venv\Scripts\python.exe"
+    )
+    assert launchers.stand_in_python() == r"C:\dev\checkout\.venv\Scripts\python.exe", (
+        "nothing recorded yet"
+    )
+    launchers.write_json(launchers.state_file(), {"python": str(python), "names": {}})
+    assert launchers.stand_in_python() == str(python)
+    python.unlink()  # a recorded Python that is gone is no Python to name
+    assert launchers.stand_in_python() == r"C:\dev\checkout\.venv\Scripts\python.exe"
+
+
+def test_remove_says_so_when_another_process_is_looking(tmp_path, monkeypatch):
+    from claude_hr.filelock import LockTimeout
+
+    folder = make_bin(tmp_path, ("claude-hr-ctl",))
+    look(folder, {"claude-hr-ctl": REFUSED})
+
+    def busy(*a, **k):
+        raise LockTimeout("held")
+
+    monkeypatch.setattr(launchers, "locked", busy)
+    assert "try again" in " ".join(remove(bin_dir=folder))
+    assert (folder / "claude-hr-ctl.cmd").is_file(), "nothing was touched"
 
 
 def test_a_dry_run_looks_and_says_but_changes_nothing(tmp_path):
@@ -431,7 +563,8 @@ def test_the_cmd_stand_ins_come_with_a_warning_about_cmd_exe_that_says_what_to_d
     folder = make_bin(tmp_path, ("claude-hr",))
     out = look(folder, {"claude-hr": REFUSED})
     text = " ".join(out.lines)
-    assert "hand their arguments to cmd.exe, which acts on & | < > and % ^ in them" in text
+    assert launchers.CMD_WARNING in text
+    assert "acts on & | < > and % ^ ! in them and drops everything after a line break" in text
     assert "never pass them text from an untrusted source" in text
     assert f"{PY} -I -m claude_hr.launcher" in text, "a script is told how to call Python directly"
     assert "launchers.cmd false" in text
@@ -441,7 +574,7 @@ def test_the_cmd_stand_ins_are_on_by_default_and_the_default_is_documented_in_th
     cfg = config.load()
     assert cfg.flag("launchers.fallback") is True and cfg.flag("launchers.cmd") is True
     text = (paths.package_data_dir() / "defaults.toml").read_text(encoding="utf-8")
-    assert "acts on & | < > in them" in text and "cmd = true" in text
+    assert "acts on & | < > and % ^ ! in them" in text and "cmd = true" in text
 
 
 def test_setup_passes_the_cmd_setting_on(sandbox, monkeypatch, capsys):
@@ -585,13 +718,92 @@ def test_the_status_line_names_the_hook_when_its_launcher_is_replaced(
     monkeypatch.setattr(paths, "IS_WINDOWS", True)
     monkeypatch.setattr(procutil, "which_all", lambda name, path=None: [exe])
     monkeypatch.setattr(launchers, "is_shimmed", lambda name: name == "claude-hr-hook")
+    monkeypatch.setattr(launchers, "stand_in_python", lambda: r"C:\tool\Scripts\python.exe")
+    # Python by absolute path, isolated: a bare name would be looked up in the folder of the session first by cmd.exe, and a
+    # repository could put a claude-hr-hook.bat there
     assert (
-        setup.statusline_command() == "claude-hr-hook statusline"
-    )  # by name: the stand-ins are found that way
+        setup.statusline_command()
+        == '"C:/tool/Scripts/python.exe" -I -m claude_hr.hooks statusline'
+    )
     monkeypatch.setattr(launchers, "is_shimmed", lambda name: False)
     assert setup.statusline_command().endswith(
         "claude-hr-hook.exe statusline"
     )  # as before: the path of the launcher
+
+
+@pytest.fixture
+def stand_ins_in_use(monkeypatch):
+    """A Windows PC where every launcher of claude-hr runs as a .cmd stand-in."""
+    monkeypatch.setattr(paths, "IS_WINDOWS", True)
+    monkeypatch.setattr(launchers, "is_shimmed", lambda name: True)
+    monkeypatch.setattr(launchers, "stand_in_python", lambda: r"C:\tool\Scripts\python.exe")
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "claude-hr-ctl wt new 'x&calc'",
+        'claude-hr-ctl wt new "x|y"',
+        "claude-hr-ctl wt new 'a<b'",
+        "claude-hr-ctl wt new fix-%GITHUB_TOKEN%",
+        "claude-hr-ctl wt new a^b",
+        "claude-hr-ctl wt new 'a!b'",
+        "claude-hr-ctl run 'first line\nsecond line'",
+        "claude-hr-ctl wt new \u2018x&calc\u2019",  # typographic quotes: still one argument to PowerShell
+        "claude-hr-ctl run 'it''s & that'",
+        "& 'C:\\Users\\x\\.local\\bin\\claude-hr-ctl.cmd' 'x&calc'",
+        "cd repo; claude-hr 'a>b'",
+        'CLAUDE-HR-HOOK "a<b"',
+    ],
+)
+def test_the_guard_stops_a_powershell_call_of_a_stand_in_with_arguments_cmd_exe_would_read(
+    command, stand_ins_in_use, capsys
+):
+    from claude_hr import hooks
+
+    assert hooks._judge(command, "PowerShell") == 2
+    err = capsys.readouterr().err
+    assert "Blocked by the claude-hr guard" in err and ".cmd stand-in" in err
+    assert r"C:\tool\Scripts\python.exe' -I -m claude_hr." in err, (
+        "the way round it is in the message"
+    )
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "claude-hr-ctl doctor",
+        "claude-hr-ctl wt new feature/x",
+        "claude-hr-ctl status | Select-String 'a&b'",  # after the pipe it is PowerShell's own
+        "claude-hr-ctl wt new feature/x; echo 'a&b'",
+        "claude-hr-ctl wt new 'it''s fine'",
+        "claude-hr-ctl doctor > out.txt",
+        "claude-hr-ctl wt new `%literal",
+        "git log --oneline && echo done",
+        "Get-Content claude-hr.log | Select-String 'a&b'",
+        "echo 'a&b'",
+    ],
+)
+def test_the_guard_leaves_other_powershell_calls_alone(command, stand_ins_in_use):
+    from claude_hr import hooks
+
+    assert hooks._judge(command, "PowerShell") == 0
+
+
+def test_the_guard_looks_only_where_a_stand_in_is_in_use(monkeypatch):
+    from claude_hr import hooks
+
+    monkeypatch.setattr(paths, "IS_WINDOWS", True)
+    monkeypatch.setattr(launchers, "is_shimmed", lambda name: name == "claude-hr-hook")
+    assert hooks._judge("claude-hr-ctl wt new 'x&calc'", "PowerShell") == 0, (
+        "its launcher starts: no cmd.exe on the way"
+    )
+    assert hooks._judge("claude-hr-hook 'x&calc'", "PowerShell") == 2
+    assert hooks._judge("claude-hr-hook 'x&calc'", "Bash") == 0, (
+        "Git Bash runs the shell script, not the .cmd"
+    )
+    monkeypatch.setattr(paths, "IS_WINDOWS", False)
+    assert hooks._judge("claude-hr-hook 'x&calc'", "PowerShell") == 0
 
 
 def test_plain_claude_gets_no_cmd_stand_in(sandbox, monkeypatch, capsys):
@@ -642,6 +854,23 @@ def test_doctor_is_quiet_when_nothing_is_refused_and_says_what_to_do_when_someth
     (folder / "claude-hr-ctl.exe").write_bytes(b"MZ new")
     [check] = doctor.launcher_checks()
     assert "missing or hidden" in check.detail and check.fix == "claude-hr-ctl launchers ensure"
+
+
+def test_a_headroom_left_out_on_purpose_is_a_warning_with_the_reason_not_a_failure(
+    sandbox, fake_claude, monkeypatch
+):
+    """Where launchers are refused setup does not install Headroom; doctor (and so the health verdict of an update) must not
+    call that a failure of the machine, and must say why."""
+    monkeypatch.setattr(Headroom, "binary", lambda self: None)
+    monkeypatch.setattr(paths, "IS_WINDOWS", True)
+    monkeypatch.setattr(launchers, "refused_names", lambda: [])
+    got = {c.name: c for c in doctor.run(config.load(), Path.cwd())}
+    assert got["headroom"].status == "fail" and got["headroom"].detail == "not installed"
+    monkeypatch.setattr(launchers, "refused_names", lambda: ["claude-hr-ctl"])
+    got = {c.name: c for c in doctor.run(config.load(), Path.cwd())}
+    assert got["headroom"].status == "warn"
+    assert "Windows refuses launcher programs" in got["headroom"].detail
+    assert "claude-hr-ctl launchers ensure" in got["headroom"].fix
 
 
 def test_the_launchers_command_does_nothing_off_windows(sandbox, monkeypatch, capsys):
@@ -714,6 +943,11 @@ def test_default_bin_dir_follows_uv(monkeypatch, tmp_path):
     assert launchers.default_bin_dir() == tmp_path / "xdg"
     monkeypatch.setenv("UV_TOOL_BIN_DIR", str(tmp_path / "uv"))
     assert launchers.default_bin_dir() == tmp_path / "uv"
+    # a relative value depends on where we happen to be: not a folder to trust
+    monkeypatch.setenv("UV_TOOL_BIN_DIR", "relative/bin")
+    assert launchers.default_bin_dir() == tmp_path / "xdg"
+    monkeypatch.delenv("XDG_BIN_HOME")
+    assert launchers.default_bin_dir() == paths.home() / ".local" / "bin"
 
 
 # ---- Windows: files that Windows really refuses ------------------------------------------------------------------------------

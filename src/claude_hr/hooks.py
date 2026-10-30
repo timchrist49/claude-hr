@@ -366,6 +366,72 @@ def _no_verify_risk(command: str, tool: str) -> str | None:
     return _NO_VERIFY_WHY if _NO_VERIFY_RE.search(_MESSAGE_VALUE.sub(" -m X", command)) else None
 
 
+# Where Windows refuses claude-hr-ctl.exe (and its siblings), `claude-hr-ctl` in PowerShell is the .cmd stand-in that
+# `claude-hr-ctl launchers` wrote, and cmd.exe reads the arguments PowerShell hands it a second time: it acts on & | < > ^ % !
+# even inside quotes and drops everything after a line break. A permission rule or an approval prompt for the PowerShell tool
+# was judged on PowerShell syntax, so such a call is not let through. (Text built at run time, "$x", cannot be seen here.)
+_STAND_IN_CALL = re.compile(
+    r"(?<![\w-])(claude-hr(?:-ctl|-hook)?)(?:\.cmd)?(?![\w-])", re.IGNORECASE
+)
+_CMD_READS = "&|<>^%!\r\n"
+# PowerShell closes a string at ANY quote character of its kind: the typographic ones count (a pasted ‘x&y’ is one argument)
+_SINGLE_QUOTES = "'‘’‚‛"
+_DOUBLE_QUOTES = '"“”„'
+
+
+def _cmd_would_read(args: str) -> bool:
+    """Do these arguments of a PowerShell call carry something cmd.exe would act on? Reads until the statement ends."""
+    quotes, i = "", 0
+    while i < len(args):
+        ch = args[i]
+        if quotes:
+            if ch in quotes:
+                if args[i + 1 : i + 2] in tuple(
+                    quotes
+                ):  # a doubled quote character is one character of the string
+                    i += 1
+                else:
+                    quotes = ""
+            elif ch == "`" and quotes == _DOUBLE_QUOTES:
+                i += 1
+            elif ch in _CMD_READS:
+                return True
+        elif ch in _SINGLE_QUOTES:
+            quotes = _SINGLE_QUOTES
+        elif ch in _DOUBLE_QUOTES:
+            quotes = _DOUBLE_QUOTES
+        elif ch == "`":
+            i += 1  # the escaped character belongs to the word
+        elif ch in ";|&)}\r\n":
+            return False  # the statement ends: what follows is PowerShell's own business
+        elif ch in "%^!":
+            return True
+        i += 1
+    return False
+
+
+def stand_in_risk(command: str) -> str | None:
+    """PowerShell tool: a call of a launcher that runs as a .cmd stand-in with arguments cmd.exe would act on. Why not, or None."""
+    if not paths.IS_WINDOWS or "claude-hr" not in command.lower():
+        return None
+    from . import launchers
+
+    for match in _STAND_IN_CALL.finditer(command):
+        name = match.group(1).lower()
+        rest = command[match.end() :]
+        if rest[:1] and rest[:1] in _SINGLE_QUOTES + _DOUBLE_QUOTES:
+            rest = rest[1:]  # the name ended a quoted path: & 'C:\...\claude-hr-ctl.cmd' ...
+        if name in launchers.LAUNCHERS and launchers.is_shimmed(name) and _cmd_would_read(rest):
+            python = launchers.stand_in_python()
+            return (
+                f"on this PC Windows refuses {name}.exe, so `{name}` in PowerShell is a .cmd stand-in, and cmd.exe reads its "
+                "arguments a second time: it acts on & | < > ^ % ! (inside quotes too) and drops everything after a line break. "
+                "Leave those out of the arguments, or call Python directly: "
+                f"& '{python}' -I -m {launchers.LAUNCHERS[name][0]} ..."
+            )
+    return None
+
+
 def main(argv: list[str] | None = None) -> int:
     """`claude-hr-hook <bash-guard|stop|statusline>`: a tiny entry point so hooks do not import the whole control CLI (~250 ms)."""
     argv = sys.argv[1:] if argv is None else argv
@@ -429,6 +495,11 @@ def _judge(command: str, tool: str = "") -> int:
                 "session transcript. Use the configured credential helper (gh auth, op run) or ask the user to "
                 "run it themselves.\n"
             )
+            return 2
+    if tool == "PowerShell":
+        risk = stand_in_risk(command)
+        if risk:
+            sys.stderr.write(f"Blocked by the claude-hr guard: {risk}\n")
             return 2
     mode = os.environ.get("CLAUDE_HR_GIT_GUARD", "ask").strip().lower()
     if mode != "off":

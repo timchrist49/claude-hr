@@ -89,12 +89,17 @@ each refused launcher aside (`claude-hr.exe.refused`) and writes stand-ins next 
 Python: `claude-hr.cmd` for PowerShell and cmd.exe, and a shell script of the same name for Git Bash (where the hooks and
 skills run). Every later `setup`, update and `claude-hr-ctl launchers ensure` looks again: a launcher that is allowed
 meanwhile gets its name back, and a reinstall that writes a new refused launcher gets its stand-ins again. What this does **not**
-give you: Headroom (`headroom.exe` comes from the same tool and is refused the same way, so it is not downloaded), and exact
-arguments in PowerShell and cmd.exe: a `.cmd` hands its arguments to cmd.exe, which acts on `& | < >` and `% ^` in them. So
-never pass text from an untrusted source to `claude-hr` that way; a script calls Python directly
-(`<tool env>\Scripts\python.exe -I -m claude_hr.launcher ...`), and `claude-hr-ctl config set launchers.cmd false` keeps only the
-Git Bash scripts. Plain `claude` never gets such a stand-in (`claude-hr-ctl shim install` refuses). `launchers.fallback = false`
-switches the whole thing off. `claude-hr-ctl launchers` shows the state, `claude-hr-ctl doctor` warns while it is in use.
+give you: Headroom (`headroom.exe` comes from the same tool and is refused the same way, so it is not downloaded), the
+end-of-turn gates of the `hr-gates` plugin (Claude Code starts `claude-hr-hook` there without a shell, and whether it can start a
+`.cmd` that way was not verified: assume they do not run), and exact arguments in PowerShell and cmd.exe: a `.cmd` hands its arguments to cmd.exe, which acts on `& | < >` and `% ^ !` in them and
+drops everything after a line break. So never pass text from an untrusted source to `claude-hr` that way (that includes a
+permission rule that allows `claude-hr-ctl` for an agent: it reads PowerShell, cmd.exe reads it again); a script calls Python
+directly (`<tool env>\Scripts\python.exe -I -m claude_hr.launcher ...`), and `claude-hr-ctl config set launchers.cmd false`
+keeps only the Git Bash scripts. Plain `claude` never gets such a stand-in (`claude-hr-ctl shim install` refuses). The stand-ins
+run claude-hr through Python, which that PC allows, in place of the launcher programs, which it refuses: if the refusal is a
+policy of your organisation, ask whoever manages the PC before you rely on this, and have the programs allowed by file (both
+folders are writable by your account) to get the real launchers back. `launchers.fallback = false` switches the whole thing off.
+`claude-hr-ctl launchers` shows the state, `claude-hr-ctl doctor` warns while it is in use.
 
 The repo is public, so the installers clone `https://github.com/timchrist49/claude-hr.git` anonymously and the scheduled
 self-update needs no credentials. **Private fork:** set `CLAUDE_HR_REPO_URL` and export `CLAUDE_HR_GIT_TOKEN` (a fine-grained

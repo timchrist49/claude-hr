@@ -212,11 +212,17 @@ function Stop-WithOutput([string]$What, $Output, [string]$Hint = '') {
   throw "claude-hr-install failed: $What (details above)"
 }
 
+# A value inside '...' in a command that a person is told to paste. PowerShell ends such a string at any of the single quotes
+# (U+2018 to U+201B as well as the ASCII one), so each of them is doubled.
+function ConvertTo-SingleQuoted([string]$Text) {
+  "'" + [regex]::Replace($Text, ("['" + [char]0x2018 + '-' + [char]0x201B + ']'), '$0$0') + "'"
+}
+
 # What to tell a person whose PC will not start a program that is there. $Extra: anything that is specific to the program.
 function Get-BlockedAdvice([string]$Path, [string]$Extra = '') {
   ("A program that is installed but will not start is being blocked on this PC: antivirus, AppLocker or other application control (ThreatLocker, Defender rules, a policy of your organisation). " +
     "After a product like that is removed, restart Windows before trying again: it may keep blocking until then. " +
-    "In a normal PowerShell window run   & '$($Path -replace "'", "''")' --version   to see Windows' exact reason, and ask whoever manages this PC to allow that file. $Extra").Trim()
+    "In a normal PowerShell window run   & $(ConvertTo-SingleQuoted $Path) --version   to see Windows' exact reason, and ask whoever manages this PC to allow that file. $Extra").Trim()
 }
 
 # Try each route until `$Command` runs. A route fails by throwing; every reason is kept for the final message.
@@ -321,7 +327,10 @@ function Show-BlockEvidence([string]$Path) {
   $lines = @(Get-BlockEvidence $Path)
   $leaf = if ($Path) { Split-Path -Leaf $Path } else { 'the program' }
   Write-Host "  What this PC records about $($leaf):" -ForegroundColor Red
-  if ($lines.Count) { foreach ($l in $lines) { Write-Host "    - $l" -ForegroundColor Red } }
+  if ($lines.Count) {
+    foreach ($l in $lines) { Write-Host "    - $l" -ForegroundColor Red }
+    Write-Host '    (This names accounts, folders and security products of this PC: read it before you paste it into an issue or a chat.)' -ForegroundColor Red
+  }
   else { Write-Host '    - nothing: no rule on the file, and no Defender, code integrity or AppLocker event names it. The product that blocks it keeps its own log - look in its console.' -ForegroundColor Red }
 }
 
@@ -351,7 +360,7 @@ function Resolve-HrCtl {
   }
   $where = if ($py) { $py } else { $run.Path }
   Write-Host "[claude-hr-install] ERROR: Windows will not start claude-hr's Python either: $($pyRun.Error)" -ForegroundColor Red
-  Write-Host (Get-BlockedAdvice $where "claude-hr's launcher programs are in $(if ($run.Path) { Split-Path -Parent $run.Path } else { $localBin }) and its Python environment is under %APPDATA%\uv\tools: a rule has to allow both folders. Run this installer again afterwards (it skips what is done).") -ForegroundColor Red
+  Write-Host (Get-BlockedAdvice $where "claude-hr's launcher programs are in $(if ($run.Path) { Split-Path -Parent $run.Path } else { $localBin }) and its Python environment is under %APPDATA%\uv\tools: ask for rules that allow the programs in both (by file or publisher, not by folder: your own account can write to both folders). Run this installer again afterwards (it skips what is done).") -ForegroundColor Red
   throw 'claude-hr-install failed: Windows will not start claude-hr or its Python (details above)'
 }
 
@@ -389,13 +398,16 @@ claude-hr is installed - with stand-ins for its launcher programs.
   small stand-ins there (claude-hr.cmd and a shell script of the same name) that start the same commands through Python.
   It works like the real thing, with three differences:
     - Headroom (token compression) was not installed: headroom.exe comes from the same tool and would be refused too.
-    - In PowerShell and cmd.exe the arguments of claude-hr go through cmd.exe, which acts on & | < > and % ^ in them: never give
-      claude-hr text from an untrusted source that way (a script calls Python directly:
+    - In PowerShell and cmd.exe the arguments of claude-hr go through cmd.exe, which acts on & | < > and % ^ ! in them and drops
+      everything after a line break: never give claude-hr text from an untrusted source that way (a script calls Python directly:
       $Python -I -m claude_hr.launcher ...). Git Bash is not affected. To keep only the Git Bash scripts:
       claude-hr-ctl config set launchers.cmd false
     - After an update, if Windows still refuses the new launchers, setup puts the stand-ins back by itself.
-  To get the real launchers: have $localBin and %APPDATA%\uv\tools allowed by whoever manages this PC's security
-  software, then run   claude-hr-ctl launchers ensure
+  This runs claude-hr through Python, which this PC allows, instead of the launcher programs, which it refuses. If that refusal
+  is a policy of your organisation, ask whoever manages this PC before you rely on it (to turn it off:
+  claude-hr-ctl config set launchers.fallback false).
+  To get the real launchers: ask whoever manages this PC's security software to allow the claude-hr programs in $localBin
+  (by file: your own account can write to that folder), then run   claude-hr-ctl launchers ensure
   Open a NEW terminal, then:   claude-hr
   Health:                      claude-hr-ctl doctor
   First run on a new machine: log in to Claude Code (/login); until then claude-hr starts it without Headroom on purpose.
@@ -407,8 +419,8 @@ claude-hr is installed - with stand-ins for its launcher programs.
 
 claude-hr is installed, but its commands do not start from the command line yet (see the warnings above).
   What does work, through Python:
-    & '$($Python -replace "'", "''")' -I -m claude_hr.launcher          (claude-hr)
-    & '$($Python -replace "'", "''")' -I -m claude_hr.ctl doctor       (claude-hr-ctl)
+    & $(ConvertTo-SingleQuoted $Python) -I -m claude_hr.launcher          (claude-hr)
+    & $(ConvertTo-SingleQuoted $Python) -I -m claude_hr.ctl doctor       (claude-hr-ctl)
   Fix the cause above, restart Windows if a security product was removed, then run this installer again.
 "@
     return

@@ -225,9 +225,11 @@ class ClaudeSetup:
             from . import launchers
 
             if launchers.is_shimmed("claude-hr-hook"):
-                # Windows refuses claude-hr-hook.exe: the stand-ins (claude-hr-hook.cmd, and the script Git Bash runs) are found
-                # by name, a path to the .exe is not
-                return "claude-hr-hook statusline"
+                # Windows refuses claude-hr-hook.exe, so the stand-ins run it through Python; so does this, by absolute path and
+                # isolated (-I): a bare name would be looked up in the folder of the session first by cmd.exe, and a repository
+                # could put a claude-hr-hook.bat there
+                python = launchers.stand_in_python().replace("\\", "/")
+                return f'"{python}" -I -m claude_hr.hooks statusline'
         name = "claude-hr-hook.exe" if paths.IS_WINDOWS else "claude-hr-hook"
         candidates = [Path(sys.executable).with_name(name), *procutil.which_all("claude-hr-hook")]
         exe = next((c for c in candidates if c.is_file()), None)

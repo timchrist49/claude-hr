@@ -608,7 +608,8 @@ def test_when_python_is_refused_too_the_install_stops_with_the_reason_and_the_wa
     assert "Windows will not start claude-hr's Python either" in out
     assert f"& '{py}' --version" in out and "ask whoever manages this PC" in out
     assert "ThreatLocker" in out and "restart Windows" in out
-    assert "a rule has to allow both folders" in out and "%APPDATA%\\uv\\tools" in out
+    assert "ask for rules that allow the programs in both" in out and "%APPDATA%\\uv\\tools" in out
+    assert "by file or publisher, not by folder" in out
 
 
 @windows_only
@@ -900,14 +901,19 @@ def test_the_banner_of_an_install_through_python_says_what_differs_and_how_to_ge
     out = r["out"]
     assert "claude-hr is installed - with stand-ins for its launcher programs." in out
     assert "Headroom (token compression) was not installed" in out
-    assert "go through cmd.exe, which acts on & | < > and % ^ in them" in out
+    assert "go through cmd.exe, which acts on & | < > and % ^ ! in them and drops" in out
+    assert "everything after a line break" in out
     assert (
         "never give" in out
         and "C:\\py\\python.exe -I -m claude_hr.launcher" in out
         and "Git Bash is not affected" in out
     )
     assert "claude-hr-ctl config set launchers.cmd false" in out
-    assert "claude-hr-ctl launchers ensure" in out and "%APPDATA%\\uv\\tools" in out
+    assert "claude-hr-ctl launchers ensure" in out
+    assert "by file: your own account can write to that folder" in out
+    assert (
+        "which this PC allows" in out and "claude-hr-ctl config set launchers.fallback false" in out
+    )
     assert "Open a NEW terminal, then:   claude-hr" in out
 
 
@@ -920,6 +926,25 @@ def test_the_banner_of_an_install_whose_commands_still_do_not_start_gives_the_py
     assert "do not start from the command line yet" in out
     assert "& 'C:\\Users\\O''Brien\\py\\python.exe' -I -m claude_hr.launcher" in out
     assert "& 'C:\\Users\\O''Brien\\py\\python.exe' -I -m claude_hr.ctl doctor" in out
+
+
+@windows_only
+def test_a_pasted_command_escapes_every_single_quote_character_powershell_knows(tmp_path):
+    """PowerShell ends a '...' string at U+2018 to U+201B as well as at the ASCII quote: a profile folder named with one
+    (a typographic apostrophe in a name) must not turn the rest of the pasted command into code."""
+    typed = "a" + "".join(chr(c) for c in (0x2018, 0x2019, 0x201A, 0x201B)) + "b'c"
+    r = run_block(
+        tmp_path,
+        "$q = ConvertTo-SingleQuoted ('a' + [char]0x2018 + [char]0x2019 + [char]0x201A + [char]0x201B + \"b'c\"); "
+        "'CODES=' + (($q.ToCharArray() | ForEach-Object { [int]$_ }) -join ',')",
+    )
+    codes = [int(c) for c in _line(r["out"], "CODES").split(",")]
+    quote_marks = {0x27, 0x2018, 0x2019, 0x201A, 0x201B}
+    inner = codes[1:-1]
+    assert codes[0] == 0x27 and codes[-1] == 0x27
+    assert len(inner) == len(typed) + 5, "each of the five quote characters is doubled"
+    for mark in quote_marks:
+        assert inner.count(mark) % 2 == 0 and inner.count(mark) > 0, hex(mark)
 
 
 @windows_only
@@ -1213,6 +1238,7 @@ def test_a_blocked_program_found_by_a_route_ends_in_the_clear_message_not_a_stac
     assert "winget: installed at " in out and exe.name in out
     assert "but it will not run: Windows would not start it: " in out and "(Windows error 5)" in out
     assert "What this PC records about hrblocked.exe:" in out and "has a Deny rule for" in out
+    assert "read it before you paste it into an issue or a chat" in " ".join(out.split())
     assert "--version" in out and "ask whoever manages this PC" in out
 
 

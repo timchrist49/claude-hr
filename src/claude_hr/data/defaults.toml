@@ -10,7 +10,7 @@ update_ref = "stable"        # what the self-updater tracks: "stable" = newest v
 [launchers]
 fallback = true              # Windows: when Windows refuses a launcher program (claude-hr.exe ...), move it aside and run the same command through
                              # Python with a .cmd / shell-script stand-in. false = never touch the launchers (setup then fails where they are refused)
-cmd = true                   # the .cmd stand-ins (PowerShell, cmd.exe) hand their arguments to cmd.exe, which acts on & | < > in them. false = write only the
+cmd = true                   # the .cmd stand-ins (PowerShell, cmd.exe) hand their arguments to cmd.exe, which acts on & | < > and % ^ ! in them. false = write only the
                              # shell scripts (Git Bash): safer for text from untrusted sources, but PowerShell then has no claude-hr command
 
 [claude]

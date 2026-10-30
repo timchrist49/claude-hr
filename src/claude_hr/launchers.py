@@ -55,6 +55,12 @@ REFUSED: dict[int, str] = {
 # How long to wait, between looks, before believing a refusal: a scanner may hold a file that was written a moment ago.
 WAITS: tuple[float, ...] = (2.0, 4.0, 6.0)
 
+# What a .cmd stand-in costs, in the words every place that mentions it uses (setup output, doctor, installer, docs).
+CMD_WARNING = (
+    "The .cmd stand-ins hand their arguments to cmd.exe, which acts on & | < > and % ^ ! in them and drops everything after "
+    "a line break"
+)
+
 _CREATE_NO_WINDOW = 0x08000000
 
 
@@ -113,19 +119,31 @@ def render_sh(python: str, module: str) -> str:
 
 def _is_ours(path: Path) -> bool:
     try:
-        return MARKER in path.read_text(encoding="utf-8", errors="replace")[:600]
+        with path.open(
+            "rb"
+        ) as handle:  # the marker is on the first lines; a launcher program is not read whole
+            return MARKER.encode() in handle.read(600)
     except OSError:
         return False
 
 
 # ---- where things are ------------------------------------------------------------------------------------------------------
 def default_bin_dir() -> Path:
-    """The folder `uv tool install` puts its launchers in (uv's own rules, without asking uv: this must stay inside the
-    profile claude-hr is told to use, which is what CLAUDE_HR_USER_HOME is for)."""
+    """The folder `uv tool install` puts its launchers in: uv's own rules (UV_TOOL_BIN_DIR, XDG_BIN_HOME, else .local/bin in the
+    home of the profile), without asking uv. A relative value is no folder to trust: the answer would depend on where we are.
+    (The tests' sandbox clears both variables; and stand-ins are only written by the Python of a uv tool environment.)"""
     for var in ("UV_TOOL_BIN_DIR", "XDG_BIN_HOME"):
-        if os.environ.get(var):
-            return Path(os.environ[var])
+        value = os.environ.get(var)
+        if value and Path(value).is_absolute():
+            return Path(value)
     return paths.home() / ".local" / "bin"
+
+
+def running_from_tool_environment() -> bool:
+    """Does this Python belong to a `uv tool` environment (uv writes uv-receipt.toml at its root)? A stand-in runs whatever code
+    its Python finds, so one that points into a development checkout, or a venv of a branch under review, would make every
+    claude-hr command and hook run that checkout."""
+    return (Path(sys.prefix) / "uv-receipt.toml").is_file()
 
 
 def console_python() -> str:
@@ -134,6 +152,14 @@ def console_python() -> str:
     if exe.name.lower() == "pythonw.exe" and exe.with_name("python.exe").is_file():
         exe = exe.with_name("python.exe")
     return str(exe)
+
+
+def stand_in_python() -> str:
+    """The Python the stand-ins run: the one the last look recorded (it ran from the tool environment), else this one."""
+    recorded = state().get("python")
+    if isinstance(recorded, str) and recorded and Path(recorded).is_file():
+        return recorded
+    return console_python()
 
 
 def state_file() -> Path:
@@ -186,6 +212,9 @@ def _write_shims(
     if with_cmd and not python.isascii():
         # cmd.exe reads a batch file in the console's code page, not in UTF-8: a path with other characters would be misread
         return f"the Python path {python} has characters that cmd.exe cannot read from a batch file"
+    if with_cmd and "!" in python:
+        # where delayed expansion is on (a registry value, a calling batch file) cmd.exe would eat the exclamation mark
+        return f"the Python path {python} has an exclamation mark, which cmd.exe may read as a variable in a batch file"
     if with_cmd:
         atomic_write_text(cmd, render_cmd(python, module), newline="\r\n", follow_symlinks=False)
     elif cmd.is_file() and _is_ours(cmd):
@@ -219,6 +248,13 @@ def ensure(
     out = Outcome()
     folder = Path(bin_dir) if bin_dir else default_bin_dir()
     try:
+        if python is None and not running_from_tool_environment():
+            out.lines.append(
+                f"{sys.executable} is not the Python of a uv tool environment (no uv-receipt.toml in {sys.prefix}): "
+                "stand-ins would run whatever code it finds, so nothing was changed. Run `claude-hr-ctl launchers ensure` "
+                "from the installed tool."
+            )
+            return out
         py = python or console_python()
         if dry:
             return _ensure(out, folder, py, probe_fn, waits, sleep, True, cmd)
@@ -263,9 +299,17 @@ def _ensure(
             found[name] = exe
             moved_back.add(name)
 
+    previous = state().get("names")
+    moved_before = {
+        n
+        for n, v in (previous if isinstance(previous, dict) else {}).items()
+        if isinstance(v, dict) and v.get("refused")
+    }  # the launchers that an earlier look moved aside
     verdicts = {name: probe_fn(path, LAUNCHERS[name][1]) for name, path in found.items()}
     for wait in waits:
-        again = [n for n, v in verdicts.items() if v.refused]
+        # a launcher that was put back from `.exe.refused` has been waited for before: one more refusal is believed at once
+        # (each refused start is an event for whoever watches this PC, and for those seconds the name is a program that fails)
+        again = [n for n, v in verdicts.items() if v.refused and n not in moved_back]
         if not again:
             break
         sleep(wait)
@@ -280,6 +324,17 @@ def _ensure(
             if not dry and _drop_shims(bin_dir, name):
                 out.changed = True
                 out.lines.append(f"{name}: the launcher starts again; its stand-in is removed")
+            if not dry and name in moved_before and aside.is_file():
+                # a reinstall wrote a new launcher next to the one that was moved aside, and the new one starts: the old one is
+                # nobody's now (only a file that an earlier look moved aside is ever deleted)
+                try:
+                    aside.unlink()
+                    out.changed = True
+                    out.lines.append(
+                        f"{name}: the old {aside.name} is deleted, a launcher that starts took its place"
+                    )
+                except OSError:
+                    pass
             names_state[name] = {"refused": False, "shim": False}
         elif verdict.refused:
             out.refused[name] = verdict
@@ -358,14 +413,16 @@ def _ensure(
     if out.refused and with_cmd:
         # the same warning wherever the .cmd is mentioned: it is the price of a launcher that works in PowerShell
         out.lines.append(
-            "The .cmd stand-ins hand their arguments to cmd.exe, which acts on & | < > and % ^ in them: never pass them text from "
-            f"an untrusted source; a script calls Python directly ({python} -I -m claude_hr.launcher ...). "
+            f"{CMD_WARNING}: never pass them text from an untrusted source; a script calls Python directly "
+            f"({python} -I -m claude_hr.launcher ...). "
             "`claude-hr-ctl config set launchers.cmd false` keeps only the shell scripts (Git Bash)."
         )
     if out.refused and not dry:
         out.lines.append(
-            f"To get the real launchers back, have {bin_dir} and the tool environment ({Path(python).parent.parent}) allowed, "
-            "then run `claude-hr-ctl launchers ensure`."
+            f"To get the real launchers back, have the files in {bin_dir} ({', '.join(f'{n}.exe' for n in out.refused)}) "
+            "allowed by whoever manages this PC (by file: both folders are writable by your account), then run "
+            "`claude-hr-ctl launchers ensure`. The stand-ins run claude-hr through Python, which this PC allows: if the block "
+            "on the launchers is a policy, ask before you rely on that."
         )
     if not out.lines:
         out.lines.append(
@@ -384,6 +441,14 @@ def _ensure(
 def remove(*, bin_dir: Path | None = None) -> list[str]:
     """Take the stand-ins away and give each launcher that was moved aside its name back. Files that are not ours stay."""
     folder = Path(bin_dir) if bin_dir else default_bin_dir()
+    try:
+        with locked(paths.state_dir() / "launchers.lock", timeout=10.0, stale_after=300.0):
+            return _remove(folder)
+    except LockTimeout:
+        return ["another claude-hr process is checking the launchers; try again in a moment"]
+
+
+def _remove(folder: Path) -> list[str]:
     lines: list[str] = []
     for name in LAUNCHERS:
         try:

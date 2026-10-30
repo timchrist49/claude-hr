@@ -420,6 +420,12 @@ def _read_user_json(path: Path, name: str, out: list[Check]) -> dict:
     return data if isinstance(data, dict) else {}
 
 
+def _launchers_refused() -> bool:
+    from . import launchers
+
+    return bool(launchers.refused_names())
+
+
 def launcher_checks() -> list[Check]:
     """Windows: launcher programs (claude-hr.exe ...) that Windows refuses, and whether their stand-ins are in place."""
     from . import launchers
@@ -431,8 +437,8 @@ def launcher_checks() -> list[Check]:
     bin_dir = Path(str(data.get("bin") or launchers.default_bin_dir()))
     names = ", ".join(refused)
     allow = (
-        rf"ask whoever manages this PC to allow {bin_dir} and the claude-hr tool environment (under %APPDATA%\uv\tools), "
-        "then run `claude-hr-ctl launchers ensure`"
+        f"ask whoever manages this PC to allow the claude-hr programs in {bin_dir} (by file: your own account can write to that "
+        "folder), then run `claude-hr-ctl launchers ensure`"
     )
     back = [n for n in refused if (bin_dir / f"{n}.exe").is_file()]
     loose = [n for n in refused if not launchers.is_shimmed(n)]
@@ -467,8 +473,8 @@ def launcher_checks() -> list[Check]:
         "only as shell scripts for Git Bash (launchers.cmd = false): PowerShell and cmd.exe have no claude-hr command"
         if cmd_off
         else "as .cmd files and shell scripts through Python; the .cmd files hand their arguments to cmd.exe, which acts on "
-        "& | < > in them, so never pass them text from an untrusted source (a script calls Python directly), or set "
-        "launchers.cmd = false"
+        "& | < > and % ^ ! in them and drops everything after a line break, so never pass them text from an untrusted source "
+        "(a script calls Python directly), or set launchers.cmd = false"
     )
     return [
         Check(
@@ -669,7 +675,19 @@ def run(cfg: Config, cwd: Path, deep: bool = False) -> list[Check]:
     reg = _read_user_json(paths.claude_global_json(), ".claude.json", out)
     if cfg.flag("headroom.enabled", True):
         b = hr.binary()
-        if not b:
+        if not b and paths.IS_WINDOWS and _launchers_refused():
+            # setup left it out on purpose (headroom.exe comes from the same tool as the launchers Windows refuses): a
+            # known state with its own line under "launchers", not a failure of this machine
+            out.append(
+                Check(
+                    "headroom",
+                    WARN,
+                    "not installed: Windows refuses launcher programs on this PC, and would refuse headroom.exe too",
+                    "have the programs named under launchers allowed, then: claude-hr-ctl launchers ensure; "
+                    "claude-hr-ctl setup --only headroom",
+                )
+            )
+        elif not b:
             out.append(
                 Check(
                     "headroom",
