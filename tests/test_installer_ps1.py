@@ -35,6 +35,17 @@ def _shell():
     return shutil.which("powershell") or shutil.which("pwsh")
 
 
+def _pwsh() -> str | None:
+    """PowerShell 7, when this machine has it (a CI runner does): the edition whose message for a refused program differs."""
+    found = shutil.which("pwsh")
+    if found:
+        return found
+    standard = (
+        Path(os.environ.get("ProgramFiles", r"C:\Program Files")) / "PowerShell" / "7" / "pwsh.exe"
+    )
+    return str(standard) if standard.is_file() else None
+
+
 def _block() -> str:
     text = INSTALLER.read_text(encoding="utf-8")
     assert START in text and END in text, (
@@ -59,6 +70,8 @@ $global:WingetExit = 0
 $global:WingetProvides = $null
 $global:Broken = @()
 $global:FakeDir = 'C:\\fake'
+$global:ToolDir = ''
+$global:Evidence = @()
 """
 
 # Defined AFTER the block, so they replace its commands; functions win over cmdlets and programs.
@@ -80,7 +93,11 @@ function winget {
   $global:LASTEXITCODE = $global:WingetExit
   if ($global:WingetExit -eq 0 -and $global:WingetProvides) { $global:Have += $global:WingetProvides }
 }
-function uv { $global:Calls.Add("uv $args") | Out-Null; $global:LASTEXITCODE = 0 }
+function uv {
+  $global:Calls.Add("uv $args") | Out-Null; $global:LASTEXITCODE = 0
+  if ("$args" -eq 'tool dir' -and $global:ToolDir) { $global:ToolDir }
+}
+function Get-BlockEvidence([string]$Path) { $global:Evidence }
 function Test-ToolRuns([string]$Name) {
   if ($global:Broken -contains $Name) {
     return @{ Ok = $false; Path = "$($global:FakeDir)\\$Name.exe"; Version = ''; Error = "Program '$Name.exe' failed to run: Access is denied" }
@@ -90,9 +107,10 @@ function Test-ToolRuns([string]$Name) {
 """
 
 
-def run_block(tmp_path, scenario: str, *, mocks=True, setup="", pre="") -> dict:
-    """Run `scenario` (PowerShell) after the installer's download block. Returns the output, the result line and the calls."""
-    shell = _shell()
+def run_block(tmp_path, scenario: str, *, mocks=True, setup="", pre="", shell=None) -> dict:
+    """Run `scenario` (PowerShell) after the installer's download block. Returns the output, the result line and the calls.
+    `shell`: the PowerShell to use (default: Windows PowerShell 5.1, which is what a plain `powershell` is)."""
+    shell = shell or _shell()
     if shell is None:
         pytest.skip("needs PowerShell")
     bin_dir = tmp_path / "bin"
@@ -510,61 +528,384 @@ def test_claude_hr_ctl_is_started_once_before_setup_runs_it():
     refused and `N { claude-hr-ctl @setupArgs }` crashed with a raw exception. The check sits between the install and setup."""
     text = INSTALLER.read_text(encoding="utf-8")
     install = text.index("N { uv tool install")
-    check = text.index("\nAssert-HrCtlRuns\n")
+    check = text.index("\n$hrCtl = Resolve-HrCtl\n")
     setup = text.index("N { claude-hr-ctl @setupArgs }")
     assert install < check < setup
+    assert "Assert-HrCtlRuns" not in text
+
+
+def test_setup_is_handed_to_python_when_the_launcher_is_refused_and_the_banner_ends_the_script():
+    text = INSTALLER.read_text(encoding="utf-8")
+    assert (
+        "if ($hrCtl.ViaPython) { N { & $hrCtl.Python -I -m claude_hr.ctl @setupArgs } } else { N { claude-hr-ctl @setupArgs } }"
+        in text
+    )
+    assert text.rstrip().endswith("Show-Done $hrCtl.ViaPython (Test-HrCommandsRun) $hrCtl.Python")
+    # `-I`: without it `python -m` puts the current directory first on the import path
+    assert "-I -m claude_hr.ctl" in text
 
 
 @windows_only
-def test_claude_hr_ctl_that_starts_lets_the_install_go_on(tmp_path):
-    r = run_block(tmp_path, "Assert-HrCtlRuns; 'AFTER'")
-    assert r["result"] == "RESULT=OK" and "AFTER" in r["out"], r["out"]
+def test_claude_hr_ctl_that_starts_is_used_as_before_and_uv_is_not_asked_anything(tmp_path):
+    r = run_block(tmp_path, "$h = Resolve-HrCtl; 'VIA=' + $h.ViaPython; 'PY=[' + $h.Python + ']'")
+    assert "VIA=False" in r["out"] and "PY=[]" in r["out"], r["out"]
+    assert not [c for c in r["calls"] if c.startswith("uv")], "the normal path stays as it was"
+
+
+def _tool_environment(tmp_path) -> Path:
+    """A tool environment with a python.exe in it, as `uv tool dir` would name it."""
+    py = tmp_path / "toolenv" / "claude-hr" / "Scripts" / "python.exe"
+    py.parent.mkdir(parents=True)
+    py.write_bytes(b"MZ")
+    return py
 
 
 @windows_only
-def test_claude_hr_ctl_that_will_not_start_stops_the_install_with_the_reason_and_the_way_out(
-    tmp_path,
-):
-    r = run_block(tmp_path, "Assert-HrCtlRuns", setup="$global:Broken = @('claude-hr-ctl')\n")
+def test_a_refused_claude_hr_ctl_is_set_up_through_python_instead(tmp_path):
+    """The fifth report: claude-hr-ctl.exe is refused in both windows (Windows PowerShell says 'Access is denied', PowerShell 7
+    says something about output encodings). Python starts, and it is the Python that claude-hr-ctl.exe would have started."""
+    py = _tool_environment(tmp_path)
+    setup = (
+        f"$global:Broken = @('claude-hr-ctl'); $global:ToolDir = {q(tmp_path / 'toolenv')}\n"
+        "$global:Evidence = @('Microsoft Defender, event 1121 at 2026-10-30 10:00: Rule ID 01443614')\n"
+    )
+    r = run_block(
+        tmp_path, "$h = Resolve-HrCtl; 'VIA=' + $h.ViaPython; 'PY=' + $h.Python", setup=setup
+    )
     out = r["out"]
+    assert "VIA=True" in out and f"PY={py}" in out, out
     assert (
-        r["result"]
-        == "RESULT=THROW: claude-hr-install failed: claude-hr-ctl will not start (details above)"
-    ), out
-    assert (
-        "claude-hr-ctl was installed at C:\\fake\\claude-hr-ctl.exe but will not start: "
+        "WARNING: claude-hr-ctl was installed at C:\\fake\\claude-hr-ctl.exe but Windows will not start it: "
         "Program 'claude-hr-ctl.exe' failed to run: Access is denied"
     ) in out
     assert (
-        "& 'C:\\fake\\claude-hr-ctl.exe' --version" in out and "ask whoever manages this PC" in out
+        "What this PC records about claude-hr-ctl.exe:" in out
+        and "Microsoft Defender, event 1121" in out
     )
+    assert "claude-hr is set up through it" in out
+
+
+@windows_only
+def test_when_python_is_refused_too_the_install_stops_with_the_reason_and_the_way_out(tmp_path):
+    py = _tool_environment(tmp_path)
+    setup = f"$global:Broken = @('claude-hr-ctl', {q(py)}); $global:ToolDir = {q(tmp_path / 'toolenv')}\n"
+    r = run_block(tmp_path, "Resolve-HrCtl", setup=setup)
+    out = r["out"]
+    assert (
+        r["result"]
+        == "RESULT=THROW: claude-hr-install failed: Windows will not start claude-hr or its Python (details above)"
+    ), out
+    assert "Windows will not start claude-hr's Python either" in out
+    assert f"& '{py}' --version" in out and "ask whoever manages this PC" in out
     assert "ThreatLocker" in out and "restart Windows" in out
     assert "a rule has to allow both folders" in out and "%APPDATA%\\uv\\tools" in out
 
 
 @windows_only
-def test_a_real_claude_hr_ctl_that_windows_refuses_ends_in_that_message_not_in_an_exception(
-    tmp_path,
+def test_a_python_that_cannot_be_found_is_a_failure_that_says_so(tmp_path):
+    r = run_block(tmp_path, "Resolve-HrCtl", setup="$global:Broken = @('claude-hr-ctl')\n")
+    assert r["result"].startswith(
+        "RESULT=THROW: claude-hr-install failed: Windows will not start claude-hr or its Python"
+    ), r["out"]
+    assert "the Python of the claude-hr tool environment was not found" in r["out"]
+
+
+@windows_only
+def test_the_tool_python_is_the_one_in_the_tool_environment(tmp_path):
+    py = _tool_environment(tmp_path)
+    r = run_block(
+        tmp_path,
+        "'PY=[' + (Get-ToolPython) + ']'",
+        setup=f"$global:ToolDir = {q(tmp_path / 'toolenv')}\n",
+    )
+    assert f"PY=[{py}]" in r["out"], r["out"]
+    (tmp_path / "second").mkdir()
+    r = run_block(
+        tmp_path / "second",
+        "'PY=[' + (Get-ToolPython) + ']'",
+        setup=f"$global:ToolDir = {q(tmp_path / 'nowhere')}\n",
+    )
+    assert "PY=[]" in r["out"], "a tool dir without python.exe in it is no Python"
+
+
+EDITIONS = [pytest.param("5.1", id="powershell-5.1"), pytest.param("7", id="powershell-7")]
+
+
+def _edition(name: str) -> str:
+    shell = _shell() if name == "5.1" else _pwsh()
+    if shell is None:
+        pytest.skip(f"needs PowerShell {name}")
+    return shell
+
+
+# Stand-ins for the two logs and the service list, so a test is not at the mercy of what the machine happens to have recorded.
+EVIDENCE_STUBS = "function Get-Service { @() }\nfunction Get-WinEvent { throw 'No events were found that match the specified selection criteria.' }\n"
+
+
+@windows_only
+@pytest.mark.parametrize("edition", EDITIONS)
+def test_a_real_claude_hr_ctl_that_windows_refuses_is_set_up_through_the_real_python(
+    tmp_path, edition
 ):
-    """Your situation with a real program: claude-hr-ctl.exe is found on the PATH and Windows answers 'Access is denied'."""
+    """The reported situation with real programs, in both PowerShell editions: claude-hr-ctl.exe is found on the PATH and
+    Windows will not start it; the Python of the tool environment starts."""
+    shell = _edition(edition)
     exe = _program(tmp_path / "tools", "claude-hr-ctl.exe")
+    (tmp_path / "toolenv" / "claude-hr" / "Scripts").mkdir(parents=True)
+    py = _program(
+        tmp_path / "toolenv" / "claude-hr" / "Scripts", "python.exe"
+    )  # a program that answers --version
     user = _deny_execute(exe)
+    fake_uv = f"function uv {{ if (\"$args\" -eq 'tool dir') {{ {q(tmp_path / 'toolenv')} }} }}\n"
     try:
         r = run_block(
             tmp_path,
-            "Assert-HrCtlRuns",
+            "$h = Resolve-HrCtl; 'VIA=' + $h.ViaPython; 'PY=' + $h.Python",
             mocks=False,
             pre=_on_path(exe.parent),
-            setup=COUNT_SLEEPS,
+            setup=COUNT_SLEEPS + EVIDENCE_STUBS + fake_uv,
+            shell=shell,
         )
     finally:
         subprocess.run(["icacls", str(exe), "/remove:d", user], capture_output=True)
     out = r["out"]
-    assert r["result"].startswith(
-        "RESULT=THROW: claude-hr-install failed: claude-hr-ctl will not start"
-    ), out
-    assert "claude-hr-ctl was installed at " in out and "failed to run: Access is denied" in out
-    assert "At line" not in out
+    assert "VIA=True" in out and f"PY={py}" in out, out
+    assert "Windows will not start it" in out and "Windows would not start it: " in out
+    assert "(Windows error 5)" in out, (
+        "the reason comes from Windows, not from the edition of PowerShell"
+    )
+    assert "StandardOutputEncoding" not in out and "At line" not in out
+    assert "has a Deny rule for" in out and exe.name in out, (
+        "the evidence names the rule that forbids running the file"
+    )
+
+
+@windows_only
+@pytest.mark.parametrize("edition", EDITIONS)
+def test_the_reason_a_program_was_refused_is_windows_own_in_every_powershell(tmp_path, edition):
+    """PowerShell 7 reports a refused program as 'StandardOutputEncoding is only supported when standard output is
+    redirected'; Windows PowerShell 5.1 as 'Access is denied'. The installer asks Windows instead of repeating either."""
+    shell = _edition(edition)
+    exe = _program(tmp_path / "tools", "hrdenied.exe")
+    user = _deny_execute(exe)
+    try:
+        r = run_block(
+            tmp_path,
+            _report("hrdenied"),
+            mocks=False,
+            pre=_on_path(exe.parent),
+            setup=COUNT_SLEEPS,
+            shell=shell,
+        )
+    finally:
+        subprocess.run(["icacls", str(exe), "/remove:d", user], capture_output=True)
+    error = _line(r["out"], "ERROR")
+    assert re.fullmatch(r"Windows would not start it: .+ \(Windows error 5\)", error), error
+    assert "StandardOutputEncoding" not in error and "At line" not in error
+    assert _line(r["out"], "OK") == "False" and _line(r["out"], "SLEEPS") == "3"
+
+
+@windows_only
+def test_powershell_7_really_does_hide_the_reason_which_is_why_windows_is_asked(tmp_path):
+    """The premise, checked on the machine that runs the tests: without the installer's help, PowerShell 7 gives the
+    misleading text for a program that Windows refuses (this test goes if a later PowerShell 7 fixes that)."""
+    shell = _edition("7")
+    exe = _program(tmp_path / "tools", "hrraw.exe")
+    user = _deny_execute(exe)
+    try:
+        r = run_block(
+            tmp_path,
+            f"try {{ N {{ & {q(exe)} --version }} }} catch {{ 'RAW=' + $_.Exception.Message }}",
+            mocks=False,
+            shell=shell,
+        )
+    finally:
+        subprocess.run(["icacls", str(exe), "/remove:d", user], capture_output=True)
+    if "StandardOutputEncoding" not in r["out"]:
+        pytest.skip("this PowerShell 7 reports a refused program properly")
+    assert "StandardOutputEncoding is only supported when standard output is redirected" in r["out"]
+
+
+@windows_only
+def test_get_start_failure_names_the_windows_error_of_a_refused_and_of_a_missing_program(tmp_path):
+    ok = _program(tmp_path / "t", "hrok.exe")
+    denied = _program(tmp_path / "t", "hrno.exe")
+    user = _deny_execute(denied)
+    scenario = (
+        f"'DENIED=' + (Get-StartFailure {q(denied)}); "
+        f"'OK=[' + (Get-StartFailure {q(ok)}) + ']'; "
+        f"'MISSING=' + (Get-StartFailure {q(tmp_path / 'nope.exe')})"
+    )
+    try:
+        r = run_block(tmp_path, scenario, mocks=False)
+    finally:
+        subprocess.run(["icacls", str(denied), "/remove:d", user], capture_output=True)
+    out = r["out"]
+    assert re.search(r"DENIED=.+ \(Windows error 5\)", out), out
+    assert "OK=[]" in out, "a program that starts has no failure to report"
+    assert re.search(r"MISSING=.+ \(Windows error 2\)", out), out
+
+
+# ---- what the PC says about a program it refused ----------------------------------------------------------------------------
+@windows_only
+def test_evidence_names_a_deny_rule_on_the_file(tmp_path):
+    exe = _program(tmp_path / "t", "hrruled.exe")
+    user = _deny_execute(exe)
+    try:
+        r = run_block(
+            tmp_path,
+            f"@(Get-BlockEvidence {q(exe)}) | ForEach-Object {{ 'E=' + $_ }}",
+            mocks=False,
+            setup=EVIDENCE_STUBS,
+        )
+    finally:
+        subprocess.run(["icacls", str(exe), "/remove:d", user], capture_output=True)
+    lines = [ln for ln in r["out"].splitlines() if ln.startswith("E=")]
+    assert (
+        len(lines) == 1
+        and f"{exe} has a Deny rule for" in lines[0]
+        and user.lower() in lines[0].lower()
+    ), r["out"]
+
+
+@windows_only
+def test_evidence_lists_security_software_and_a_threatlocker_that_is_still_there(tmp_path):
+    program_files = tmp_path / "pf"
+    (program_files / "ThreatLocker").mkdir(parents=True)
+    stubs = (
+        "function Get-Service { @("
+        "[pscustomobject]@{ Name = 'ThreatLockerSvc'; DisplayName = 'ThreatLocker Service'; Status = 'Running' },"
+        "[pscustomobject]@{ Name = 'Spooler'; DisplayName = 'Print Spooler'; Status = 'Running' },"
+        "[pscustomobject]@{ Name = 'AppIDSvc'; DisplayName = 'Application Identity'; Status = 'Stopped' }) }\n"
+        "function Get-WinEvent { throw 'No events were found' }\n"
+    )
+    r = run_block(
+        tmp_path,
+        "@(Get-BlockEvidence 'C:\\no\\such\\hr.exe') | ForEach-Object { 'E=' + $_ }",
+        mocks=False,
+        pre=f"$env:ProgramFiles = {q(program_files)}; ${{env:ProgramFiles(x86)}} = ''; $env:ProgramData = ''\n",
+        setup=stubs,
+    )
+    out = r["out"]
+    assert "ThreatLocker Service (Running)" in out and "Application Identity (Stopped)" in out
+    assert "Print Spooler" not in out
+    assert "ThreatLocker is still on this PC" in out and "restarted" in out
+
+
+@windows_only
+def test_evidence_quotes_the_event_that_names_the_file_and_the_defender_rule(tmp_path):
+    stubs = (
+        "function Get-Service { @() }\n"
+        "function Get-WinEvent {\n"
+        "  param([hashtable]$FilterHashtable, $MaxEvents, $ErrorAction)\n"
+        "  if ($FilterHashtable.LogName -like '*Defender*') {\n"
+        "    @([pscustomobject]@{ Id = 1121; TimeCreated = [datetime]'2026-10-30 10:05'; Message = \"blocked an operation`r`nID: 01443614-cd74-433a-b99e-2ecdc07bfc25`r`nPath: C:\\x\\other.exe\" },\n"
+        "      [pscustomobject]@{ Id = 1121; TimeCreated = [datetime]'2026-10-30 10:07'; Message = \"blocked an operation`r`nID: 01443614-cd74-433a-b99e-2ecdc07bfc25`r`nPath: C:\\x\\claude-hr-ctl.exe\" })\n"
+        "  } else { throw 'No events were found that match the specified selection criteria.' }\n"
+        "}\n"
+    )
+    r = run_block(
+        tmp_path,
+        "@(Get-BlockEvidence 'C:\\x\\claude-hr-ctl.exe') | ForEach-Object { 'E=' + $_ }",
+        mocks=False,
+        setup=stubs,
+    )
+    lines = [ln for ln in r["out"].splitlines() if ln.startswith("E=")]
+    assert len(lines) == 1, r["out"]
+    assert lines[0].startswith("E=Microsoft Defender, event 1121 at 2026-10-30 10:07:"), lines[0]
+    assert "claude-hr-ctl.exe" in lines[0] and "other.exe" not in lines[0]
+    assert "prevalence, age, or trusted list criterion" in lines[0]
+
+
+@windows_only
+def test_evidence_survives_a_source_that_fails_and_says_when_it_found_nothing(tmp_path):
+    stubs = (
+        "function Get-Acl { throw 'no acl' }\nfunction Get-Service { throw 'no services' }\n"
+        "function Get-WinEvent { throw 'The channel was not found' }\n"
+    )
+    r = run_block(
+        tmp_path,
+        "Show-BlockEvidence 'C:\\no\\such\\hr.exe'; 'AFTER'",
+        mocks=False,
+        pre="$env:ProgramFiles = ''; ${env:ProgramFiles(x86)} = ''; $env:ProgramData = ''\n",
+        setup=stubs,
+    )
+    out = r["out"]
+    assert r["result"] == "RESULT=OK" and "AFTER" in out, out
+    assert "What this PC records about hr.exe:" in out and "nothing: no rule on the file" in out
+
+
+# ---- the closing banner and the processes -----------------------------------------------------------------------------------
+@windows_only
+def test_the_banner_of_a_normal_install_is_the_old_one(tmp_path):
+    r = run_block(tmp_path, "Show-Done $false $true ''")
+    out = r["out"]
+    assert "claude-hr is installed." in out and "Open a NEW terminal, then:   claude-hr" in out
+    assert "stand-ins" not in out and "WARNING" not in out
+
+
+@windows_only
+def test_a_normal_install_whose_commands_do_not_start_says_so(tmp_path):
+    r = run_block(tmp_path, "Show-Done $false $false ''")
+    assert (
+        "claude-hr is installed." in r["out"]
+        and "WARNING: claude-hr-ctl or claude-hr did not start" in r["out"]
+    )
+
+
+@windows_only
+def test_the_banner_of_an_install_through_python_says_what_differs_and_how_to_get_the_real_launchers(
+    tmp_path,
+):
+    r = run_block(tmp_path, "Show-Done $true $true 'C:\\py\\python.exe'")
+    out = r["out"]
+    assert "claude-hr is installed - with stand-ins for its launcher programs." in out
+    assert "Headroom (token compression) was not installed" in out
+    assert "pass through cmd.exe" in out and "Git Bash does not" in out
+    assert "claude-hr-ctl launchers ensure" in out and "%APPDATA%\\uv\\tools" in out
+    assert "Open a NEW terminal, then:   claude-hr" in out
+
+
+@windows_only
+def test_the_banner_of_an_install_whose_commands_still_do_not_start_gives_the_python_commands(
+    tmp_path,
+):
+    r = run_block(tmp_path, 'Show-Done $true $false "C:\\Users\\O\'Brien\\py\\python.exe"')
+    out = r["out"]
+    assert "do not start from the command line yet" in out
+    assert "& 'C:\\Users\\O''Brien\\py\\python.exe' -I -m claude_hr.launcher" in out
+    assert "& 'C:\\Users\\O''Brien\\py\\python.exe' -I -m claude_hr.ctl doctor" in out
+
+
+@windows_only
+def test_programs_running_from_the_tool_environment_or_named_claude_hr_count_as_claude_hr_running(
+    tmp_path,
+):
+    ping = Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32" / "PING.EXE"
+    if not ping.exists():
+        pytest.skip("needs ping.exe")
+    toolenv = tmp_path / "toolenv" / "claude-hr" / "Scripts"
+    elsewhere = tmp_path / "elsewhere"
+    named = tmp_path / "named"
+    for folder in (toolenv, elsewhere, named):
+        folder.mkdir(parents=True)
+    shutil.copy2(
+        ping, toolenv / "python.exe"
+    )  # runs from the tool environment, but has no claude-hr name
+    shutil.copy2(ping, elsewhere / "other.exe")  # neither
+    shutil.copy2(ping, named / "claude-hr.exe")  # a launcher program
+    scenario = (
+        "$procs = @(); "
+        f"foreach ($f in {q(toolenv / 'python.exe')}, {q(elsewhere / 'other.exe')}, {q(named / 'claude-hr.exe')}) "
+        "{ $procs += Start-Process -FilePath $f -ArgumentList '-n','40','127.0.0.1' -WindowStyle Hidden -PassThru }; "
+        "try { $found = @(Get-ClaudeHrProcesses | ForEach-Object { $_.Id }); "
+        "'ENV=' + ($found -contains $procs[0].Id); 'OTHER=' + ($found -contains $procs[1].Id); 'NAMED=' + ($found -contains $procs[2].Id) } "
+        "finally { $procs | ForEach-Object { Stop-Process -Id $_.Id -Force -ErrorAction SilentlyContinue } }"
+    )
+    r = run_block(tmp_path, scenario, setup=f"$global:ToolDir = {q(tmp_path / 'toolenv')}\n")
+    assert "ENV=True" in r["out"] and "NAMED=True" in r["out"] and "OTHER=False" in r["out"], r[
+        "out"
+    ]
 
 
 # ---- a failing git or uv says why ------------------------------------------------------------------------------------------
@@ -777,7 +1118,7 @@ def test_windows_refusing_to_start_a_program_is_a_result_not_a_crash(tmp_path):
         subprocess.run(["icacls", str(exe), "/remove:d", user], capture_output=True)
     assert _line(r["out"], "OK") == "False", r["out"]
     error = _line(r["out"], "ERROR")
-    assert "failed to run: Access is denied" in error, error
+    assert "Windows would not start it: " in error and "(Windows error 5)" in error, error
     assert "At line" not in error and "At C:" not in error, (
         "PowerShell's own trace is not part of the reason"
     )
@@ -816,7 +1157,7 @@ def test_a_blocked_program_found_by_a_route_ends_in_the_clear_message_not_a_stac
             "Install-Tool 'hrblocked' @(@{ Name = 'winget'; Run = { } }) 'Install it another way, then run this installer again.'",
             mocks=False,
             pre=_on_path(exe.parent),
-            setup=COUNT_SLEEPS + "function Show-Reachability { }\n",
+            setup=COUNT_SLEEPS + EVIDENCE_STUBS + "function Show-Reachability { }\n",
         )
     finally:
         subprocess.run(["icacls", str(exe), "/remove:d", user], capture_output=True)
@@ -825,7 +1166,8 @@ def test_a_blocked_program_found_by_a_route_ends_in_the_clear_message_not_a_stac
         "RESULT=THROW: claude-hr-install failed: could not install hrblocked"
     ), out
     assert "winget: installed at " in out and exe.name in out
-    assert "but it will not run: Program 'hrblocked.exe' failed to run: Access is denied" in out
+    assert "but it will not run: Windows would not start it: " in out and "(Windows error 5)" in out
+    assert "What this PC records about hrblocked.exe:" in out and "has a Deny rule for" in out
     assert "--version" in out and "ask whoever manages this PC" in out
 
 
