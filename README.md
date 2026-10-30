@@ -70,6 +70,12 @@ PC can reach, so a firewall or proxy rule is easy to name: the install talks to 
 `files.pythonhosted.org` (packages), `claude.ai` (Claude Code) and, later, `huggingface.co` (Headroom's models). Install uv by
 hand (`winget install --id astral-sh.uv -e`), open a new terminal and run the one-liner again if you prefer.
 
+A program the installer has just installed is also started once (`--version`) before it counts. If Windows refuses to start it
+(antivirus or application control: `Program 'claude.exe' failed to run: Access is denied`) the installer stops with that
+reason, the program's path and the command that shows Windows' own message, so whoever manages the PC knows which file to
+allow; running the one-liner again afterwards is quick. A Claude Code installed through `winget` is updated by `winget`
+(`winget upgrade Anthropic.ClaudeCode`), not by `claude-hr update`.
+
 The repo is public, so the installers clone `https://github.com/timchrist49/claude-hr.git` anonymously and the scheduled
 self-update needs no credentials. **Private fork:** set `CLAUDE_HR_REPO_URL` and export `CLAUDE_HR_GIT_TOKEN` (a fine-grained
 PAT, *Contents: read-only*, that repo only) for the first clone. It is sent as a one-shot HTTP header and never written to

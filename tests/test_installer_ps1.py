@@ -57,6 +57,8 @@ $global:Have = @()
 $global:Web = @{{}}
 $global:WingetExit = 0
 $global:WingetProvides = $null
+$global:Broken = @()
+$global:FakeDir = 'C:\\fake'
 """
 
 # Defined AFTER the block, so they replace its commands; functions win over cmdlets and programs.
@@ -79,6 +81,12 @@ function winget {
   if ($global:WingetExit -eq 0 -and $global:WingetProvides) { $global:Have += $global:WingetProvides }
 }
 function uv { $global:Calls.Add("uv $args") | Out-Null; $global:LASTEXITCODE = 0 }
+function Test-ToolRuns([string]$Name) {
+  if ($global:Broken -contains $Name) {
+    return @{ Ok = $false; Path = "$($global:FakeDir)\\$Name.exe"; Version = ''; Error = "Program '$Name.exe' failed to run: Access is denied" }
+  }
+  @{ Ok = $true; Path = "$($global:FakeDir)\\$Name.exe"; Version = '9.9.9'; Error = '' }
+}
 """
 
 
@@ -414,6 +422,269 @@ def test_claude_code_that_cannot_be_installed_says_where_to_get_it(tmp_path):
     ), r["out"]
     assert "claude.ai installer: https://claude.ai/install.ps1 - Unable to connect" in r["out"]
     assert "https://code.claude.com/docs/en/setup" in r["out"]
+
+
+# ---- "found" is not "works" --------------------------------------------------------------------------------------------
+@windows_only
+def test_a_tool_that_installs_but_will_not_run_is_not_a_success(tmp_path):
+    """The second report: claude.ai blocked, winget 'installed' Claude Code, and Windows then refused to start claude.exe
+    ("Program 'claude.exe' failed to run: Access is denied"). That is a failed install with the reason and the way to check it,
+    not a crash at the last line of the script."""
+    r = run_block(
+        tmp_path,
+        "Install-ClaudeCode",
+        setup="$global:Have = @('winget'); $global:WingetProvides = 'claude'; $global:Broken = @('claude')\n",
+    )
+    assert r["result"].startswith(
+        "RESULT=THROW: claude-hr-install failed: could not install claude"
+    ), r["out"]
+    out = r["out"]
+    assert "claude.ai installer: https://claude.ai/install.ps1 - Unable to connect" in out
+    assert (
+        "winget: installed at C:\\fake\\claude.exe, but it will not run: Program 'claude.exe' failed to run: Access is denied"
+        in out
+    )
+    assert "& 'C:\\fake\\claude.exe' --version" in out and "ask whoever manages this PC" in out
+
+
+@windows_only
+def test_an_install_that_will_not_run_hands_over_to_the_next_route(tmp_path):
+    zpath, digest = make_zip(tmp_path)
+    setup = web(
+        {
+            ASTRAL: script_act(fake_uv(tmp_path / "bin")),
+            ZIP: f"Copy-Item -LiteralPath {q(zpath)} -Destination $f -Force; $global:Broken = @()",
+            ZIP
+            + ".sha256": f"Set-Content -LiteralPath $f -Value '{digest}  uv-x86_64-pc-windows-msvc.zip'",
+        }
+    )
+    r = run_block(tmp_path, "Install-Uv", setup=setup + "$global:Broken = @('uv')\n")
+    assert r["result"] == "RESULT=OK", r["out"]
+    assert "astral.sh installer: installed at C:\\fake\\uv.exe, but it will not run" in r["out"]
+    assert (
+        r["bin"] / "uv.exe"
+    ).read_bytes() == b"MZ stub of uv.exe"  # the zip's, not the first route's
+
+
+def test_the_last_line_of_the_installer_cannot_crash_on_a_program_that_will_not_start():
+    text = INSTALLER.read_text(encoding="utf-8")
+    assert "N { claude --version }" not in text, (
+        "an unguarded call is what crashed with 'Access is denied'"
+    )
+    assert re.search(r"^Show-ClaudeCode$", text, re.M), (
+        "the script ends its Claude Code check through the guarded function"
+    )
+
+
+@windows_only
+def test_a_claude_code_that_was_there_before_and_will_not_run_is_only_a_warning(tmp_path):
+    """The last step of the installer: not a crash, claude-hr is installed anyway."""
+    r = run_block(tmp_path, "Show-ClaudeCode; 'AFTER'", setup="$global:Broken = @('claude')\n")
+    assert r["result"] == "RESULT=OK" and "AFTER" in r["out"], r["out"]
+    assert (
+        "WARNING: Claude Code (C:\\fake\\claude.exe) did not run: Program 'claude.exe' failed to run: Access is denied"
+        in r["out"]
+    )
+
+
+@windows_only
+def test_a_claude_code_that_runs_is_logged_with_its_version(tmp_path):
+    r = run_block(tmp_path, "Show-ClaudeCode")
+    assert r["result"] == "RESULT=OK" and "[claude-hr-install] claude 9.9.9" in r["out"], r["out"]
+
+
+@windows_only
+def test_the_hint_survives_a_path_with_an_apostrophe(tmp_path):
+    """The command in the hint is meant to be pasted: `C:\\Users\\O'Brien\\...` needs its quote doubled."""
+    r = run_block(
+        tmp_path,
+        "Install-ClaudeCode",
+        setup="$global:Have = @('winget'); $global:WingetProvides = 'claude'; $global:Broken = @('claude')\n"
+        '$global:FakeDir = "C:\\Users\\O\'Brien\\bin"\n',
+    )
+    assert "& 'C:\\Users\\O''Brien\\bin\\claude.exe' --version" in r["out"], r["out"]
+
+
+def _ps_text(value: str) -> str:
+    """A PowerShell expression that yields exactly `value` (newlines and quotes included)."""
+    b64 = base64.b64encode(value.encode("utf-8")).decode("ascii")
+    return f"[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('{b64}'))"
+
+
+@windows_only
+@pytest.mark.parametrize(
+    ("message", "reason"),
+    [
+        # the reported one: PowerShell glues its trace straight onto the text
+        (
+            "Program 'claude.exe' failed to run: Access is deniedAt line:201 char:24\r\n+ Log (...)\r\n+   ~~~~",
+            "Program 'claude.exe' failed to run: Access is denied",
+        ),
+        ("failed to start\nAt C:\\x\\y.ps1:3 char:1\n+ foo", "failed to start"),
+        ("failed to start\r\nAt line:3 char:1\r\n+ foo", "failed to start"),
+        # sentences that merely mention a place are left alone
+        (
+            "Could not read the file at C:\\data\\x.txt",
+            "Could not read the file at C:\\data\\x.txt",
+        ),
+        ("Problem. At C:\\data nothing was found", "Problem. At C:\\data nothing was found"),
+        ("Look at line:5 of the file", "Look at line:5 of the file"),
+        ("  padded  ", "padded"),
+        ("", ""),
+    ],
+)
+def test_the_reason_of_an_error_loses_powershells_trace_and_nothing_else(tmp_path, message, reason):
+    r = run_block(
+        tmp_path, f"'REASON=[' + (Get-ErrorReason ({_ps_text(message)})) + ']'", mocks=False
+    )
+    assert f"REASON=[{reason}]" in r["out"], r["out"]
+
+
+CURL = Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32" / "curl.exe"
+
+
+def _program(folder: Path, name: str) -> Path:
+    """A real program that answers --version: a copy of curl.exe (it needs nothing next to it)."""
+    if not CURL.exists():
+        pytest.skip("needs curl.exe (Windows 10 and later)")
+    folder.mkdir(exist_ok=True)
+    target = folder / name
+    shutil.copy2(CURL, target)
+    return target
+
+
+def _deny_execute(path: Path) -> str:
+    """Take the right to run `path` from the current user: Windows then answers 'Access is denied', as on the reported PC."""
+    user = os.environ.get("USERNAME", "")
+    subprocess.run(["icacls", str(path), "/deny", f"{user}:(X)"], capture_output=True, check=True)
+    try:
+        subprocess.run([str(path), "--version"], capture_output=True)
+    except PermissionError:
+        return user
+    subprocess.run(["icacls", str(path), "/remove:d", user], capture_output=True)
+    pytest.skip("this machine still starts a program whose execute right is denied")
+
+
+def _on_path(folder: Path) -> str:
+    return f"$env:PATH = {q(folder)} + ';' + $env:PATH\n"
+
+
+COUNT_SLEEPS = "$global:Sleeps = 0; function Start-Sleep { $global:Sleeps++ }\n"
+
+
+def _report(name: str) -> str:
+    return (
+        f"$r = Test-ToolRuns {q(name)}; 'OK=' + $r.Ok; 'VERSION=' + $r.Version; 'ERROR=' + $r.Error; "
+        "'PATH=' + $r.Path; 'SLEEPS=' + $global:Sleeps"
+    )
+
+
+def _line(out: str, key: str) -> str:
+    return next(ln for ln in out.splitlines() if ln.startswith(key + "="))[len(key) + 1 :]
+
+
+@windows_only
+def test_a_tool_that_runs_is_reported_with_its_version_and_path(tmp_path):
+    exe = _program(tmp_path / "tools", "hrtool.exe")
+    r = run_block(
+        tmp_path, _report("hrtool"), mocks=False, pre=_on_path(exe.parent), setup=COUNT_SLEEPS
+    )
+    assert _line(r["out"], "OK") == "True", r["out"]
+    assert _line(r["out"], "VERSION").startswith("curl "), r["out"]
+    assert _line(r["out"], "PATH").lower() == str(exe).lower()
+    assert _line(r["out"], "SLEEPS") == "0"
+
+
+@windows_only
+def test_a_tool_that_starts_but_fails_is_reported_at_once_without_waiting(tmp_path):
+    (tmp_path / "tools").mkdir()
+    (tmp_path / "tools" / "hrfail.cmd").write_text("@exit /b 7\r\n", encoding="ascii")
+    r = run_block(
+        tmp_path,
+        _report("hrfail"),
+        mocks=False,
+        pre=_on_path(tmp_path / "tools"),
+        setup=COUNT_SLEEPS,
+    )
+    assert _line(r["out"], "OK") == "False" and "exited with code 7" in _line(r["out"], "ERROR"), r[
+        "out"
+    ]
+    assert _line(r["out"], "SLEEPS") == "0", (
+        "a program that started is not a scanner delay: no waiting"
+    )
+
+
+@windows_only
+def test_a_tool_that_is_not_on_the_path_says_so(tmp_path):
+    r = run_block(tmp_path, _report("hr-no-such-tool"), mocks=False, setup=COUNT_SLEEPS)
+    assert _line(r["out"], "OK") == "False" and "is not on the PATH" in _line(r["out"], "ERROR"), r[
+        "out"
+    ]
+
+
+@windows_only
+def test_windows_refusing_to_start_a_program_is_a_result_not_a_crash(tmp_path):
+    """The reported error, for real: 'Program ... failed to run: Access is denied'. Tried four times, then reported cleanly."""
+    exe = _program(tmp_path / "tools", "hrdenied.exe")
+    user = _deny_execute(exe)
+    try:
+        r = run_block(
+            tmp_path, _report("hrdenied"), mocks=False, pre=_on_path(exe.parent), setup=COUNT_SLEEPS
+        )
+    finally:
+        subprocess.run(["icacls", str(exe), "/remove:d", user], capture_output=True)
+    assert _line(r["out"], "OK") == "False", r["out"]
+    error = _line(r["out"], "ERROR")
+    assert "failed to run: Access is denied" in error, error
+    assert "At line" not in error and "At C:" not in error, (
+        "PowerShell's own trace is not part of the reason"
+    )
+    assert _line(r["out"], "SLEEPS") == "3"  # four attempts, a pause between each
+    assert _line(r["out"], "PATH").lower() == str(exe).lower()
+
+
+@windows_only
+def test_a_program_that_a_virus_scan_still_holds_is_tried_again(tmp_path):
+    """Denied on the first try, allowed on the second: what a scanner finishing with a just-written file looks like."""
+    exe = _program(tmp_path / "tools", "hrscan.exe")
+    user = _deny_execute(exe)
+    allow = f"function Start-Sleep {{ $global:Sleeps++; & icacls {q(exe)} /remove:d {q(user)} | Out-Null }}\n"
+    try:
+        r = run_block(
+            tmp_path,
+            _report("hrscan"),
+            mocks=False,
+            pre=_on_path(exe.parent),
+            setup="$global:Sleeps = 0\n" + allow,
+        )
+    finally:
+        subprocess.run(["icacls", str(exe), "/remove:d", user], capture_output=True)
+    assert _line(r["out"], "OK") == "True", r["out"]
+    assert _line(r["out"], "SLEEPS") == "1"
+
+
+@windows_only
+def test_a_blocked_program_found_by_a_route_ends_in_the_clear_message_not_a_stack_trace(tmp_path):
+    """The whole path of the report with the real checks: the route 'succeeds', the program is found, Windows refuses it."""
+    exe = _program(tmp_path / "tools", "hrblocked.exe")
+    user = _deny_execute(exe)
+    try:
+        r = run_block(
+            tmp_path,
+            "Install-Tool 'hrblocked' @(@{ Name = 'winget'; Run = { } }) 'Install it another way, then run this installer again.'",
+            mocks=False,
+            pre=_on_path(exe.parent),
+            setup=COUNT_SLEEPS + "function Show-Reachability { }\n",
+        )
+    finally:
+        subprocess.run(["icacls", str(exe), "/remove:d", user], capture_output=True)
+    out = r["out"]
+    assert r["result"].startswith(
+        "RESULT=THROW: claude-hr-install failed: could not install hrblocked"
+    ), out
+    assert "winget: installed at " in out and exe.name in out
+    assert "but it will not run: Program 'hrblocked.exe' failed to run: Access is denied" in out
+    assert "--version" in out and "ask whoever manages this PC" in out
 
 
 @windows_only
