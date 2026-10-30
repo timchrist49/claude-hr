@@ -381,7 +381,9 @@ def _no_verify_risk(command: str, tool: str) -> str | None:
 _STAND_IN_CALL = re.compile(
     r"(?<![\w-])(claude-hr(?:-ctl|-hook)?)(?:\.cmd)?(?![\w-])(?![\\/]|\.\w)", re.IGNORECASE
 )  # (not claude-hr.log, nor the folder .claude-hr/ or claude-hr\)
-_CMD_ACTS = re.compile(r"[&|<>^%!`$@(){}]")
+# (a line break too: inside a quoted argument cmd.exe ends the line there and drops the rest, a --dry-run among it; outside
+# quotes it would only end the statement, but telling those apart is reading PowerShell's quoting)
+_CMD_ACTS = re.compile(r"[&|<>^%!`$@(){}\r\n]")
 _START_PROCESS = re.compile(r"(?i)(?<![\w-])(?:start-process|saps|start)(?![\w-])|-arg")
 
 
@@ -404,15 +406,18 @@ def stand_in_risk(command: str) -> str | None:
         # what follows the first such call includes what follows every later one: this one look settles the command.
         # Start-Process takes its arguments BEFORE the program as well (-ArgumentList 'x&y' -FilePath claude-hr-ctl).
         start = 0 if _START_PROCESS.search(command) else match.end()
-        if not _CMD_ACTS.search(command, start):
+        if not _CMD_ACTS.search(
+            command[start:].rstrip()
+        ):  # (a line break at the very end ends nothing)
             return None
         python = launchers.console_python().replace(
             "'", "''"
         )  # the hook runs in the tool environment's Python
         return (
             f"on this PC Windows refuses {name}.exe, so `{name}` in PowerShell is a .cmd stand-in, and cmd.exe reads its "
-            "arguments a second time: it acts on & | < > ^ % ! whatever the quotes say. After a call of it this guard allows "
-            "none of & | < > ^ % ! ` $ @ ( ) { } (not even a pipe or 2>&1; text PowerShell builds at run time cannot be "
+            "arguments a second time: it acts on & | < > ^ % ! whatever the quotes say, and drops everything after a line "
+            "break. After a call of it this guard allows none of & | < > ^ % ! ` $ @ ( ) { } nor a line break (not even a "
+            "pipe, 2>&1 or a next line: put the call in a command of its own; text PowerShell builds at run time cannot be "
             f"checked). Call Python directly instead, which has no such limit: & '{python}' -I -m "
             f"{launchers.LAUNCHERS[name][0]} ... (or use the Bash tool: Git Bash runs the shell-script stand-in, "
             "without cmd.exe)"

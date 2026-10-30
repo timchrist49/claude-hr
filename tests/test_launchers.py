@@ -787,6 +787,10 @@ def stand_ins_in_use(monkeypatch):
         "claude-hr-ctl doctor > out.txt",
         "claude-hr-ctl wt new feature/x; echo 'a&b'",
         "claude-hr-ctl doctor # it's fine & x",
+        # a line break: inside quotes cmd.exe drops the rest of the arguments (a --dry-run among them); not read apart
+        "claude-hr-ctl run 'first line\nsecond line' --dry-run",
+        "claude-hr-ctl run 'a\r\nb'",
+        "claude-hr-ctl doctor\nWrite-Output done",
     ],
 )
 def test_the_guard_stops_a_powershell_call_of_a_stand_in_with_what_cmd_exe_acts_on_after_it(
@@ -810,7 +814,9 @@ def test_the_guard_stops_a_powershell_call_of_a_stand_in_with_what_cmd_exe_acts_
         "claude-hr-ctl wt new 'it''s fine'",
         "claude-hr-ctl wt new 'a b' \"c d\"",
         "claude-hr-ctl config set a.b C:\\work\\x,y=z",
-        "cd repo\nclaude-hr-ctl doctor\nWrite-Output done",
+        "cd repo\nclaude-hr-ctl doctor",  # line breaks before the call are not its arguments
+        "claude-hr-ctl doctor\n",  # nor one at the very end
+        "claude-hr-ctl doctor \r\n  ",
         "claude-hr-ctl doctor; Write-Output done",
         # text before the call cannot be an argument of it
         "'a&b' | Out-Null; claude-hr-ctl doctor",

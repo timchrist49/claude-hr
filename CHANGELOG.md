@@ -27,7 +27,8 @@ an allowed `uv.exe` and `python.exe` fits any of them). What claude-hr did wrong
 - **Not covered, stated:** the end-of-turn gates of the `hr-gates` plugin start `claude-hr-hook` without a shell (exec form); whether
   Claude Code can start a `.cmd` that way was not verified, so on a PC with stand-ins assume the gates do not run.
 - **Hardening (from the security reviews of this change):** the PowerShell tool is not let call a `.cmd` stand-in when anything
-  after the call contains `& | < > ^ % !` or a character with which PowerShell builds text at run time (`` ` $ @ ( ) { } ``;
+  after the call contains `& | < > ^ % !`, a line break (cmd.exe drops the rest of the arguments there), or a character with
+  which PowerShell builds text at run time (`` ` $ @ ( ) { } ``;
   `Start-Process` is read whole, it takes arguments before the program). A permission rule or an approval prompt had judged
   the PowerShell text, and cmd.exe reads it again. The rule reads no PowerShell quoting on purpose: the first two versions did,
   and automated reviews found ways round each (backtick escapes, here-strings, a call inside `cmd /c "..."`). Strict (a pipe
