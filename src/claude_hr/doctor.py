@@ -420,6 +420,43 @@ def _read_user_json(path: Path, name: str, out: list[Check]) -> dict:
     return data if isinstance(data, dict) else {}
 
 
+def launcher_checks() -> list[Check]:
+    """Windows: launcher programs (claude-hr.exe ...) that Windows refuses, and whether their stand-ins are in place."""
+    from . import launchers
+
+    data = launchers.state()
+    refused = launchers.refused_names()
+    if not refused:
+        return []
+    bin_dir = Path(str(data.get("bin") or launchers.default_bin_dir()))
+    names = ", ".join(refused)
+    allow = (
+        rf"ask whoever manages this PC to allow {bin_dir} and the claude-hr tool environment (under %APPDATA%\uv\tools), "
+        "then run `claude-hr-ctl launchers ensure`"
+    )
+    back = [n for n in refused if (bin_dir / f"{n}.exe").is_file()]
+    loose = [n for n in refused if not launchers.is_shimmed(n)]
+    if back or loose:
+        return [
+            Check(
+                "launchers",
+                WARN,
+                f"Windows refuses {names}, and the stand-in for {', '.join(sorted(set(back + loose)))} is missing or hidden by a "
+                "new launcher program (an update or a reinstall writes new ones)",
+                "claude-hr-ctl launchers ensure",
+            )
+        ]
+    return [
+        Check(
+            "launchers",
+            WARN,
+            f"Windows refuses {names}; they run through stand-ins (.cmd / shell script) and Python instead. Headroom is not "
+            "installed while launcher programs are refused, and arguments of the .cmd stand-ins pass through cmd.exe",
+            allow,
+        )
+    ]
+
+
 def run(cfg: Config, cwd: Path, deep: bool = False) -> list[Check]:
     out: list[Check] = []
     hr = Headroom(cfg)
@@ -514,6 +551,8 @@ def run(cfg: Config, cwd: Path, deep: bool = False) -> list[Check]:
                 "use one of them: quit Headroom Desktop and remove its entries, or keep it and `claude-hr-ctl uninstall`",
             )
         )
+    if paths.IS_WINDOWS:
+        out.extend(launcher_checks())
     if not shutil.which("claude-hr-hook"):
         out.append(
             Check(

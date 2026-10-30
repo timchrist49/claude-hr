@@ -221,6 +221,13 @@ class ClaudeSetup:
 
     def statusline_command(self) -> str:
         """Absolute path to the tiny claude-hr-hook entry point (forward slashes work in cmd, PowerShell and Git Bash)."""
+        if paths.IS_WINDOWS:
+            from . import launchers
+
+            if launchers.is_shimmed("claude-hr-hook"):
+                # Windows refuses claude-hr-hook.exe: the stand-ins (claude-hr-hook.cmd, and the script Git Bash runs) are found
+                # by name, a path to the .exe is not
+                return "claude-hr-hook statusline"
         name = "claude-hr-hook.exe" if paths.IS_WINDOWS else "claude-hr-hook"
         candidates = [Path(sys.executable).with_name(name), *procutil.which_all("claude-hr-hook")]
         exe = next((c for c in candidates if c.is_file()), None)
