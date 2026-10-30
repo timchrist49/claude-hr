@@ -72,12 +72,29 @@ hand (`winget install --id astral-sh.uv -e`), open a new terminal and run the on
 
 A program the installer has just installed is also started once (`--version`) before it counts. If Windows refuses to start it
 (antivirus or application control: `Program 'claude.exe' failed to run: Access is denied`) the installer stops with that
-reason, the program's path and the command that shows Windows' own message, so whoever manages the PC knows which file to
-allow; running the one-liner again afterwards is quick. The same goes for claude-hr's own commands: uv writes them as small
-launcher programs, new files that security software has not seen, so a tool that only lets known programs run (ThreatLocker,
-AppLocker, application control) has to allow `%USERPROFILE%\.local\bin` and `%APPDATA%\uv\tools`; after removing such a product,
-restart Windows before you try again, it may keep blocking until then. A Claude Code installed through `winget` is updated by `winget`
-(`winget upgrade Anthropic.ClaudeCode`), not by `claude-hr update`.
+reason, the program's path, **what the PC itself recorded about the file** (a Deny rule on it, security software that is
+present, Defender / code-integrity / AppLocker events that name it) and the command that shows Windows' own message, so whoever
+manages the PC knows which file to allow; running the one-liner again afterwards is quick. The reason is Windows' own in every
+PowerShell: Windows PowerShell 5.1 says `Access is denied`, PowerShell 7 says `StandardOutputEncoding is only supported when
+standard output is redirected` for the same refusal, so the installer asks Windows. After removing a product such as
+ThreatLocker, restart Windows before you try again, it may keep blocking until then. A Claude Code installed through `winget`
+is updated by `winget` (`winget upgrade Anthropic.ClaudeCode`), not by `claude-hr update`. You do not need an Administrator
+window for any of this; a normal one is the better choice (git can refuse a folder that another token created).
+
+**claude-hr's own commands are launcher programs** (`claude-hr.exe`, `claude-hr-ctl.exe`, `claude-hr-hook.exe`) that uv writes
+when it installs the tool: new files, different on every PC, which a tool that only lets known programs run (ThreatLocker,
+AppLocker, Defender's attack-surface rules, an endpoint product) may refuse while it lets Python run. Where that happens the
+install does not stop: setup runs through the tool's Python (`python -I -m claude_hr.ctl setup`), and its `launchers` step moves
+each refused launcher aside (`claude-hr.exe.refused`) and writes stand-ins next to it that start the same command through
+Python: `claude-hr.cmd` for PowerShell and cmd.exe, and a shell script of the same name for Git Bash (where the hooks and
+skills run). Every later `setup`, update and `claude-hr-ctl launchers ensure` looks again: a launcher that is allowed
+meanwhile gets its name back, and a reinstall that writes a new refused launcher gets its stand-ins again. What this does **not**
+give you: Headroom (`headroom.exe` comes from the same tool and is refused the same way, so it is not downloaded), and exact
+arguments in PowerShell and cmd.exe: a `.cmd` hands its arguments to cmd.exe, which acts on `& | < >` and `% ^` in them. So
+never pass text from an untrusted source to `claude-hr` that way; a script calls Python directly
+(`<tool env>\Scripts\python.exe -I -m claude_hr.launcher ...`), and `claude-hr-ctl config set launchers.cmd false` keeps only the
+Git Bash scripts. Plain `claude` never gets such a stand-in (`claude-hr-ctl shim install` refuses). `launchers.fallback = false`
+switches the whole thing off. `claude-hr-ctl launchers` shows the state, `claude-hr-ctl doctor` warns while it is in use.
 
 The repo is public, so the installers clone `https://github.com/timchrist49/claude-hr.git` anonymously and the scheduled
 self-update needs no credentials. **Private fork:** set `CLAUDE_HR_REPO_URL` and export `CLAUDE_HR_GIT_TOKEN` (a fine-grained
