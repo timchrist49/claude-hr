@@ -299,7 +299,13 @@ def _ensure(
             found[name] = exe
             moved_back.add(name)
 
-    previous = state().get("names")
+    last = state()
+    same_folder = os.path.normcase(os.path.abspath(str(last.get("bin") or ""))) == os.path.normcase(
+        os.path.abspath(str(bin_dir))
+    )
+    previous = (
+        last.get("names") if same_folder else None
+    )  # an old record of another folder moved nothing here
     moved_before = {
         n
         for n, v in (previous if isinstance(previous, dict) else {}).items()

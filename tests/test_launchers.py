@@ -737,6 +737,7 @@ def stand_ins_in_use(monkeypatch):
     monkeypatch.setattr(paths, "IS_WINDOWS", True)
     monkeypatch.setattr(launchers, "is_shimmed", lambda name: True)
     monkeypatch.setattr(launchers, "stand_in_python", lambda: r"C:\tool\Scripts\python.exe")
+    monkeypatch.setattr(launchers, "console_python", lambda: r"C:\tool\Scripts\python.exe")
 
 
 @pytest.mark.parametrize(
@@ -748,38 +749,47 @@ def stand_ins_in_use(monkeypatch):
         "claude-hr-ctl wt new fix-%GITHUB_TOKEN%",
         "claude-hr-ctl wt new a^b",
         "claude-hr-ctl wt new 'a!b'",
-        "claude-hr-ctl run 'first line\nsecond line'",
         "claude-hr-ctl wt new \u2018x&calc\u2019",  # typographic quotes: still one argument to PowerShell
         "claude-hr-ctl run 'it''s & that'",
         "& 'C:\\Users\\x\\.local\\bin\\claude-hr-ctl.cmd' 'x&calc'",
         "cd repo; claude-hr 'a>b'",
         'CLAUDE-HR-HOOK "a<b"',
-        # a backtick-escaped character still reaches cmd.exe as that character
+        # a backtick-escaped character still reaches cmd.exe as that character; `n `r `u{26} make others
         "claude-hr-ctl wt new x`&calc",
         'claude-hr-ctl wt new "x`&calc"',
         "claude-hr-ctl wt new a`|b",
         "claude-hr-ctl wt new `%literal",
-        'claude-hr-ctl wt new "a`nb"',  # `n and `r are line breaks inside "..."
-        'claude-hr-ctl wt new "a`u{26}b"',  # PowerShell 7: `u{26} is an ampersand
-        # the stop-parsing token hands the rest of the line over as it is (its % is what is seen first)
+        'claude-hr-ctl wt new "a`nb"',
+        'claude-hr-ctl wt new "a`u{26}b"',
+        # the stop-parsing token hands the rest of the line over as it is
         "claude-hr-ctl --% wt new x&calc",
         "claude-hr-ctl wt new --% x&calc",
         # the call sits inside a string that something else runs
         'cmd /c "claude-hr-ctl wt new x&calc"',
         'powershell -Command "claude-hr-ctl x | y"',
         "iex 'claude-hr-ctl wt new x&calc'",
-        # a comment with an apostrophe must not turn the quotes of the real call around
+        # whatever the text before the call does to the quotes, the rule looks at what comes after the call
         "# it's a comment\nclaude-hr-ctl wt new 'x&calc'",
         "<# it's #> claude-hr-ctl wt new 'x&calc'",
+        "@'\nit's\n'@; claude-hr-ctl wt new 'x&calc'",
+        'echo "$("a")"; claude-hr-ctl wt new \'x&calc\'',
         # text that PowerShell builds at run time cannot be checked
         "claude-hr-ctl wt new $name",
         'claude-hr-ctl wt new "$name"',
         'claude-hr-ctl wt new "$($x)"',
         "claude-hr-ctl wt new (Get-Name)",
         "claude-hr-ctl wt new @args",
+        "claude-hr-ctl wt new { a&b }",  # a script block is passed as its text
+        "claude-hr-ctl wt new feature `\n  x",
+        # strict on purpose: a pipe, a redirection or a statement after the call is refused too
+        "claude-hr-ctl status | Select-String 'a'",
+        "claude-hr-ctl doctor 2>&1",
+        "claude-hr-ctl doctor > out.txt",
+        "claude-hr-ctl wt new feature/x; echo 'a&b'",
+        "claude-hr-ctl doctor # it's fine & x",
     ],
 )
-def test_the_guard_stops_a_powershell_call_of_a_stand_in_with_arguments_cmd_exe_would_read(
+def test_the_guard_stops_a_powershell_call_of_a_stand_in_with_what_cmd_exe_acts_on_after_it(
     command, stand_ins_in_use, capsys
 ):
     from claude_hr import hooks
@@ -797,20 +807,22 @@ def test_the_guard_stops_a_powershell_call_of_a_stand_in_with_arguments_cmd_exe_
     [
         "claude-hr-ctl doctor",
         "claude-hr-ctl wt new feature/x",
-        "claude-hr-ctl status | Select-String 'a&b'",  # after the pipe it is PowerShell's own
-        "claude-hr-ctl wt new feature/x; echo 'a&b'",
         "claude-hr-ctl wt new 'it''s fine'",
-        "claude-hr-ctl doctor > out.txt",
-        "claude-hr-ctl doctor 2>&1 | Out-String",
-        "claude-hr-ctl wt new feature `\n  x",  # a line continuation: cmd.exe never sees the break
         "claude-hr-ctl wt new 'a b' \"c d\"",
-        "claude-hr-ctl wt new `$literal 'it''s'",  # an escaped dollar sign is just a dollar sign
-        "claude-hr-ctl doctor # it's fine & x",  # a comment is not passed on
-        "'a&b' | Out-Null; claude-hr-ctl doctor",  # a balanced string before the call
+        "claude-hr-ctl config set a.b C:\\work\\x,y=z",
+        "cd repo\nclaude-hr-ctl doctor\nWrite-Output done",
+        "claude-hr-ctl doctor; Write-Output done",
+        # text before the call cannot be an argument of it
+        "'a&b' | Out-Null; claude-hr-ctl doctor",
         "Write-Output 'don''t'; claude-hr-ctl doctor",
         "<# a & b #> claude-hr-ctl doctor",
+        "$x = (Get-Date); claude-hr-ctl doctor",
+        # not a call: a file, a folder, another word
         "git log --oneline && echo done",
         "Get-Content claude-hr.log | Select-String 'a&b'",
+        "cd ~/.claude-hr/repo; git status | Select-String x",
+        "Get-Content C:\\Users\\x\\.claude-hr\\logs\\crash.log | Select-Object -Last 5",
+        "claude-hr-ctl.exe 'a&b'",  # the launcher program itself, which Windows refuses: it never reaches cmd.exe
         "echo 'a&b'",
     ],
 )
@@ -820,23 +832,42 @@ def test_the_guard_leaves_other_powershell_calls_alone(command, stand_ins_in_use
     assert hooks._judge(command, "PowerShell") == 0
 
 
-def test_the_guard_reads_a_bounded_amount_and_refuses_what_it_cannot_read(stand_ins_in_use, capsys):
-    """A hook that is killed at its time limit lets the command through: padding must not buy that."""
+def test_the_guard_reads_the_arguments_start_process_takes_before_the_program(
+    stand_ins_in_use,
+):
+    from claude_hr import hooks
+
+    command = "Start-Process -ArgumentList 'x&calc' -FilePath claude-hr-ctl"
+    assert hooks._judge(command, "PowerShell") == 2
+    assert hooks._judge("saps -Args 'a|b' claude-hr-ctl", "PowerShell") == 2
+    assert hooks._judge("Start-Process claude-hr-ctl -ArgumentList doctor", "PowerShell") == 0
+
+
+def test_a_broken_launcher_record_does_not_switch_off_the_git_check(
+    stand_ins_in_use, monkeypatch, capsys
+):
+    from claude_hr import hooks
+
+    def broken(name):
+        raise ValueError("launchers.json is not JSON")
+
+    monkeypatch.setattr(launchers, "is_shimmed", broken)
+    assert hooks._judge("claude-hr-ctl doctor; git push --force origin main", "PowerShell") == 0
+    assert "permissionDecision" in capsys.readouterr().out, "the git check still asks"
+
+
+def test_the_guard_costs_one_linear_look_however_the_command_is_padded(stand_ins_in_use):
+    """A hook that is killed at its time limit lets the command through: padding must not buy that. (This times the stand-in
+    guard itself; the older patterns that _judge runs first have their own, documented limits on multi-megabyte commands.)"""
     import time
 
     from claude_hr import hooks
 
-    many = "; ".join(["claude-hr-ctl doctor"] * 60)  # each call alone is harmless
-    assert hooks._judge(many, "PowerShell") == 2
-    assert "too long, or calls launchers too often" in capsys.readouterr().err
-    assert hooks._judge("claude-hr-ctl doctor # " + "x" * 70_000, "PowerShell") == 2
-    # no launcher called: nothing is read, however long
     started = time.monotonic()
-    assert hooks._judge("echo " + "'a&b' " * 30_000, "PowerShell") == 0
-    # the most that is read: 40 calls in a command just under the limit
-    busy = ("claude-hr-ctl doctor; " + "echo 'x' " * 150) * 40
-    assert len(busy) < hooks._TOKEN_MAX
-    assert hooks._judge(busy, "PowerShell") == 0
+    assert not hooks.stand_in_risk("claude-hr-ctl doctor " + "x" * 2_000_000)
+    assert hooks.stand_in_risk("claude-hr-ctl doctor; " + "echo 'x' " * 200_000 + "&")
+    assert hooks.stand_in_risk(("claude-hr-ctl doctor; " * 100_000) + "|")
+    assert not hooks.stand_in_risk("echo " + "'a&b' " * 300_000), "no launcher called"
     assert time.monotonic() - started < 10
 
 
