@@ -132,11 +132,20 @@ function Install-UvFromGitHub {
     Get-Download "$base/$name" "$tmp\$name"
     Get-Download "$base/$name.sha256" "$tmp\$name.sha256"
     $want = (Get-Content -LiteralPath "$tmp\$name.sha256" -Raw) -split '\s+' | Where-Object { $_ } | Select-Object -First 1
-    $got = (Get-FileHash -LiteralPath "$tmp\$name" -Algorithm SHA256).Hash
+    # .NET, not Get-FileHash / Expand-Archive: those are script functions that Windows PowerShell loads on first use, and on
+    # a CI runner that load failed ("The term 'Get-FileHash' is not recognized"), which took the whole route down
+    $sha = [Security.Cryptography.SHA256]::Create()
+    $stream = [IO.File]::OpenRead("$tmp\$name")
+    try { $got = [BitConverter]::ToString($sha.ComputeHash($stream)).Replace('-', '') } finally { $stream.Dispose(); $sha.Dispose() }
     if ("$want" -notmatch '^[0-9a-fA-F]{64}$' -or $got -ne $want) { throw "the checksum of $name does not match (expected $want, got $got)" }
-    Expand-Archive -LiteralPath "$tmp\$name" -DestinationPath "$tmp\x" -Force
     New-Item -ItemType Directory -Force -Path $localBin | Out-Null
-    Copy-Item -Path "$tmp\x\*.exe" -Destination $localBin -Force
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    $zip = [IO.Compression.ZipFile]::OpenRead("$tmp\$name")
+    try {  # only these three, by name: whatever else a zip holds, or a path that climbs out of the folder, is never written
+      foreach ($entry in $zip.Entries) {
+        if ($entry.Name -in 'uv.exe', 'uvx.exe', 'uvw.exe') { [IO.Compression.ZipFileExtensions]::ExtractToFile($entry, (Join-Path $localBin $entry.Name), $true) }
+      }
+    } finally { $zip.Dispose() }
   } finally { Remove-Item -LiteralPath $tmp -Recurse -Force -ErrorAction SilentlyContinue }
   # Like Astral's own installer, put the folder on the PATH for new terminals (uv's own logic: it keeps the registry value intact)
   $env:PATH = "$localBin;$env:PATH"

@@ -257,6 +257,46 @@ def test_uv_comes_from_its_github_release_when_astralsh_cannot_be_reached(tmp_pa
 
 
 @windows_only
+def test_the_github_route_needs_no_module_that_windows_powershell_loads_on_first_use(tmp_path):
+    """Get-FileHash and Expand-Archive are script functions of modules that Windows PowerShell 5.1 loads on first use. On the
+    CI runners that load failed ("The term 'Get-FileHash' is not recognized"), taking the whole route down. These two stand-ins
+    make exactly those commands unavailable on any machine; the installer hashes and unpacks with .NET instead."""
+    gone = "function {0} {{ throw \"The term '{0}' is not recognized as the name of a cmdlet\" }}\n"
+    r = run_block(
+        tmp_path,
+        "Install-Uv",
+        setup=serve_zip(tmp_path),
+        pre=gone.format("Get-FileHash") + gone.format("Expand-Archive"),
+    )
+    assert r["result"] == "RESULT=OK", r["out"]
+    assert sorted(p.name for p in r["bin"].iterdir()) == ["uv.exe", "uvw.exe", "uvx.exe"]
+    assert "not recognized" not in r["out"]
+
+
+@windows_only
+def test_only_the_three_uv_programs_are_taken_out_of_the_zip(tmp_path):
+    """Whatever else a zip holds (other names, a folder path that climbs out) is never written."""
+    zpath = tmp_path / "evil.zip"
+    with zipfile.ZipFile(zpath, "w") as z:
+        z.writestr("uv.exe", b"MZ uv")
+        z.writestr("sub/uvx.exe", b"MZ uvx")
+        z.writestr("../escaped.exe", b"MZ no")
+        z.writestr("readme.txt", b"no")
+    digest = hashlib.sha256(zpath.read_bytes()).hexdigest()
+    setup = web(
+        {
+            ZIP: f"Copy-Item -LiteralPath {q(zpath)} -Destination $f -Force",
+            ZIP
+            + ".sha256": f"Set-Content -LiteralPath $f -Value '{digest}  uv-x86_64-pc-windows-msvc.zip'",
+        }
+    )
+    r = run_block(tmp_path, "Install-Uv", setup=setup)
+    assert r["result"] == "RESULT=OK", r["out"]
+    assert sorted(p.name for p in r["bin"].iterdir()) == ["uv.exe", "uvx.exe"]
+    assert not (tmp_path / "escaped.exe").exists()
+
+
+@windows_only
 def test_a_zip_that_does_not_match_its_checksum_is_never_installed(tmp_path):
     setup = (
         serve_zip(tmp_path, checksum="0" * 64)
@@ -449,9 +489,11 @@ def test_the_session_path_keeps_its_order_and_gets_no_duplicates(tmp_path):
         "$parts = $env:PATH -split ';'; "
         "'FIRST=' + $parts[0]; "
         "'DUPES=' + @($parts | Where-Object { $_ } | Group-Object { $_.TrimEnd('\\').ToLower() } | Where-Object Count -gt 1).Count; "
-        "'LOST=' + @(($before -split ';') | Where-Object { $_ -and ($parts -notcontains $_) }).Count"
+        # an entry counts as kept when its folder is still there, however the case or a trailing backslash is spelled: the
+        # function merges those on purpose (a runner's PATH has both `C:\\x` and `C:\\x\\`)
+        "$kept = @($parts | ForEach-Object { $_.TrimEnd('\\').ToLower() }); "
+        "'LOST=' + (@(($before -split ';') | Where-Object { $_ -and ($kept -notcontains $_.TrimEnd('\\').ToLower()) }) -join ' | ')"
     )
     r = run_block(tmp_path, scenario)
-    assert f"FIRST={r['bin']}" in r["out"] and "DUPES=0" in r["out"] and "LOST=0" in r["out"], r[
-        "out"
-    ]
+    assert f"FIRST={r['bin']}" in r["out"] and "DUPES=0" in r["out"], r["out"]
+    assert "LOST=\n" in r["out"] + "\n", r["out"]  # nothing of the original PATH is gone

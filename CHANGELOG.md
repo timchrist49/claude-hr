@@ -7,7 +7,9 @@ download with `Invoke-RestMethod : Unable to connect to the remote server` (Powe
 `astral.sh`, so not TLS, DNS or a proxy login; most likely a firewall or web filter on that network) while GitHub, and so the
 installer itself, was reachable.
 - **uv has three routes**: Astral's installer, then uv's GitHub release (the zip is verified against the release's `.sha256`
-  file before anything is unpacked; the folder is put on the PATH with `uv tool update-shell`, as Astral's installer does), then
+  file before anything is unpacked, with .NET and not `Get-FileHash` / `Expand-Archive`: those are script functions that
+  Windows PowerShell loads on first use, and on the CI runners that load failed; only `uv.exe`, `uvx.exe` and `uvw.exe` are
+  taken out of the zip, by name; the folder is put on the PATH with `uv tool update-shell`, as Astral's installer does), then
   `winget install astral-sh.uv`. A route fails by throwing and the next one is tried; an installer that downloads but then fails
   while running (it could not fetch the program from its second host, `releases.astral.sh`) falls back too. **Downloaded
   installers run in a PowerShell of their own**: the real ones of uv and Claude Code end with `exit 1` when they fail, and
