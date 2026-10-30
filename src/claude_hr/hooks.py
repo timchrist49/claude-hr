@@ -369,7 +369,13 @@ def _no_verify_risk(command: str, tool: str) -> str | None:
 # Where Windows refuses claude-hr-ctl.exe (and its siblings), `claude-hr-ctl` in PowerShell is the .cmd stand-in that
 # `claude-hr-ctl launchers` wrote, and cmd.exe reads the arguments PowerShell hands it a second time: it acts on & | < > ^ % !
 # even inside quotes and drops everything after a line break. A permission rule or an approval prompt for the PowerShell tool
-# was judged on PowerShell syntax, so such a call is not let through. (Text built at run time, "$x", cannot be seen here.)
+# was judged on PowerShell syntax, so such a call is not let through.
+#
+# The reading is deliberately strict where it cannot see: an argument that PowerShell builds at run time ($x, "$x", $(...),
+# (...), @splat) is refused like one that carries a character cmd.exe acts on, because it may. A backtick-escaped character
+# still reaches cmd.exe as that character. The call may also sit INSIDE a string (cmd /c "claude-hr-ctl ..."): the text before
+# it says whether a quote is open. This is a best-effort guard like every pattern in this file, not a boundary: a name built at
+# run time ('claude-hr-' + 'ctl') is not seen.
 _STAND_IN_CALL = re.compile(
     r"(?<![\w-])(claude-hr(?:-ctl|-hook)?)(?:\.cmd)?(?![\w-])", re.IGNORECASE
 )
@@ -377,35 +383,104 @@ _CMD_READS = "&|<>^%!\r\n"
 # PowerShell closes a string at ANY quote character of its kind: the typographic ones count (a pasted ‘x&y’ is one argument)
 _SINGLE_QUOTES = "'‘’‚‛"
 _DOUBLE_QUOTES = '"“”„'
+_UNSEEN = "$@("  # outside single quotes these start text that PowerShell builds at run time
+_MAX_CALLS = (
+    40  # launcher names read in one command; _TOKEN_MAX (above) is the longest command that is read
+)
 
 
-def _cmd_would_read(args: str) -> bool:
-    """Do these arguments of a PowerShell call carry something cmd.exe would act on? Reads until the statement ends."""
+def _comment_end(text: str, i: int) -> int | None:
+    """If a PowerShell comment starts at `i` (`<# ... #>`, or a `#` that starts a word and runs to the end of the line), the
+    index where it ends (a line comment stops before its line break, which ends the statement); else None."""
+    if text.startswith("<#", i):
+        end = text.find("#>", i + 2)
+        return len(text) if end < 0 else end + 2
+    if text[i] == "#" and (i == 0 or text[i - 1] in " \t\r\n;|({"):
+        end = text.find("\n", i)
+        return len(text) if end < 0 else end
+    return None
+
+
+def _open_quotes(text: str) -> str:
+    """The kind of quote still open at the end of `text` ('' = none), read the way PowerShell reads strings."""
     quotes, i = "", 0
+    while i < len(text):
+        ch = text[i]
+        if quotes:
+            if ch == "`" and quotes == _DOUBLE_QUOTES:
+                i += 2
+                continue
+            if ch in quotes:
+                if text[i + 1 : i + 2] in tuple(
+                    quotes
+                ):  # a doubled quote is one character of the string
+                    i += 1
+                else:
+                    quotes = ""
+        else:
+            end = _comment_end(text, i)
+            if end is not None:
+                i = end
+                continue
+            if ch == "`":
+                i += 2
+                continue
+            if ch in _SINGLE_QUOTES:
+                quotes = _SINGLE_QUOTES
+            elif ch in _DOUBLE_QUOTES:
+                quotes = _DOUBLE_QUOTES
+        i += 1
+    return quotes
+
+
+def _cmd_would_read(args: str, quotes: str = "") -> bool:
+    """Do the arguments of a PowerShell call (`quotes`: the quote that is open where they start) carry something that cmd.exe
+    would act on, or something that cannot be seen? Reads until the statement ends."""
+    i = 0
     while i < len(args):
         ch = args[i]
+        if ch == "`" and quotes != _SINGLE_QUOTES:
+            nxt = args[i + 1 : i + 2]
+            if (
+                nxt in ("\r", "\n") and not quotes
+            ):  # a line continuation: cmd.exe never sees the break
+                i += 3 if args[i + 1 : i + 3] == "\r\n" else 2
+                continue
+            # the escaped character is still a character of the argument: `& is an ampersand; in "..." `n and `r are line
+            # breaks and `u{26} (PowerShell 7) is an ampersand
+            if nxt and (nxt in _CMD_READS or (quotes and nxt in "nru")):
+                return True
+            i += 2
+            continue
         if quotes:
             if ch in quotes:
                 if args[i + 1 : i + 2] in tuple(
                     quotes
-                ):  # a doubled quote character is one character of the string
+                ):  # a doubled quote is one character of the string
                     i += 1
                 else:
                     quotes = ""
-            elif ch == "`" and quotes == _DOUBLE_QUOTES:
-                i += 1
-            elif ch in _CMD_READS:
+            elif ch in _CMD_READS or (ch == "$" and quotes == _DOUBLE_QUOTES):
                 return True
-        elif ch in _SINGLE_QUOTES:
-            quotes = _SINGLE_QUOTES
-        elif ch in _DOUBLE_QUOTES:
-            quotes = _DOUBLE_QUOTES
-        elif ch == "`":
-            i += 1  # the escaped character belongs to the word
-        elif ch in ";|&)}\r\n":
-            return False  # the statement ends: what follows is PowerShell's own business
-        elif ch in "%^!":
-            return True
+        else:
+            end = _comment_end(args, i)
+            if end is not None:
+                if args.startswith(
+                    "<#", i
+                ):  # a block comment is cut out of the line; the arguments go on
+                    i = end
+                    continue
+                return False
+            if ch in _SINGLE_QUOTES:
+                quotes = _SINGLE_QUOTES
+            elif ch in _DOUBLE_QUOTES:
+                quotes = _DOUBLE_QUOTES
+            elif ch in ";|&)}\r\n":
+                return False  # the statement ends: what follows is PowerShell's own business
+            elif (
+                ch in "%^!" or ch in _UNSEEN
+            ):  # (the % of the stop-parsing token --% is one of them)
+                return True
         i += 1
     return False
 
@@ -416,17 +491,31 @@ def stand_in_risk(command: str) -> str | None:
         return None
     from . import launchers
 
+    # The work is bounded (a hook that is killed at its time limit lets the command through): a command too long to read, or
+    # one that calls launchers more often than any honest one does, is refused as it stands if it calls a stand-in at all.
+    calls = []
     for match in _STAND_IN_CALL.finditer(command):
+        calls.append(match)
+        if len(calls) > _MAX_CALLS:
+            break
+    in_use: dict[str, bool] = {}
+    for match in calls:
         name = match.group(1).lower()
-        rest = command[match.end() :]
-        if rest[:1] and rest[:1] in _SINGLE_QUOTES + _DOUBLE_QUOTES:
-            rest = rest[1:]  # the name ended a quoted path: & 'C:\...\claude-hr-ctl.cmd' ...
-        if name in launchers.LAUNCHERS and launchers.is_shimmed(name) and _cmd_would_read(rest):
+        if name not in in_use:
+            in_use[name] = name in launchers.LAUNCHERS and launchers.is_shimmed(name)
+        if not in_use[name]:
+            continue
+        too_much = len(command) > _TOKEN_MAX or len(calls) > _MAX_CALLS
+        if too_much or _cmd_would_read(
+            command[match.end() :], _open_quotes(command[: match.start()])
+        ):
             python = launchers.stand_in_python()
             return (
                 f"on this PC Windows refuses {name}.exe, so `{name}` in PowerShell is a .cmd stand-in, and cmd.exe reads its "
-                "arguments a second time: it acts on & | < > ^ % ! (inside quotes too) and drops everything after a line break. "
-                "Leave those out of the arguments, or call Python directly: "
+                "arguments a second time: it acts on & | < > ^ % ! (inside quotes and when escaped with a backtick too) and "
+                "drops everything after a line break, and arguments PowerShell builds at run time ($x, (...), @x) cannot be "
+                f"checked{' (this command is too long, or calls launchers too often, to read)' if too_much else ''}. "
+                "Leave those out, or call Python directly: "
                 f"& '{python}' -I -m {launchers.LAUNCHERS[name][0]} ..."
             )
     return None

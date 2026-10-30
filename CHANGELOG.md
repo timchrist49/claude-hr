@@ -27,9 +27,10 @@ an allowed `uv.exe` and `python.exe` fits any of them). What claude-hr did wrong
 - **Not covered, stated:** the end-of-turn gates of the `hr-gates` plugin start `claude-hr-hook` without a shell (exec form); whether
   Claude Code can start a `.cmd` that way was not verified, so on a PC with stand-ins assume the gates do not run.
 - **Hardening (from the security review of this change):** the PowerShell tool is not let call a `.cmd` stand-in with arguments
-  that cmd.exe would act on (`& | < > ^ % !` in the arguments, inside quotes too, or a line break): the guard hook says so and
-  gives the Python command instead (a permission rule or an approval prompt had judged the PowerShell text, cmd.exe reads it
-  again); stand-ins are only written by the Python of a `uv tool` environment
+  that cmd.exe would act on (`& | < > ^ % !` in the arguments, inside quotes and escaped with a backtick too, or a line break;
+  also arguments that PowerShell builds at run time, `$x`, `(...)`, `@x`, which cannot be read; also a call inside a string such
+  as `cmd /c "claude-hr-ctl ..."`): the guard hook says so and gives the Python command instead (a permission rule or an approval
+  prompt had judged the PowerShell text, cmd.exe reads it again; best effort like the other guards, not a boundary); stand-ins are only written by the Python of a `uv tool` environment
   (`uv-receipt.toml`): a development checkout or a venv under review never becomes claude-hr for every command and hook (a test
   run from a shell that exports `UV_TOOL_BIN_DIR` or `XDG_BIN_HOME` could not reach the real launchers either: the sandbox of the
   tests clears them, the guard that watches the real profile watches the stand-ins, and a relative value is ignored); a
