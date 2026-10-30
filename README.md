@@ -62,6 +62,14 @@ curl -fsSL https://raw.githubusercontent.com/timchrist49/claude-hr/main/install.
 & ([scriptblock]::Create((irm https://raw.githubusercontent.com/timchrist49/claude-hr/main/install.ps1))) -Profile minimal -NoHeadroomInstall
 ```
 
+**A blocked download (Windows):** if the PC cannot reach `astral.sh` the installer does not stop at `Unable to connect to the
+remote server`. It installs uv from its GitHub release instead (the zip is checked against the release's SHA-256 file), then
+with `winget`; Claude Code falls back to `winget` as well. When every route fails it lists what it tried and which hosts the
+PC can reach, so a firewall or proxy rule is easy to name: the install talks to `astral.sh` / `releases.astral.sh` (uv),
+`github.com` / `release-assets.githubusercontent.com` (the claude-hr source, the uv release, Python builds), `pypi.org` /
+`files.pythonhosted.org` (packages), `claude.ai` (Claude Code) and, later, `huggingface.co` (Headroom's models). Install uv by
+hand (`winget install --id astral-sh.uv -e`), open a new terminal and run the one-liner again if you prefer.
+
 The repo is public, so the installers clone `https://github.com/timchrist49/claude-hr.git` anonymously and the scheduled
 self-update needs no credentials. **Private fork:** set `CLAUDE_HR_REPO_URL` and export `CLAUDE_HR_GIT_TOKEN` (a fine-grained
 PAT, *Contents: read-only*, that repo only) for the first clone. It is sent as a one-shot HTTP header and never written to

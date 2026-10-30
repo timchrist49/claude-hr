@@ -1,5 +1,35 @@
 # Changelog
 
+## Unreleased
+**Windows installer (`install.ps1`): a blocked download no longer ends the install.** The installer is fetched from `main`, so this
+takes effect without a claude-hr release. Reported from a Windows PC where `irm .../install.ps1 | iex` stopped at the first
+download with `Invoke-RestMethod : Unable to connect to the remote server` (PowerShell's message for a failed TCP connection to
+`astral.sh`, so not TLS, DNS or a proxy login; most likely a firewall or web filter on that network) while GitHub, and so the
+installer itself, was reachable.
+- **uv has three routes**: Astral's installer, then uv's GitHub release (the zip is verified against the release's `.sha256`
+  file before anything is unpacked, with .NET and not `Get-FileHash` / `Expand-Archive`: those are script functions that
+  Windows PowerShell loads on first use, and on the CI runners that load failed; only `uv.exe`, `uvx.exe` and `uvw.exe` are
+  taken out of the zip, by name; the folder is put on the PATH with `uv tool update-shell`, as Astral's installer does), then
+  `winget install astral-sh.uv`. A route fails by throwing and the next one is tried; an installer that downloads but then fails
+  while running (it could not fetch the program from its second host, `releases.astral.sh`) falls back too. **Downloaded
+  installers run in a PowerShell of their own**: the real ones of uv and Claude Code end with `exit 1` when they fail, and
+  run with `Invoke-Expression` (as `irm | iex` does) that `exit` closes the person's whole PowerShell window, error message
+  and fallbacks included. Their output is shown, a failure keeps its exit code and last lines.
+- **Claude Code has two**: the claude.ai installer, then `winget install Anthropic.ClaudeCode`.
+- **When every route fails** the error lists each route with its reason (the URL is part of the message), then which of
+  `astral.sh`, `releases.astral.sh`, `github.com`, `release-assets.githubusercontent.com`, `pypi.org`, `files.pythonhosted.org`
+  and `claude.ai` this PC can reach (an error page counts as reachable), and how to install by hand.
+- Downloads add TLS 1.2 where the .NET default lacks it (a system that decides for itself is left alone), wait at most 60 s and
+  try twice; the progress bar is off (it makes Windows PowerShell 5.1 downloads many times slower). They are staged in a new
+  folder under `%LOCALAPPDATA%\Temp` (not a `TEMP` that may be shared), checked there, run from there and deleted. The PATH of
+  the running session is refreshed from the registry after each route instead of only gaining `~\.local\bin`. The signed-in
+  user's credentials are deliberately not offered to a proxy: a rogue WPAD proxy could harvest them.
+- **Tests** (`tests/test_installer_ps1.py`, Windows): the download block is cut out of `install.ps1` and run under the real
+  PowerShell with the network, winget and uv replaced, so every route, the checksum refusal, an installer that ends with
+  `exit 1`, the cleanup of the staging folder and each failure message are exercised; two tests use a real local server for the
+  "error page is reachable, refused connection is not" rule. A security review of the first version found the proxy-credentials
+  and shared-TEMP weaknesses (both removed); checking the real installers found the `exit` problem.
+
 ## 0.3.6
 `claude-hr update` shows what it is doing, a run that ends early no longer locks out its own retry, and the background reinstall no
 longer risks a half-deleted installation. From a Windows PC where `claude-hr update` moved the checkout to the new release and
